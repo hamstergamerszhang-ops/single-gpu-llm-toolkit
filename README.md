@@ -322,4 +322,4 @@ works in your own environment rather than trusting a fabricated
 
 ## License
 
-Not yet decided — add one before treating this as reusable by others.
+Apache License 2.0 — see [LICENSE](LICENSE).
