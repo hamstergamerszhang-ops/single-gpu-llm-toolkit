@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""PyTorch/ROCm port of an MLX embedding-slicing script, for CUDA/ROCm boxes
-without MLX (Apple Silicon only).
+"""PyTorch/ROCm port of an MLX embedding-slicing script — pipeline step 2 of 4
+(runs on the output of prune_vocab.py, before expand_model.py). For CUDA/ROCm
+boxes without MLX (Apple Silicon only).
 
 Same logic as an MLX original built first for local Apple Silicon experiments,
 ported to run on a single AMD MI300X (ROCm) box that can't run MLX. Uses

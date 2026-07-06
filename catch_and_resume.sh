@@ -41,33 +41,35 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-MODEL=./checkpoints/base_expanded_15b
-DATA=./data/data_cpt_1        # dir containing train.jsonl; ignored if CPT_CACHE is set
-CPT_CACHE=                    # e.g. ./cpt_cache/cache.jsonl -- takes priority over DATA
-                               # if set (see train_cpt.py --cpt-cache). Leave empty to
-                               # use DATA/train.jsonl instead.
-SAVE=./checkpoints/model_cpt_1
-TOTAL_ITERS=10000
-CHECKPOINT_EVERY=500
-BATCH=4
-LR=5e-7
-MAX_SEQ_LEN=2048
-STOP_FILE=.stop_autoresume
-LOG_PREFIX=./logs/cpt_1_autoresume
+# Config: sourced from config.env if present (see config.env.example), so you
+# edit config.env rather than this script. Falls back to built-in defaults
+# matching config.env.example if config.env doesn't exist.
+CONFIG_FILE="${1:-config.env}"
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=config.env
+    source "$CONFIG_FILE"
+    echo "[autoresume] loaded config from $CONFIG_FILE"
+else
+    echo "[autoresume] WARNING: $CONFIG_FILE not found -- using built-in defaults. "
+    echo "[autoresume] Copy config.env.example to config.env and edit it for your run."
+    MODEL=./checkpoints/base_expanded_15b
+    DATA=./data/data_cpt_1
+    CPT_CACHE=
+    SAVE=./checkpoints/model_cpt_1
+    TOTAL_ITERS=10000
+    CHECKPOINT_EVERY=500
+    BATCH=4
+    LR=5e-7
+    MAX_SEQ_LEN=2048
+    STOP_FILE=.stop_autoresume
+    LOG_PREFIX=./logs/cpt_1_autoresume
+    HISTORY_KEEP=4
+    LOSS_REGRESSION_FACTOR=1.5
+    MAX_SAME_POSITION_RETRIES=8
+    RETRY_SLEEP_SECS=10
+fi
 
 HISTORY_DIR="${SAVE}_history"
-HISTORY_KEEP=4  # how many distinct loss-tagged checkpoints to retain for rollback.
-                 # train_cpt.py's own --save path is a single slot that gets
-                 # overwritten every checkpoint -- without a side history, a
-                 # checkpoint written during a bad/elevated-loss patch would
-                 # permanently replace the last known-good state with no way back.
-LOSS_REGRESSION_FACTOR=1.5  # if the latest checkpoint's train loss is more than
-                 # this multiple of the best loss still in history, roll back to
-                 # the better one instead of blindly continuing to build on a
-                 # regression.
-
-MAX_SAME_POSITION_RETRIES=8
-RETRY_SLEEP_SECS=10
 
 mkdir -p "$HISTORY_DIR" "$(dirname "$LOG_PREFIX")" "$(dirname "$SAVE")"
 
@@ -95,6 +97,27 @@ else:
     # defaults to weights_only=True, breaking resume without this.
     state = torch.load(state_path, map_location="cpu", weights_only=False)
     print(state.get("step", 0))
+PYEOF
+}
+
+# Read the valid_loss field train_cpt.py writes into training_state.pt's
+# extra_state (when a held-out valid.jsonl is present). Falls back to empty
+# string if absent (e.g. --no-eval, or no valid.jsonl). Used to prefer held-out
+# loss over training loss for rollback decisions — train loss hides overfitting.
+read_valid_loss() {
+    python3 - "$1" <<'PYEOF'
+import sys
+import torch
+from pathlib import Path
+
+save_dir = Path(sys.argv[1])
+state_path = save_dir / "training_state.pt"
+if not state_path.exists():
+    print("")
+else:
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    vl = state.get("valid_loss", None)
+    print(vl if vl is not None else "")
 PYEOF
 }
 
@@ -163,19 +186,36 @@ while true; do
     else
         same_position_retries=0
 
-        # Tag this checkpoint with its most recent logged train loss and copy it
-        # into the loss-tagged history (a COPY, not a move -- train_cpt.py's own
-        # $SAVE path stays where it is and keeps getting overwritten by the next
-        # checkpoint) so a later bad-patch checkpoint can never destroy this one.
-        last_loss=$(grep -oE "loss=[0-9.]+" "$log_file" | tail -1 | grep -oE "[0-9.]+$")
+        # Tag this checkpoint with its loss and copy it into the loss-tagged
+        # history (a COPY, not a move -- train_cpt.py's own $SAVE path stays
+        # where it is and keeps getting overwritten by the next checkpoint) so a
+        # later bad-patch checkpoint can never destroy this one.
+        #
+        # Prefer valid_loss (held-out, written into training_state.pt by
+        # train_cpt.py's eval loop) over training-loss grep: train loss hides
+        # overfitting, which is exactly the failure rollback exists to catch.
+        last_loss=$(read_valid_loss "$SAVE")
+        loss_kind="valid"
+        if [ -z "$last_loss" ]; then
+            # No held-out eval (--no-eval, no valid.jsonl, or eval not yet run at
+            # this checkpoint) — fall back to the last logged training loss.
+            last_loss=$(grep -oE "loss=[0-9.]+" "$log_file" | tail -1 | grep -oE "[0-9.]+$")
+            loss_kind="train"
+        fi
         if [ -n "$last_loss" ] && [ -d "$SAVE" ]; then
             hist_entry="$HISTORY_DIR/step${new_step}"
             rm -rf "$hist_entry"
             cp -r "$SAVE" "$hist_entry"
+            # NOTE: .train_loss may hold valid_loss OR train_loss depending on
+            # which was available (see $loss_kind above). The rollback
+            # comparison below compares these numerically — if eval cadence
+            # differs across checkpoints, this can mix scales. For consistent
+            # rollback, run eval at every checkpoint (--eval-every = --checkpoint-every).
             echo "$last_loss" > "$hist_entry/.train_loss"
-            echo "[autoresume] History: saved step $new_step checkpoint with train loss $last_loss"
+            echo "$loss_kind" > "$hist_entry/.loss_kind"
+            echo "[autoresume] History: saved step $new_step checkpoint with $loss_kind loss $last_loss"
         else
-            echo "[autoresume] WARNING: could not determine train loss for step $new_step -- "\
+            echo "[autoresume] WARNING: could not determine loss for step $new_step -- "\
 "history entry skipped (rollback won't see this checkpoint)."
         fi
 

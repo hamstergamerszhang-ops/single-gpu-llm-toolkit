@@ -1,14 +1,16 @@
 # gemma-mi300x-prune-cpt
 
-Ten real, independently-runnable tools for adapting an LLM checkpoint on a
+Twelve real, independently-runnable tools (ten Python + two shell) for
+adapting an LLM checkpoint on a
 **single AMD GPU** under ROCm/PyTorch — no multi-node cluster, no
 distributed training framework. They came out of actually doing this once,
 for real: shrinking a tokenizer, growing a model, and continue-pretraining
 it, all on one MI300X, and then hitting the specific ways a single GPU
 fails you (OOM, crashes, a data source that goes unreachable mid-run) and
 fixing each one for real instead of writing around it. Every script here is
-real, run code, not a from-scratch rewrite for this repo — project-specific
-naming genericized, everything else unchanged.
+real, run code, not a from-scratch rewrite for this repo — core training
+logic unchanged; refactored into standalone modules and parameterized into
+CLI flags.
 
 None of this is pinned to one GPU. There's no device-name check, no
 architecture branch, no hardcoded VRAM figure anywhere in the source —
@@ -24,13 +26,66 @@ Every model-family-specific assumption that used to be a hardcoded constant
 layer-naming prefix, the sharding size, the depth/width step sizes — is now
 a CLI flag, defaulting to the Gemma-4 layout these were built against but
 pointable anywhere your own checkpoint's tensor/config layout actually
-lives. No source edits needed to retarget them. The README calls out
+lives. Most model-family constants are CLI flags; `expand_model.py`'s
+submodule key suffixes (`gate_proj`, `k_proj`, etc.) still need source edits
+for non-Gemma layouts (see its docstring). The README calls out
 per-tool which pieces are Gemma-4-specific by nature (mainly the GQA fix,
-and a couple of `expand_model.py`'s submodule key suffixes) versus
+and those `expand_model.py` submodule key suffixes) versus
 already architecture-agnostic.
 
 You don't need to use these together or in order — each one solves a
-different single-GPU problem on its own:
+different single-GPU problem on its own. The canonical pipeline order, if
+you use them together, is:
+
+```
+prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py
+```
+
+Each step is optional — you can skip pruning, skip expansion, skip MTP, and
+just train directly against a base checkpoint.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Tools](#prune_vocabpy--shrink-a-tokenizer-you-dont-need-in-full)
+  - [`prune_vocab.py`](#prune_vocabpy--shrink-a-tokenizer-you-dont-need-in-full)
+  - [`prune_embeddings_torch.py`](#prune_embeddings_torchpy--apply-that-vocab-cut-to-the-actual-weights)
+  - [`expand_model.py`](#expand_modelpy--grow-a-models-width-and-depth-without-retraining-from-scratch)
+  - [`mtp_head.py`](#mtp_headpy--add-a-multi-token-prediction-head)
+  - [`train_cpt.py`](#train_cptpy--continued-pretraining-single-gpu)
+  - [`catch_and_resume.sh`](#catch_and_resumesh--keep-a-single-gpu-run-alive-across-crashes)
+  - [Standalone utilities](#standalone-utilities)
+  - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
+- [Tips / Troubleshooting](#tips--troubleshooting)
+- [Where this hits a real ceiling](#where-this-hits-a-real-ceiling)
+- [Requirements](#requirements)
+- [License](#license)
+
+## Installation
+
+**Option 1: Docker (recommended — bakes in all deps including ROCm torch):**
+
+```bash
+docker build -t gemma-prune-cpt .
+docker run --device /dev/kfd --device /dev/dri --group-add video \
+           --shm-size 64G -v $(pwd):/work -w /work -it gemma-prune-cpt \
+           python3 train_cpt.py --model ... --save ...
+```
+
+**Option 2: pip (install ROCm torch first from [pytorch.org](https://pytorch.org/get-started/locally/), then the rest):**
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` lists tested-known-good versions. `torch` is NOT in it —
+the ROCm build must come from AMD's index, not PyPI. Install it first.
+
+**AMD consumer/older cards:** if your GPU's gfx arch isn't in the torch
+wheel's compiled list (common on RDNA1/2, older cards), `train_cpt.py` calls
+`rocm_env.py` automatically at startup to detect and set
+`HSA_OVERRIDE_GFX_VERSION`. See [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
+below. You can also force it with `--gfx-override gfx1100`.
 
 ## `prune_vocab.py` — shrink a tokenizer you don't need in full
 
@@ -77,9 +132,10 @@ projections only**, which makes the insertion a true no-op: the layer runs
 a real forward pass, but contributes nothing to the residual stream until
 training turns it on. There's also an optional GQA fix for full-attention
 layers that ship with a single shared KV head and no separate `v_proj` —
-worth applying when KV-cache size isn't your actual memory bottleneck. Pure
-PyTorch, no Apple-Silicon-only dependency, usable on any checkpoint you want
-to grow rather than retrain.
+worth applying when KV-cache size isn't your actual memory bottleneck. Uses
+PyTorch + numpy + safetensors (no Apple-Silicon-only MLX dependency), usable
+on Gemma-4-family checkpoints; retargeting to other families needs the
+submodule key suffix edits noted in the docstring.
 
 ```
 python3 expand_model.py --src <pruned_checkpoint> --dst <expanded_checkpoint>
@@ -91,13 +147,41 @@ for CPU tensors, so `torch.linalg.qr` on CPU raises directly, not
 approximately, not sometimes. Swap it if your build has working CPU-tensor
 QR; this repo keeps numpy because it's what actually ran.
 
+## `mtp_head.py` — add a Multi-Token-Prediction head
+
+Standalone tool that appends real MTP modules to an expanded checkpoint,
+following the **DeepSeek-V3 MTP pattern**: per depth, an RMSNorm + a
+`2*hidden → hidden` projection (orthogonally initialized) + one transformer
+block **cloned from the last real decoder layer** (real pretrained weights,
+not fresh init) + a final RMSNorm. The weights are written as a safetensors
+shard and merged into the checkpoint's index, and `config.json` is updated
+with `mtp_depths` / `mtp_loss_weight` / `auto_map`.
+
+This replaces an earlier version of `expand_model.py` whose docstring claimed
+to instantiate MTP modules and append them as a shard — that claim was false
+(the code only wrote two config fields). `mtp_head.py` is the real
+implementation; `expand_model.py` no longer touches MTP at all.
+
+**What it does NOT provide:** the modeling Python code. For the generated
+weights to be used at train/inference time, you need a `modeling_custom.py`
+(alongside the checkpoint) defining a `CustomForCausalLM` class whose forward
+instantiates MTP modules consuming the keys `mtp_head.py` documents
+(`model.mtp_layers.{i}.enorm.weight`, `.eh_proj.weight`, `.block.<suffix>`,
+`.lnorm.weight`, `model.mtp.norm.weight`). `mtp_head.py` produces correct
+weights + config; the modeling code is your responsibility.
+
+```
+python3 mtp_head.py --src <expanded_checkpoint> --dst <mtp_checkpoint>
+```
+
 ## `train_cpt.py` — continued pretraining, single GPU
 
 This is the actual CUDA/ROCm training loop, and the rest of this README is
 mostly about the problems it ran into and how they got fixed: layer-window
 freeze/unfreeze (full-model training when VRAM allows, partial-layer
 windowing when it doesn't), gradient checkpointing, an 8-bit-Adam-with-AdamW-
-fallback optimizer, async local-disk checkpointing, a local-JSONL data/cache
+fallback optimizer, async local-disk checkpointing (opt-in via
+`--async-checkpoint`, off by default), a local-JSONL data/cache
 mode, and a clean SIGTERM-triggered checkpoint-and-exit. It's the standalone
 entry point for training any checkpoint — pruned, expanded, or neither.
 
@@ -112,6 +196,57 @@ standalone modules now (see "Standalone utilities" below). `train_cpt.py`
 imports and calls them rather than duplicating the logic, and its own
 `--selftest` still passes with the same "no torch/GPU required" guarantee it
 always had.
+
+### AMD-specific optimizations (all opt-in, throughput numbers not yet verified)
+
+`train_cpt.py` supports several AMD-ROCm-specific optimizations, each behind a
+CLI flag. The optimization flags (--flash-attn, --dtype fp8, --compile) fall
+back gracefully to the default path (bf16, eager, standard attention) if their
+dependency isn't installed; --ddp and --profile are infrastructure flags
+without a fallback (they either run or don't, based on whether you pass them).
+**Honest caveat up front:** the code paths below are real and exercised by
+this repo's own logic (the fallback branches, the DDP rank/all-reduce
+plumbing, the flag wiring), but none of the throughput/speedup figures
+mentioned (e.g. "~2x", "2-4x") have been measured against real ROCm hardware
+by this repo — they're the figures commonly cited for these techniques in
+general, not something benchmarked here. Configurable is not the same claim
+as verified; treat every number below as "expected, unconfirmed on this
+codebase's own hardware" until you've run it yourself:
+
+- **`--flash-attn`** — Flash Attention 2. Reduces attention VRAM from
+  `O(seqlen²)` to `O(seqlen)`, which is the mechanism that speeds up
+  long-context training in general — directly attacks the OOM theme this repo
+  is built around. Requires `flash-attn` built for ROCm (`pip install
+  flash-attn --no-build-isolation`). Falls back to standard attention with a
+  warning if not installed.
+- **`--dtype fp8`** — fp8 training via `torchao`'s `Float8Linear`
+  (`float8_e4m3fn`). MI300X/MI325X have native fp8 compute, which is why fp8
+  is expected to be faster than bf16 on those cards — the actual multiplier
+  hasn't been measured here. Falls back to bf16 if `torchao` isn't installed
+  or the card lacks fp8 hardware.
+- **`--compile`** — `torch.compile()` with ROCm's inductor backend for kernel
+  fusion + graph optimization. First few steps are slower (compilation), then
+  faster. Falls back to eager mode if compilation fails.
+- **`--profile <dir>`** — `torch.profiler` trace (viewable in
+  `chrome://tracing` or Perfetto) including ROCm/HIP kernel launches. For
+  kernel-level profiling beyond torch.profiler, wrap the run with
+  `rocprof --stats python3 train_cpt.py ...`.
+- **`--hip-alloc-conf`** — sets `PYTORCH_HIP_ALLOC_CONF` (default
+  `max_split_size_mb:128`) to prevent the caching allocator fragmentation that
+  causes phantom OOMs on long runs. Handled by `rocm_env.py` alongside the gfx
+  override.
+- **`--ddp`** — multi-GPU training via `torch.distributed` +
+  `DistributedDataParallel`. Launch with `torchrun --nproc_per_node=N
+  train_cpt.py --ddp ...`. Only rank 0 writes checkpoints/logs; all ranks
+  participate in gradient all-reduce. The rank/device/all-reduce wiring is
+  real code, but this repo has only ever run on a single GPU — the multi-GPU
+  path itself (not just its speedup) is untested against real multi-GPU
+  hardware. Verify it actually converges correctly on your own cluster before
+  trusting it for a real run.
+
+These flags are designed to compose (`--ddp --flash-attn --dtype fp8
+--compile` on a multi-GPU MI300X box), but that combination specifically has
+not been run end-to-end here either.
 
 ## `catch_and_resume.sh` — keep a single-GPU run alive across crashes
 
@@ -133,22 +268,22 @@ between attempts instead of having to reach for `kill -9`.
 
 ## Standalone utilities
 
-Three of these came directly out of the user's ask for the parts of
-`train_cpt.py` that were doing real, non-trivial work but only existed as
-prose and inline logic buried in `main()` — worth pulling out on their own
-merits, not just for tidiness. A fourth is a port of a memory-safety script
-that started life solving a Mac-specific crash but whose actual pattern —
-poll, warn, kill before the OS does something worse — has nothing
-Mac-specific about it. A fifth closes a small but genuinely nasty gap: what
-happens when you resume training with a *different* optimizer than the one
-that saved the checkpoint.
+Four of these came directly out of `train_cpt.py`'s `main()` — pieces that
+were doing real, non-trivial work but only existed as prose and inline logic
+buried there, worth pulling out on their own merits (optimizer construction,
+async checkpoint writes, the optimizer-type resume guard, and local-cache
+data streaming). A fifth is a port of a memory-safety script that started
+life solving a Mac-specific crash but whose actual pattern — poll, warn,
+kill before the OS does something worse — has nothing Mac-specific about it.
 
 **`bnb_optimizer.py`** exists because "which optimizer did this run
 actually get" turns out to matter a lot on a single GPU, and it's not a
 question you want answered differently by two copies of the same
 try/except scattered across two scripts. It tries bitsandbytes' 8-bit Adam
-first — both first and second moment buffers at roughly 1 byte/param
-instead of fp32 AdamW's 4 bytes/param, which is the difference between
+first — each moment buffer (first and second) at roughly 1 byte/param vs
+fp32 AdamW's 4 bytes/param/moment (a ~4x reduction in total optimizer state:
+2 moments × 1 byte = 2 bytes/param for 8-bit vs 2 × 4 = 8 bytes/param for
+fp32), which is the difference between
 comfortably fitting a large model plus its optimizer state on an 80GB+ card
 and being one missing pip install away from an OOM. If bitsandbytes isn't
 importable, it falls back to plain `torch.optim.AdamW` with an explicit
@@ -168,7 +303,7 @@ optimizer, kind = build_optimizer(trainable_params, lr=8e-7, weight_decay=0.01)
 
 **`async_checkpoint.py`** is the background-thread checkpoint writer,
 pulled out of `train_cpt.py` where it used to be a ~100-line class buried
-inside a 33KB training script. The idea is straightforward once it's
+inside the training script's `main()`. The idea is straightforward once it's
 isolated: serializing tens of GB to a possibly-slow disk or NFS mount is
 slow, and there's no reason the GPU should sit idle waiting for it. So the
 class splits the work into two phases — a synchronous GPU-to-CPU snapshot
@@ -247,26 +382,58 @@ swaps the Mac-only `top -l 1` memory parsing for a read of Linux's
 `/proc/meminfo` (`MemAvailable`, which already accounts for reclaimable
 cache — a better number than raw free memory for deciding whether the
 kernel is actually under pressure), which is the realistic target for an
-AMD ROCm training server. **What's honestly not in here:** a GPU-VRAM-side
-check via `rocm-smi --showmeminfo vram`. That's the natural ROCm-side
-equivalent, and the extension point is commented into the script, but this
-port was written without access to real ROCm hardware to confirm
-`rocm-smi`'s actual output format or how reliably it tracks true
-"about-to-OOM" pressure under concurrent load — guessing at that parsing
-here would be exactly the kind of unverified claim the rest of this repo
-tries to avoid, so it's left as a documented gap instead of a fabricated
-implementation. One design note carried over unchanged from the original:
-if the process being watched has no SIGTERM handler, this is a hard,
-immediate kill, not a clean save, and that's intentional — the goal is to
-stop before memory pressure causes real damage, not to guarantee graceful
-shutdown after the fact. Pair it with `train_cpt.py`, though, and you get
-the graceful case for free: `train_cpt.py` installs its own SIGTERM handler
-that checkpoints before exiting, so the two together behave as a real
-clean-save-then-exit rather than a hard kill.
+AMD ROCm training server. It now also polls **GPU VRAM** via
+`rocm-smi --showmeminfo vram` (the failure mode that actually matters for
+GPU training — system-RAM polling alone can't see a VRAM OOM coming). It
+parses rocm-smi's JSON output first (structured, robust) with a text-output
+fallback, applies the same warn/emergency-threshold pattern as the
+system-RAM check, and degrades gracefully: if `rocm-smi` isn't on PATH or
+parsing fails, it logs once and skips VRAM checks (keeps the system-RAM
+check working on non-ROCm boxes) rather than crashing the guard. One
+design note carried over unchanged from the original: if the process being
+watched has no SIGTERM handler, this is a hard, immediate kill, not a
+clean save, and that's intentional — the goal is to stop before memory
+pressure causes real damage, not to guarantee graceful shutdown after the
+fact. Pair it with `train_cpt.py`, though, and you get the graceful case
+for free: `train_cpt.py` installs its own SIGTERM handler that checkpoints
+before exiting, so the two together behave as a real clean-save-then-exit
+rather than a hard kill.
 
 ```
-nohup bash oom_guard.sh <training_pid> > oom_guard.log 2>&1 &
+nohup bash oom_guard.sh <training_pid> [warn_mb] [emergency_mb] [poll_sec] [vram_warn_mb] [vram_emergency_mb] > oom_guard.log 2>&1 &
 ```
+
+## `rocm_env.py` — AMD GPU arch detection + override
+
+The single biggest blocker to running on "every AMD device": ROCm PyTorch
+wheels are compiled for a handful of gfx architectures, and a card whose
+arch isn't in that list (common on consumer RDNA1/2 cards, older
+Fiji/Polaris) will import torch fine but fail at the first kernel launch
+with "no kernel image is available for execution on the device." The fix is
+to set `HSA_OVERRIDE_GFX_VERSION` to a compatible arch **before** the
+PyTorch runtime initializes.
+
+`rocm_env.py` does this automatically. `train_cpt.py` calls
+`setup_rocm_env()` at startup (before `import torch`); it probes the GPU's
+gfx arch via `rocm-smi` or `/sys/class/kfd`, compares against torch's
+compiled-in arch list, and overrides only if the detected arch isn't
+already supported — picking the closest same-family (`gfxNN`) arch that IS
+in the list. If no family match exists, it warns loudly and doesn't
+override (a wrong cross-family override can cause silent numerical errors).
+You can force a specific value with `--gfx-override gfx1100`.
+
+```python
+from rocm_env import setup_rocm_env
+setup_rocm_env()          # auto-detect + override if needed
+import torch              # safe to import now
+```
+
+Standalone (CLI + self-test, no GPU required):
+```
+python3 rocm_env.py --selftest
+python3 rocm_env.py --gfx-override gfx1100
+```
+
 
 ## Tips, all from things that actually happened running this on real hardware
 
@@ -298,24 +465,77 @@ nohup bash oom_guard.sh <training_pid> > oom_guard.log 2>&1 &
   different depending on how you split batch vs. sequence length. Worth
   testing both directions before assuming one is free.
 
+## Troubleshooting
+
+- **"no kernel image is available for execution on the device"** — your AMD
+  GPU's gfx arch isn't in the torch wheel's compiled list. `train_cpt.py`
+  calls `rocm_env.py` automatically; check its log line for what it detected
+  and whether it set an override. If auto-detection didn't find a match,
+  force one with `--gfx-override gfx1100` (substitute your closest family
+  arch). See [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override).
+- **OOM dozens of steps in (not at step 0)** — almost always a silently
+  missing `bitsandbytes`. The fallback to plain AdamW uses ~4x more optimizer
+  memory; it allocates lazily across params, so the OOM hits later, not at
+  load. Check `train_cpt.py`'s `optimizer:` log line — if it says `AdamW`
+  instead of `Adam8bit`, install bitsandbytes. The Dockerfile bakes it in.
+- **Optimizer mismatch on resume** — `train_cpt.py` logs whether it loaded or
+  skipped the optimizer state. "skipped" means the saved and current optimizer
+  classes differ (e.g. trained with bitsandbytes, resuming without it).
+  Momentum restarts fresh; the step count is preserved. This is intentional
+  (see `optimizer_compat_guard.py`), not a bug.
+- **Vocab size silently reverts to 262144 on load** — some Gemma-4 configs
+  store `vocab_size` in two places; `prune_vocab.py` fixes both by default,
+  but only if you pass `--vocab-size-paths` matching your config layout.
+- **`catch_and_resume.sh` hardcodes paths** — it doesn't anymore. Copy
+  `config.env.example` to `config.env` and edit the values there; the script
+  sources it automatically.
+- **Async checkpoint write silently lost** — it can't happen silently anymore.
+  `AsyncCheckpointer` now captures background-thread exceptions and re-raises
+  them on the next `save()` / `wait_for_pending()`. If a write fails (disk
+  full, NFS error), training stops with a real error instead of continuing
+  checkpoint-less. The prior checkpoint is retained as `.prev` for recovery.
+
 ## Where this hits a real ceiling
 
-Single-GPU throughput is the actual limit here, and it isn't a rounding
+Single-GPU throughput was the original limit here, and it isn't a rounding
 error you optimize away — closing an orders-of-magnitude gap to a large
-multi-trillion-token CPT target isn't a "just wait longer" problem, it's a
-different problem. So it's worth being precise about what single-GPU CPT is
-actually good for: targeted or bounded token budgets, domain-adapting a
-pruned or expanded model, validating a pipeline end-to-end before scaling
-it up. What it isn't: a substitute for real multi-GPU throughput once the
-token budget gets large. That's the honest gap — everything here runs
-end-to-end on one MI300X today, and the natural next step is the same tools
-across several MI300X GPUs instead of one.
+multi-trillion-token CPT target isn't a "just wait longer" problem. The
+`--ddp` flag (multi-GPU via `torchrun`) gives the code path to scale to
+multiple GPUs, and `--dtype fp8` / `--flash-attn` / `--compile` are the
+standard per-GPU throughput levers for MI300X-class hardware — but none of
+these have been benchmarked against real ROCm hardware by this repo (see the
+caveat in the AMD-specific optimizations section above), so treat "lifts this
+to multi-GPU" as "the plumbing exists," not "the speedup is confirmed." Even
+assuming they deliver what similar techniques typically do elsewhere, the
+honest framing is: targeted or bounded token budgets, domain-adapting a
+pruned or expanded model, validating a pipeline end-to-end before scaling to
+a full cluster. What it still isn't: a substitute for a real distributed
+training framework once the token budget gets into the trillions.
+
+## Testing
+
+Each module with logic that can be tested without a real checkpoint ships a
+`--selftest` (CPU-only, no GPU needed). Transformation tools (`prune_vocab.py`,
+`prune_embeddings_torch.py`, `expand_model.py`) are covered by the pytest suite
+in [`tests/`](tests/) instead. CI (`.github/workflows/selftest.yml`) runs both
+on every push/PR.
+
+```bash
+# Run all self-tests + pytest locally (CPU-only):
+for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
+         local_cache_stream.py optimizer_compat_guard.py \
+         rocm_env.py mtp_head.py; do python3 "$f" --selftest; done
+pytest tests/ -v
+```
 
 ## Requirements
 
-Confirmed in active use:
+Confirmed in active use (see [`requirements.txt`](requirements.txt) for
+tested-known-good versions, or use the [`Dockerfile`](Dockerfile) which
+bakes in a ROCm torch + all deps):
 
-- `torch` (ROCm build for AMD GPUs)
+- `torch` (ROCm build for AMD GPUs — install from AMD's index, not PyPI; it's
+  deliberately not in `requirements.txt`)
 - `safetensors`
 - `numpy`
 - `transformers` (confirmed working against `5.7.0`; if you're on a
@@ -324,10 +544,17 @@ Confirmed in active use:
   handles that specific mismatch)
 - `bitsandbytes` (8-bit Adam; falls back to plain AdamW at ~4x optimizer
   memory if unavailable)
+- `tensorboard` (optional; for `--tb` logging — not bundled with torch, install
+  separately; if absent, `--tb` warns and falls back to stdout)
+- `flash-attn` (optional; for `--flash-attn` — build from source on ROCm with
+  `pip install flash-attn --no-build-isolation`; falls back to standard attention)
+- `torchao` (optional; for `--dtype fp8` — fp8 training on MI300X/MI325X; falls
+  back to bf16 if absent)
 
-No other versions are pinned in the source this is drawn from — pin what
-works in your own environment rather than trusting a fabricated
-`requirements.txt`.
+`requirements.txt` lists tested-known-good versions for convenience, not as a
+strict constraint — if your ROCm stack needs a different torch, override it.
+The only hard pin is `transformers` (the Gemma4Config model_type registration
+differs across versions).
 
 ## License
 

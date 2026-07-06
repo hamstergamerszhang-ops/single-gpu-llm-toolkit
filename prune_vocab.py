@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vocab pruning for a Gemma-4-family base model — pipeline step 1 of 2.
+"""Vocab pruning for a Gemma-4-family base model — pipeline step 1 of 4.
 
 Removes CJK, Cyrillic, Arabic, Devanagari (Hindi), Mongolian script tokens,
 plus tokens carrying distinctive German/Nordic/French/Spanish diacritics

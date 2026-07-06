@@ -226,11 +226,6 @@ def main():
 
     # Dry run: don't load shards, just project shapes from config.
     if args.dry_run:
-        per_depth_params = (
-            hidden                          # enorm
-            + hidden * 2 * hidden           # eh_proj (hidden, 2*hidden)
-            + num_layers * 0                # block: approximated below from a real load
-        )
         log(f"DRY RUN — planned new tensors (per depth):")
         log(f"  {args.mtp_prefix}.{{i}}.enorm.weight: ({hidden},)")
         log(f"  {args.mtp_prefix}.{{i}}.eh_proj.weight: ({hidden}, {2*hidden})")
@@ -278,15 +273,19 @@ def main():
     log(f"MTP added {added_params/1e9:.3f}B params across {len(new_tensors)} new tensors")
     log(f"checkpoint total: {total_params/1e9:.3f}B params")
 
-    # Write output: copy everything from src, then write the merged (sharded)
-    # weights over the top. config.json is written separately below.
+    # Write output: copy everything from src EXCEPT the weight shards and old
+    # index (those get rewritten by write_sharded below with the merged base+MTP
+    # set — copying the old shards first would leave orphaned files not
+    # referenced by the new index, wasting disk and confusing loaders).
     os.makedirs(args.dst, exist_ok=True)
     for fname in os.listdir(args.src):
+        if fname.endswith(".safetensors") or fname == "model.safetensors.index.json":
+            continue
         s = os.path.join(args.src, fname)
         d = os.path.join(args.dst, fname)
         if os.path.isfile(s):
             shutil.copy2(s, d)
-    log("copied source checkpoint files")
+    log("copied source checkpoint files (weights + index rewritten below)")
 
     # Overwrite weights + index with the merged (base + MTP) set.
     write_sharded(merged, args.dst, args.max_shard_bytes)

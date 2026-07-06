@@ -1,0 +1,19 @@
+# Pinned-but-caveatted deps for this repo's tools.
+#
+# These are tested-known-good versions for convenience, NOT a strict constraint.
+# The README's stance ("pin what works in your own environment") still applies —
+# if your ROCm stack needs a different torch, override it. The only hard pin is
+# transformers (the Gemma4Config model_type registration differs across
+# versions; see README).
+#
+# torch is NOT listed here because the ROCm build must come from AMD's index
+# (https://pytorch.org/get-started/locally/ -> ROCm), not PyPI. Install torch
+# first from the ROCm source, then `pip install -r requirements.txt`.
+
+safetensors>=0.4.0
+numpy>=1.24.0
+transformers==5.7.0
+bitsandbytes>=0.43.0  # optional: 8-bit Adam optimizer (falls back to AdamW if absent)
+tensorboard>=2.14.0   # optional: --tb logging (not bundled with torch; warns + stdout-only if absent)
+flash-attn>=2.5.0     # optional: --flash-attn (build from source on ROCm: pip install flash-attn --no-build-isolation)
+torchao>=0.5.0        # optional: --dtype fp8 (fp8 training on MI300X/MI325X; falls back to bf16 if absent)

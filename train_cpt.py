@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CUDA/ROCm continued-pretraining (CPT) / SFT trainer for a Gemma-4-family
-model — pipeline step 3 of 4 (runs against the output of expand_model.py, or
+model — pipeline step 4 of 4 (runs against the output of expand_model.py, or
 directly against a pruned checkpoint if you skip expansion).
 
 Ported from an MLX/Metal original written for a 48GB unified-memory Mac (that
@@ -203,7 +203,9 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     end, break the prefix assumption and would silently mis-tokenize/mis-label. We
     detect that break (the prefix check below) and fall back to a single full
     tokenization with the whole prompt masked — coarser (loses per-turn assistant
-    labeling) but correct, rather than silently wrong.
+    labeling, labels only the last assistant turn) and approximate (assumes the
+    prompt tokenization is a token-level prefix of the full text, which isn't
+    guaranteed for non-appenditive templates), rather than silently wrong.
     """
     import torch
 
@@ -235,7 +237,13 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     if not prefix_assumption_holds:
         # Fallback: tokenize the full conversation once, mask everything before
         # the last assistant turn, label only the last assistant turn's tokens.
-        # Coarser than the per-turn path but correct for non-appenditive templates.
+        # This is APPROXIMATE for non-appenditive templates — it assumes the
+        # prompt-text tokenization is a token-level prefix of the full-text
+        # tokenization, which isn't guaranteed for templates that re-render.
+        # It's safer than the broken incremental diff (which would silently
+        # mis-tokenize), but it only labels the LAST assistant turn, not all
+        # of them. Gemma-4's template is appenditive and takes the primary path
+        # above, so this fallback rarely runs for the targeted model family.
         full_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
@@ -353,11 +361,99 @@ def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int
     return total_loss / max(total_tokens, 1)
 
 
+# ── AMD-specific model optimizations (opt-in, graceful fallback) ─────────────
+
+def _apply_fp8(model):
+    """Convert linear layers to float8_e4m3fn via torchao's Float8Linear.
+    MI300X/MI325X have native fp8 compute — this roughly 2x throughput vs bf16
+    on those cards. Falls back to bf16 (no-op) with a warning if torchao isn't
+    installed or the conversion fails, so --dtype fp8 never crashes a run that
+    would otherwise work."""
+    try:
+        from torchao.float8 import convert_to_float8_training
+        convert_to_float8_training(model)
+        print("[cpt] fp8 training enabled (torchao Float8Linear, float8_e4m3fn) — "
+              "~2x throughput expected on MI300X/MI325X (native fp8 compute). "
+              "Falls back to bf16 matmul internally on cards without fp8 hardware.")
+        return model
+    except ImportError:
+        print("[cpt] WARNING: --dtype fp8 but torchao not installed — falling back "
+              "to bf16. Install with 'pip install torchao'.", file=sys.stderr)
+        return model
+    except Exception as e:
+        print(f"[cpt] WARNING: fp8 conversion failed ({e}) — falling back to bf16. "
+              f"This can happen on architectures without fp8 support or on models "
+              f"with non-standard linear layers.", file=sys.stderr)
+        return model
+
+
+def _apply_flash_attn(model):
+    """Switch the model's attention to Flash Attention 2. Reduces attention VRAM
+    from O(seqlen^2) to O(seqlen) and speeds up long-context training — directly
+    attacks the OOM theme this repo is built around. Requires the flash-attn
+    package built for ROCm. Falls back to standard attention with a warning."""
+    try:
+        import flash_attn  # noqa: F401 — just checking it's importable
+        old_impl = getattr(model.config, "_attn_implementation", "eager")
+        # Use the public set_attn_implementation() API (added in modern
+        # transformers, confirmed present in the transformers==5.7.0 this repo
+        # pins) rather than poking model.config._attn_implementation directly.
+        # The public method validates the requested implementation, propagates
+        # it to nested sub-configs itself (Gemma-4 nests under text_config —
+        # set_attn_implementation walks submodels, so no manual text_config
+        # poke is needed), and warns instead of silently no-op'ing on an
+        # architecture that doesn't support switching post-load.
+        if hasattr(model, "set_attn_implementation"):
+            model.set_attn_implementation("flash_attention_2")
+        else:
+            # Older transformers without the public API: fall back to the
+            # private-attribute poke. Not all architectures honor this
+            # post-load; logged so the user knows to verify via a forward pass.
+            model.config._attn_implementation = "flash_attention_2"
+            if hasattr(model, "text_config"):
+                model.text_config._attn_implementation = "flash_attention_2"
+        print(f"[cpt] flash attention 2 enabled (attn_implementation: "
+              f"{old_impl} -> flash_attention_2). VRAM: O(seqlen^2) -> O(seqlen). "
+              f"Verify via a forward pass — not all architectures honor this "
+              f"post-load; if loss is NaN, the model may not support it.")
+    except ImportError:
+        print("[cpt] WARNING: --flash-attn but flash-attn not installed — using "
+              "standard attention. Install with 'pip install flash-attn "
+              "--no-build-isolation' on a ROCm box.", file=sys.stderr)
+
+
+def _apply_compile(model):
+    """Wrap the model in torch.compile() for kernel fusion + graph optimization.
+    ROCm's inductor backend supports this. The first few steps are slower
+    (compilation overhead); subsequent steps get the speedup. Falls back to
+    eager mode with a warning if compilation fails."""
+    import torch
+    try:
+        compiled = torch.compile(model)
+        print("[cpt] torch.compile() enabled (ROCm inductor backend) — first "
+              "steps will be slower (compilation), then faster (kernel fusion). "
+              "If you see errors from inductor, remove the --compile flag.")
+        return compiled
+    except Exception as e:
+        print(f"[cpt] WARNING: torch.compile() failed ({e}) — using eager mode. "
+              f"This can happen on older ROCm versions or with unsupported ops.",
+              file=sys.stderr)
+        return model
+
+
+
 
 
 def find_decoder_layers(model):
     """Locate the transformer's layer list across a handful of HF model-class
-    shapes a Gemma-4-family checkpoint might load as."""
+    shapes a Gemma-4-family checkpoint might load as. Unwraps DistributedDataParallel
+    (whose wrapped model is at .module) before walking attributes."""
+    # Unwrap DDP: DistributedDataParallel exposes the wrapped model as .module,
+    # and does NOT forward attribute access to it (hasattr(ddp, "model") is False).
+    # Without this, find_decoder_layers fails on every --ddp run. Duck-type via
+    # class name to avoid importing torch in this module-level function.
+    if type(model).__name__ == "DistributedDataParallel":
+        model = model.module
     for path in ["model.layers", "language_model.model.layers", "model.model.layers",
                 "model.language_model.layers"]:  # the path used by custom multi-token-
                 # prediction subclasses that wrap Gemma4ForConditionalGeneration --
@@ -413,25 +509,26 @@ def self_test():
     print("  OK")
 
     print("[selftest] Resume offset: resuming at step N does NOT restart warmup")
-    # The property that matters: a resumed run at absolute step (resume_step + k)
-    # uses the SAME lr as a non-resumed run at that absolute step — i.e. the
-    # schedule is a function of absolute step, not "steps since resume". A buggy
-    # resume that restarted warmup would give lr_at_step(k, ...) instead.
+    # The property that matters: the schedule is a function of ABSOLUTE step,
+    # not "steps since resume." A buggy resume that restarted warmup would use
+    # lr_at_step(k, ...) (relative step) instead of lr_at_step(resume_step + k)
+    # (absolute step). For k within the warmup window, those differ — so we
+    # assert they DO differ (catching a warmup-restart bug). For k past warmup,
+    # both are on the cosine curve but at different points, so they also differ.
     resume_step = 37
     for k in [1, 5, 50]:
         absolute = resume_step + k
-        resumed_lr = lr_at_step(absolute, total, base_lr, warmup)
-        fresh_lr = lr_at_step(absolute, total, base_lr, warmup)
-        assert resumed_lr == fresh_lr, (k, resumed_lr, fresh_lr)
-        # And critically: a warmup-restarting bug would give a DIFFERENT (higher)
-        # lr for small k, since warmup ramps from 0. Assert they differ where
-        # warmup-restart would — so this test would CATCH that bug, not pass it.
-        warmup_restarted_lr = lr_at_step(k, total, base_lr, warmup)
-        if k <= warmup:
-            assert resumed_lr != warmup_restarted_lr, \
-                f"step {k}: resumed lr {resumed_lr} should NOT equal warmup-restart " \
-                f"lr {warmup_restarted_lr} (resume must not restart warmup)"
-    print("  OK (resumed schedule matches absolute-step curve, not a warmup restart)")
+        absolute_lr = lr_at_step(absolute, total, base_lr, warmup)
+        relative_lr = lr_at_step(k, total, base_lr, warmup)
+        # A correct resume uses absolute step; a warmup-restart bug uses relative.
+        # These must NOT be equal (otherwise the schedule would be identical
+        # regardless of resume point, which is only true if warmup already ended
+        # AND the cosine is flat — never the case here).
+        assert absolute_lr != relative_lr, \
+            f"step k={k}: absolute lr {absolute_lr} should differ from " \
+            f"relative lr {relative_lr} (if equal, resume offset has no effect)"
+    print("  OK (absolute-step lr differs from relative-step lr at all tested "
+          "points — resume offset matters, warmup is not restarted)")
 
     print("[selftest] atomic checkpoint rename pattern + .prev retention (no torch/model)")
     import tempfile
@@ -543,8 +640,10 @@ def main():
                     help="Disable held-out validation even if valid.jsonl exists.")
     ap.add_argument("--tb", type=str, default=None,
                     help="Directory for TensorBoard event logs (local files only, no "
-                         "external service). When set, logs train/loss, train/lr, "
-                         "train/step, and eval/valid_loss.")
+                         "external service). When set, logs train/loss, train/lr, and "
+                         "eval/valid_loss. Requires the 'tensorboard' package (not bundled "
+                         "with torch — install separately, or omit this flag for stdout-only "
+                         "logging).")
     ap.add_argument("--pack", action="store_true", default=False,
                     help="Pack short examples into sequences up to --max-seq-len instead "
                          "of padding to batch-max. Reduces padding waste; off by default.")
@@ -558,6 +657,50 @@ def main():
                     help="Tag used only for logging which checkpoint this run considers "
                          "itself to be. Defaults to the basename of --save.")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--gfx-override", type=str, default=None,
+                    help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. gfx1100) "
+                         "for AMD consumer/older cards whose arch isn't in the ROCm "
+                         "torch wheel's compiled list. When unset, rocm_env auto-detects "
+                         "the GPU arch and overrides only if needed. See rocm_env.py.")
+    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+                    help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator). "
+                         "Default 'max_split_size_mb:128' prevents the fragmentation "
+                         "OOMs that hit long training runs. Pass 'none' to disable.")
+    ap.add_argument("--flash-attn", action="store_true", default=False,
+                    help="Use Flash Attention 2 (via flash_attn package) for the "
+                         "attention layers. Reduces VRAM from O(seqlen^2) to "
+                         "O(seqlen) and speeds up long-context training. Requires "
+                         "the 'flash-attn' package built for ROCm (pip install "
+                         "flash-attn --no-build-isolation). Falls back to standard "
+                         "attention with a warning if not installed.")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="Wrap the model in torch.compile() for kernel fusion + "
+                         "graph optimization. ROCm's inductor backend supports this. "
+                         "First few steps will be slower (compilation); subsequent "
+                         "steps get the speedup. Falls back to eager mode with a "
+                         "warning if compilation fails.")
+    ap.add_argument("--dtype", type=str, default="bf16",
+                    choices=["bf16", "fp8"],
+                    help="Training dtype. 'bf16' (default) works on all ROCm cards. "
+                         "'fp8' uses torch.float8_e4m3fn via torchao's Float8Linear "
+                         "for ~2x throughput on MI300X/MI325X (native fp8 compute). "
+                         "Requires the 'torchao' package; falls back to bf16 with a "
+                         "warning if not installed or the card lacks fp8 support.")
+    ap.add_argument("--profile", type=str, default=None,
+                    help="If set, profile the training loop with torch.profiler and "
+                         "write trace artifacts to this directory. The trace is "
+                         "viewable in chrome://tracing or Perfetto, and includes "
+                         "ROCm/HIP kernel launches. For kernel-level profiling "
+                         "beyond torch.profiler, wrap the run with 'rocprof --stats "
+                         "python3 train_cpt.py ...'.")
+    ap.add_argument("--ddp", action="store_true", default=False,
+                    help="Enable multi-GPU training via torch.distributed + "
+                         "DistributedDataParallel. Launch with 'torchrun "
+                         "--nproc_per_node=N train_cpt.py --ddp ...' — the script "
+                         "reads RANK/LOCAL_RANK/WORLD_SIZE from torchrun's env "
+                         "vars. Only rank 0 writes checkpoints and logs; all ranks "
+                         "participate in training with gradient all-reduce. "
+                         "Converts 'one MI300X' -> 'a node of them'.")
     args = ap.parse_args()
 
     if args.selftest:
@@ -567,6 +710,17 @@ def main():
     if not (args.model and args.save and (args.data or args.cpt_cache)):
         ap.error("--model and --save are required, plus one of --data or --cpt-cache, "
                  "unless --selftest is given.")
+
+    # ROCm env bootstrap: MUST run before `import torch`. On AMD consumer/older
+    # cards (RDNA1/2, gfx803, etc.) whose arch isn't in the torch wheel's
+    # compiled list, kernels fail with "no kernel image" unless
+    # HSA_OVERRIDE_GFX_VERSION is set before the runtime initializes.
+    # setup_rocm_env() auto-detects the GPU arch and overrides only if needed;
+    # --gfx-override forces a specific value. No-op on non-ROCm / already-
+    # supported cards. See rocm_env.py for the detection + family-matching logic.
+    from rocm_env import setup_rocm_env
+    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
+    setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -580,6 +734,37 @@ def main():
               "A100/H100). Running on CPU will be extremely slow; only use this path "
               "for a tiny --iters smoke test.", file=sys.stderr)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── Multi-GPU DDP setup ──────────────────────────────────────────────────
+    # When --ddp is set, the script expects to be launched via torchrun:
+    #   torchrun --nproc_per_node=N train_cpt.py --ddp --model ... --save ...
+    # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars. We init the process
+    # group, pin each rank to its local GPU, and use DDP to all-reduce gradients.
+    # Only rank 0 writes checkpoints, logs to stdout, and runs eval — the other
+    # ranks train silently and participate in the gradient sync.
+    ddp_rank = 0
+    ddp_world_size = 1
+    is_main = True  # rank 0 (or single-GPU)
+    if args.ddp:
+        if "RANK" not in os.environ:
+            raise SystemExit("ERROR: --ddp set but RANK env var not found. Launch "
+                             "via 'torchrun --nproc_per_node=N train_cpt.py --ddp ...' "
+                             "so torchrun sets RANK/LOCAL_RANK/WORLD_SIZE.")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        is_main = (ddp_rank == 0)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+        torch.distributed.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            rank=ddp_rank,
+            world_size=ddp_world_size,
+        )
+        if is_main:
+            print(f"[cpt] DDP enabled: rank {ddp_rank}/{ddp_world_size}, "
+                  f"local_rank={local_rank}, device={device}")
 
     save_dir = Path(args.save)
     resume_tag = args.resume_tag or save_dir.name
@@ -611,7 +796,8 @@ def main():
                   f"Resuming from it instead of restarting from --model.")
 
     load_path = str(save_dir) if resumed else args.model
-    print(f"[cpt] Loading model from {load_path} ...")
+    if is_main:
+        print(f"[cpt] Loading model from {load_path} ...")
     # trust_remote_code=True: harmless no-op for any checkpoint that doesn't set
     # config.json's auto_map (falls back to whatever stock architecture class
     # transformers would have loaded anyway). Only matters if your model ships a
@@ -636,14 +822,50 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # ── AMD-specific model optimizations (all opt-in, all with graceful fallback) ──
+    # Order matters: fp8 weight conversion first (compile then fuses the fp8
+    # ops), then flash-attn attn_implementation (independent), then torch.compile
+    # (fuses whatever's there). Each is a no-op if the flag isn't set or the
+    # dependency is missing, so the default path (bf16, eager, standard attn)
+    # is unchanged.
+    if args.dtype == "fp8":
+        model = _apply_fp8(model)
+    if args.flash_attn:
+        _apply_flash_attn(model)
+    if args.compile:
+        model = _apply_compile(model)
+
+    # Wrap in DistributedDataParallel after all model modifications (fp8,
+    # flash-attn, compile) but before apply_window_freeze, so DDP sees the
+    # final parameter set for gradient sync. DDP syncs gradients via all-reduce
+    # during backward — the optimizer step then operates on synced grads.
+    if args.ddp and ddp_world_size > 1:
+        # find_unused_parameters=True handles the windowed-freeze case where only
+        # a subset of params have requires_grad=True — DDP needs to know which
+        # params participate in backward to all-reduce correctly (without this,
+        # DDP's default assumption that every param participates in every
+        # backward pass raises a runtime error the moment a frozen param's
+        # gradient never arrives).
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+            find_unused_parameters=True,
+        )
+        if is_main:
+            print(f"[cpt] model wrapped in DistributedDataParallel "
+                  f"(world_size={ddp_world_size})")
+
     n_layers, end_idx = apply_window_freeze(model, args.start, args.end)
 
+    # For DDP, use the underlying model's parameters (DDP wraps but doesn't
+    # change param objects). find_decoder_layers unwraps DDP via its
+    # type-name check before walking attributes.
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     # build_optimizer() lives in bnb_optimizer.py (extracted so it's independently
     # importable/testable) -- tries bitsandbytes 8-bit Adam, falls back to plain
     # torch.optim.AdamW with a clear warning if bitsandbytes isn't installed.
     optimizer, optimizer_kind = build_optimizer(trainable_params, lr=args.lr, weight_decay=0.01)
-    print(f"[cpt] optimizer: {optimizer_kind}")
+    if is_main:
+        print(f"[cpt] optimizer: {optimizer_kind}")
 
     start_step = 0
     if resumed:
@@ -679,7 +901,11 @@ def main():
     builder = build_cpt_example if args.cpt else build_sft_example
 
     import random as _random
-    rng = _random.Random(args.seed + start_step)
+    # Per-rank seeding: without this, every rank draws the same batches (same
+    # seed + same start_step), DDP all-reduces identical gradients, and the
+    # N-1 extra GPUs do fully redundant work. Adding ddp_rank makes each rank
+    # sample a different subset of the data — real data parallelism.
+    rng = _random.Random(args.seed + start_step + ddp_rank)
 
     stream_gen = None
     if args.cpt_cache:
@@ -693,7 +919,7 @@ def main():
         # cache once, shuffles with the given seed, and reshuffles on every full
         # pass instead of stopping once exhausted.
         try:
-            stream_gen = stream_from_cache(args.cpt_cache, seed=args.seed)
+            stream_gen = stream_from_cache(args.cpt_cache, seed=args.seed + ddp_rank)
         except RuntimeError as e:
             raise SystemExit(str(e))
         print(f"[cpt] training from local cache ({args.cpt_cache}) -- zero network "
@@ -705,7 +931,8 @@ def main():
         if not rows:
             raise SystemExit(f"ERROR: no training rows found in {train_file} — cannot "
                              f"train on an empty dataset.")
-        print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
+        if is_main:
+            print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
 
     # Held-out validation set: load valid.jsonl if present in the --data dir and
     # eval isn't disabled. This makes the --data help string's valid.jsonl promise
@@ -724,25 +951,56 @@ def main():
                 valid_rows = None
                 print(f"[cpt] WARNING: {valid_file} exists but is empty — eval disabled")
 
-    # TensorBoard logging (local event files only, no external service). torch
-    # already bundles tensorboard as a dependency, so no new install needed.
+    # TensorBoard logging (local event files only, no external service).
+    # tensorboard is NOT bundled with torch — it's a separate package. If --tb
+    # is set but tensorboard isn't installed, warn and continue stdout-only
+    # rather than crashing.
     tb_writer = None
     if args.tb:
-        from torch.utils.tensorboard import SummaryWriter
-        tb_writer = SummaryWriter(args.tb)
-        print(f"[cpt] TensorBoard logging -> {args.tb}")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(args.tb)
+            print(f"[cpt] TensorBoard logging -> {args.tb}")
+        except ImportError:
+            print(f"[cpt] WARNING: --tb set but tensorboard not installed — "
+                  f"falling back to stdout-only logging. Install with "
+                  f"'pip install tensorboard'.", file=sys.stderr)
+            tb_writer = None
 
     model.train()
     async_ckpt = AsyncCheckpointer() if args.async_checkpoint else None
     if args.async_checkpoint:
         print("[cpt] async checkpointing enabled -- checkpoint writes run on a "
               "background thread, training does not wait for them except at exit")
+    last_valid_loss = None  # carried into checkpoint extra_state for catch_and_resume rollback
+
+    # Profiling: wrap the training loop in torch.profiler if --profile is set.
+    # The trace includes ROCm/HIP kernel launches and is viewable in
+    # chrome://tracing or Perfetto. For deeper kernel-level profiling, wrap the
+    # whole run with 'rocprof --stats python3 train_cpt.py ...' instead.
+    profiler = None
+    if args.profile and is_main:
+        # Only rank 0 profiles — all ranks writing to the same dir would
+        # collide/corrupt traces. Non-rank-0 GPUs just don't enter the profiler.
+        os.makedirs(args.profile, exist_ok=True)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=2, warmup=2, active=10, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.profile),
+        )
+        profiler.__enter__()
+        print(f"[cpt] profiling enabled — trace artifacts -> {args.profile} "
+              f"(viewable in chrome://tracing or Perfetto)")
+
     for it in range(start_step + 1, args.iters + 1):
         if stream_gen is not None:
             batch_rows = [next(stream_gen) for _ in range(args.batch)]
         else:
             batch_rows = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
         examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
+        if args.pack:
+            examples = pack_examples(examples, args.max_seq_len)
         batch = collate(examples, tokenizer.pad_token_id)
         batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -757,12 +1015,45 @@ def main():
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
 
-        if it % 10 == 0 or it == args.iters:
-            print(f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}")
+        if profiler is not None:
+            profiler.step()
 
-        if (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
+        # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
+        if it % 10 == 0 or it == args.iters:
+            if is_main:
+                print(f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}")
+        if tb_writer is not None and is_main and it % 10 == 0:
+            tb_writer.add_scalar("train/loss", loss.item(), it)
+            tb_writer.add_scalar("train/lr", lr, it)
+
+        # Held-out eval at eval_every intervals (rank 0 only — the eval forward
+        # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
+        if valid_rows is not None and is_main and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
+            vloss = run_eval(model, valid_rows, builder, tokenizer, args.max_seq_len,
+                             args.batch, device, args.pack, tokenizer.pad_token_id)
+            last_valid_loss = vloss
+            print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
+            if tb_writer is not None:
+                tb_writer.add_scalar("eval/valid_loss", vloss, it)
+
+        # DDP barrier: ensure all ranks are at the same step before checkpointing,
+        # so rank 0 doesn't write a checkpoint from a step where other ranks are
+        # still mid-backward (which would save unsynced gradients on resume).
+        if args.ddp and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
+            torch.distributed.barrier()
+
+        # Only rank 0 writes checkpoints — DDP syncs gradients, so the model
+        # state is identical across ranks; writing from one is sufficient and
+        # avoids N copies of a multi-GB checkpoint hitting disk simultaneously.
+        if is_main and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
+            ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
+            # Unwrap DDP for checkpointing: save_pretrained / state_dict need the
+            # underlying model, not the DDP wrapper (which prefixes keys with
+            # "module." and has no save_pretrained).
+            save_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             if args.async_checkpoint:
-                async_ckpt.save(model, optimizer, it, save_dir, tokenizer,
+                async_ckpt.save(save_model, optimizer, it, save_dir, tokenizer,
+                                extra_state=ckpt_extra,
                                 custom_code_src=Path(args.model))
                 # On exit (SIGTERM or final iter) the write MUST finish before the
                 # process dies, or this defeats the whole point of atomic checkpointing.
@@ -772,14 +1063,28 @@ def main():
                 if _SHOULD_STOP or it == args.iters:
                     async_ckpt.wait_for_pending()
             else:
-                atomic_save_checkpoint(model, optimizer, it, save_dir, tokenizer,
+                atomic_save_checkpoint(save_model, optimizer, it, save_dir, tokenizer,
+                                       extra_state=ckpt_extra,
                                        custom_code_src=Path(args.model))
 
         if _SHOULD_STOP:
             print(f"[cpt] Exiting cleanly after checkpoint at step {it} (SIGTERM)")
+            if tb_writer is not None:
+                tb_writer.close()
+            if profiler is not None:
+                profiler.__exit__(None, None, None)
+            if args.ddp:
+                torch.distributed.destroy_process_group()
             sys.exit(0)
 
-    print(f"\n[cpt] Done. Final checkpoint at step {args.iters} -> {save_dir}")
+    if is_main:
+        print(f"\n[cpt] Done. Final checkpoint at step {args.iters} -> {save_dir}")
+    if tb_writer is not None:
+        tb_writer.close()
+    if profiler is not None:
+        profiler.__exit__(None, None, None)
+    if args.ddp:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

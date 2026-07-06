@@ -14,16 +14,20 @@ contributing as training proceeds).
 Key design decisions (the genuinely interesting engineering here):
 
   - **Orthogonal-QR width init**, not random-normal init. New MLP columns are
-    built via `numpy.linalg.qr` on a random matrix, scaled down (`INIT_SCALE`),
-    so the new capacity starts near-orthogonal to what the model already
-    learned — it doesn't immediately conflict with or wash out existing
-    representations, but the model still has an actual gradient signal to
-    grow into the new capacity (as opposed to zero-init, which would give the
-    new columns literally no initial gradient because their contribution
-    starts at exactly zero for the *width* dimension, unlike the *depth*
-    duplication case below where zero-init is the right call for a different
-    reason — see the code comment on why the two cases use different
-    strategies deliberately, not inconsistently).
+    built via `numpy.linalg.qr` on a random matrix, scaled down (`INIT_SCALE`).
+    The QR construction makes the new columns orthonormal *among themselves*
+    (mutually orthogonal), NOT orthogonal to the model's existing weight columns
+    — the QR runs on a fresh random matrix, with no reference to the existing
+    weights. What actually limits disruption to existing representations is the
+    small `INIT_SCALE` (0.02), not orthogonality to existing weights. The
+    orthonormal-among-themselves property still helps: it means the new capacity
+    isn't redundant within itself (no two new columns are near-identical), so
+    the model has a real, non-degenerate gradient signal to grow into the new
+    capacity (as opposed to zero-init, which would give the new columns literally
+    no initial gradient because their contribution starts at exactly zero for the
+    *width* dimension, unlike the *depth* duplication case below where zero-init
+    is the right call for a different reason — see the code comment on why the
+    two cases use different strategies deliberately, not inconsistently).
   - **Zero-init depth duplication**, not orthogonal-QR, for newly duplicated
     LAYERS. A duplicated layer clones its donor layer's weights outright
     (real, already-trained weights — not fresh init), but its output

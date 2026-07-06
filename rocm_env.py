@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""AMD ROCm environment bootstrap: detect the GPU's gfx architecture and set
+HSA_OVERRIDE_GFX_VERSION when the detected arch isn't in PyTorch's compiled-in
+list, so consumer/older AMD cards (RDNA1/2, gfx803, etc.) actually launch
+kernels instead of failing silently at the first CUDA/ROCm call.
+
+WHY THIS EXISTS
+---------------
+ROCm PyTorch wheels are typically compiled for a handful of gfx architectures
+(e.g. gfx900, gfx906, gfx90a, gfx940, gfx941, gfx942, gfx1030, gfx1100). A
+card whose architecture ISN'T in that compiled list — most consumer RDNA
+cards (RX 7900 = gfx1100 usually works, but RX 6800 = gfx1030 sometimes
+doesn't depending on the wheel, RX 5700 = gfx1010 almost never does, older
+Fiji/Polaris = gfx803 never does) — will import torch fine but fail at the
+first kernel launch with an error like "no kernel image is available for
+execution on the device".
+
+The standard fix is to set the HSA_OVERRIDE_GFX_VERSION environment variable
+to a compatible arch BEFORE the ROCm device runtime initializes (see the
+ORDERING NOTE below for why the auto-detect path works despite importing torch
+first).
+
+WHAT THIS DOES
+--------------
+  1. Probe the GPU's gfx arch via rocm-smi or /sys/class/kfd (no torch import).
+  2. Import torch and read torch.cuda.get_arch_list() to see which archs this
+     wheel was compiled for.
+  3. If the detected arch is NOT in torch's compiled list, find the closest
+     family member (same gfxNN major) that IS, and set
+     HSA_OVERRIDE_GFX_VERSION to it.
+  4. If no family match exists, warn loudly and DON'T override (guessing wrong
+     can be worse than not overriding — a wrong arch override can produce
+     silent numerical errors or crashes).
+  5. Always log what it did (or didn't do).
+
+ORDERING NOTE: HSA_OVERRIDE_GFX_VERSION must be set before the ROCm device
+runtime initializes. In the auto-detect path, this module imports torch (to
+read get_arch_list) BEFORE setting the env var. This works in practice because
+torch's device init is LAZY — `import torch` and `get_arch_list()` read
+compiled metadata without initializing the device; the actual device init
+happens later at the first real CUDA/ROCm call (e.g. torch.cuda.is_available()
+or a tensor op on GPU), which runs after the env var is set. If you want a
+fully-robust path that sets the env var with ZERO torch import first, use
+--gfx-override (the force-override path imports no torch at all).
+
+WHAT THIS DOES NOT DO
+---------------------
+  - It does NOT install drivers, ROCm, or PyTorch. It assumes a working ROCm
+    stack where the only issue is an arch mismatch.
+  - It does NOT override if the detected arch is already in torch's list
+    (the common case on MI250/MI300 — no override needed there).
+  - It is NOT a guarantee that every AMD card will work — some very old archs
+    (pre-gfx800) have no compatible override target in any modern wheel. This
+    module surfaces that honestly rather than guessing.
+
+Usage as a library (call BEFORE importing torch in your training script):
+    from rocm_env import setup_rocm_env
+    info = setup_rocm_env()          # auto-detect + override if needed
+    import torch                     # safe to import now
+    print(info)                      # what was set / why
+
+Explicit override (skip auto-detection):
+    setup_rocm_env(override="gfx1100")
+
+CLI / self-test (no GPU/torch required — tests parsing + family-matching logic):
+    python3 rocm_env.py --selftest
+"""
+
+import argparse
+import os
+import re
+import subprocess
+
+GFX_RE = re.compile(r"gfx(\d{3,4})")
+
+
+def detect_gfx_arch():
+    """Probe the GPU's gfx architecture WITHOUT importing torch (so the env
+    var can be set before torch runtime init). Returns a string like 'gfx1100'
+    or None if no AMD GPU / no rocm-smi / no /sys/class/kfd.
+
+    Tries, in order:
+      1. `rocm-smi --showproductname` — parse the 'gfx' string from its output.
+      2. /sys/class/kfd/.../name files — each KFD node has a 'name' sysfs file
+         containing the gfx arch (e.g. 'gfx1100').
+    Both are read-only probes; neither modifies anything.
+    """
+    # 1. rocm-smi --showproductname
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "--showproductname"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode("utf-8", errors="replace")
+        m = GFX_RE.search(out)
+        if m:
+            return f"gfx{m.group(1)}"
+    except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
+
+    # 2. /sys/class/kfd/*/name
+    kfd_dir = "/sys/class/kfd"
+    if os.path.isdir(kfd_dir):
+        for entry in sorted(os.listdir(kfd_dir)):
+            name_path = os.path.join(kfd_dir, entry, "name")
+            try:
+                with open(name_path) as f:
+                    name = f.read().strip()
+                m = GFX_RE.match(name)
+                if m:
+                    return f"gfx{m.group(1)}"
+            except (OSError, IOError):
+                continue
+
+    return None
+
+
+def get_torch_arch_list():
+    """Import torch and return its compiled-in arch list (e.g.
+    ['sm_90', 'gfx900', 'gfx1100', ...]). Returns None if torch can't import
+    or has no CUDA/ROCm build."""
+    try:
+        import torch
+        if hasattr(torch.cuda, "get_arch_list"):
+            return torch.cuda.get_arch_list()
+    except Exception:
+        pass
+    return None
+
+
+def _gfx_major(arch):
+    """Extract the 'gfxNN' major prefix from a full 'gfxNNNN' string, e.g.
+    'gfx1100' -> 'gfx11'. Returns None if the format is unexpected."""
+    m = re.match(r"gfx(\d{2})", arch or "")
+    return f"gfx{m.group(1)}" if m else None
+
+
+def find_override_target(detected_arch, torch_arch_list):
+    """Given a detected arch that's NOT in torch's compiled list, find the
+    closest family member (same gfxNN major) that IS in the list.
+
+    Strategy: among the archs in torch_arch_list that share the same gfxNN
+    major prefix as detected_arch, pick the numerically closest one. If none
+    share the major prefix, return None (no safe override — guessing across
+    major families risks silent errors). If the detected arch IS already in
+    the list, returns None (no override needed — the caller checks this first,
+    but this is defensive).
+
+    Returns the override arch string (e.g. 'gfx1030') or None.
+    """
+    if not torch_arch_list or not detected_arch:
+        return None
+
+    # If already supported, no override needed.
+    def base_arch(a):
+        return GFX_RE.search(a).group(0) if GFX_RE.search(a) else a
+    if detected_arch in {base_arch(a) for a in torch_arch_list if GFX_RE.search(a)}:
+        return None
+
+    detected_major = _gfx_major(detected_arch)
+    if not detected_major:
+        return None
+
+    # Filter torch's list to ROCm gfx archs (skip CUDA 'sm_XX' entries) sharing
+    # the same major prefix.
+    m = re.match(r"gfx(\d{2})(\d{2})", detected_arch)
+    if not m:
+        return None
+    detected_num = int(m.group(2))
+
+    candidates = []
+    for a in torch_arch_list:
+        am = re.match(r"gfx(\d{2})(\d{2})", a)
+        if not am:
+            continue
+        if f"gfx{am.group(1)}" != detected_major:
+            continue
+        candidates.append((a, int(am.group(2))))
+
+    if not candidates:
+        return None
+
+    # Pick the numerically closest minor within the same major family.
+    candidates.sort(key=lambda c: abs(c[1] - detected_num))
+    return candidates[0][0]
+
+
+def _set_hip_alloc_conf(conf, verbose=True):
+    """Set PYTORCH_HIP_ALLOC_CONF if not already set by the user. This must
+    happen BEFORE torch's caching allocator initializes (i.e. before the first
+    CUDA/ROCm allocation). The env var is read once at allocator init; setting
+    it after init has no effect, which is why this runs at the top of
+    setup_rocm_env rather than after torch import.
+
+    max_split_size_mb limits how large a single block the allocator will split
+    for a smaller request. Without it, a large block gets fragmented into pieces
+    that can't be recombined — the classic "I have 20GB free but OOM on a 2GB
+    allocation" symptom on long training runs. The default 128MB is conservative
+    and matches what most ROCm training guides recommend."""
+    if conf is None:
+        return
+    if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_HIP_ALLOC_CONF"] = conf
+        if verbose:
+            print(f"[rocm_env] PYTORCH_HIP_ALLOC_CONF={conf} "
+                  f"(prevents allocator fragmentation OOMs on long runs)")
+    elif verbose:
+        existing = os.environ["PYTORCH_HIP_ALLOC_CONF"]
+        if existing != conf:
+            print(f"[rocm_env] PYTORCH_HIP_ALLOC_CONF already set to "
+                  f"'{existing}' by user — not overriding")
+
+
+def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
+                   verbose=True):
+    """Main entry point. Call BEFORE importing torch in a training script.
+
+    - If `override` is given (e.g. 'gfx1100'), set HSA_OVERRIDE_GFX_VERSION to
+      it directly — no detection, no torch arch-list comparison.
+    - Otherwise: detect the GPU arch, import torch, get its compiled arch list,
+      and override ONLY if the detected arch isn't already supported.
+    - Sets PYTORCH_HIP_ALLOC_CONF to `hip_alloc_conf` (default
+      'max_split_size_mb:128') if it isn't already set. This prevents the ROCm
+      caching allocator from splitting large blocks into fragments that can't
+      be recombined, which is the #1 cause of "phantom OOM" on long training
+      runs where VRAM is actually available but fragmented. Pass None to skip.
+      The default 128MB split limit is conservative; set it lower (e.g. 64) if
+      you have many small allocations, or higher if you train with very large
+      contiguous buffers. Set unconditionally (before GPU detection) because
+      the env var must be set before the allocator initializes and is harmless
+      on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF instead).
+
+    Returns a dict describing what happened:
+        {'action': 'override'|'no-override'|'force-override'|'skip',
+         'detected': 'gfx1100' or None,
+         'torch_arch_list': [...],
+         'override_value': 'gfx1030' or None,
+         'hip_alloc_conf': 'max_split_size_mb:128' or None,
+         'reason': '...'}
+    """
+    # Set PYTORCH_HIP_ALLOC_CONF early (before torch import) so the allocator
+    # picks it up at init time. Set unconditionally (not gated on GPU detection)
+    # because the env var must be set before the allocator initializes and is
+    # harmless on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF).
+    _set_hip_alloc_conf(hip_alloc_conf, verbose)
+
+    if override is not None:
+        os.environ["HSA_OVERRIDE_GFX_VERSION"] = override
+        info = {
+            "action": "force-override",
+            "detected": None,
+            "torch_arch_list": None,
+            "override_value": override,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": f"explicit --gfx-override={override}; skipping detection",
+        }
+        if verbose:
+            print(f"[rocm_env] HSA_OVERRIDE_GFX_VERSION={override} (forced, "
+                  f"no detection)")
+        return info
+
+    detected = detect_gfx_arch()
+    torch_arch_list = get_torch_arch_list()
+
+    if detected is None:
+        info = {
+            "action": "skip",
+            "detected": None,
+            "torch_arch_list": torch_arch_list,
+            "override_value": None,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": "no AMD GPU detected (no rocm-smi, no /sys/class/kfd) — "
+                      "not overriding",
+        }
+        if verbose:
+            print(f"[rocm_env] no AMD GPU arch detected (rocm-smi and /sys/class/kfd "
+                  f"both unavailable) — not setting HSA_OVERRIDE_GFX_VERSION. "
+                  f"If you're on an AMD card, check that rocm-smi is on PATH.")
+        return info
+
+    if torch_arch_list is None:
+        info = {
+            "action": "skip",
+            "detected": detected,
+            "torch_arch_list": None,
+            "override_value": None,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": "torch.cuda.get_arch_list() unavailable — can't determine "
+                      f"if {detected} needs an override",
+        }
+        if verbose:
+            print(f"[rocm_env] detected {detected} but couldn't read torch's arch "
+                  f"list (torch.cuda.get_arch_list() unavailable) — not overriding. "
+                  f"Set HSA_OVERRIDE_GFX_VERSION manually if you hit 'no kernel "
+                  f"image' errors.")
+        return info
+
+    # Normalize: torch's list may use 'gfx1100' or 'gfx1100:xnack-' variants.
+    # Compare the base gfxNNNN token.
+    def base_arch(a):
+        return GFX_RE.search(a).group(0) if GFX_RE.search(a) else a
+
+    torch_base = {base_arch(a) for a in torch_arch_list if GFX_RE.search(a)}
+
+    if detected in torch_base:
+        info = {
+            "action": "no-override",
+            "detected": detected,
+            "torch_arch_list": torch_arch_list,
+            "override_value": None,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": f"{detected} is already in torch's compiled arch list — "
+                      f"no override needed",
+        }
+        if verbose:
+            print(f"[rocm_env] detected {detected}, already supported by this "
+                  f"torch build — no override needed.")
+        return info
+
+    # Detected arch is NOT in torch's list — find a family-compatible override.
+    target = find_override_target(detected, torch_arch_list)
+    if target is None:
+        info = {
+            "action": "skip",
+            "detected": detected,
+            "torch_arch_list": torch_arch_list,
+            "override_value": None,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": f"{detected} not in torch's arch list and no same-family "
+                      f"({_gfx_major(detected)}) override target found — NOT "
+                      f"guessing (wrong override can cause silent errors)",
+        }
+        if verbose:
+            print(f"[rocm_env] WARNING: detected {detected} is NOT in this torch "
+                  f"build's arch list {sorted(torch_base)}, and no same-major "
+                  f"({_gfx_major(detected)}) fallback exists. NOT overriding — "
+                  f"a wrong cross-family override can cause silent numerical "
+                  f"errors. If kernels fail with 'no kernel image', you'll need "
+                  f"a torch wheel compiled for {detected}.", flush=True)
+        return info
+
+    os.environ["HSA_OVERRIDE_GFX_VERSION"] = target
+    info = {
+        "action": "override",
+        "detected": detected,
+        "torch_arch_list": torch_arch_list,
+        "override_value": target,
+        "hip_alloc_conf": hip_alloc_conf,
+        "reason": f"{detected} not in torch's arch list; overriding to "
+                  f"{target} (same {_gfx_major(detected)} family)",
+    }
+    if verbose:
+        print(f"[rocm_env] detected {detected} (not in torch's compiled list "
+              f"{sorted(torch_base)}) — setting HSA_OVERRIDE_GFX_VERSION={target} "
+              f"(closest same-family {_gfx_major(detected)} arch in the build). "
+              f"This lets kernels launch on a card the wheel wasn't compiled for.")
+    return info
+
+
+def _self_test():
+    print("[selftest] rocm_env: gfx arch detection + family-matching logic "
+          "(no GPU/torch required)")
+
+    # detect_gfx_arch() on a non-ROCm box returns None (no rocm-smi, no /sys/kfd).
+    detected = detect_gfx_arch()
+    print(f"  detect_gfx_arch() on this host: {detected!r} "
+          f"(expected None on a non-ROCm box)")
+    # Don't hard-assert None — if this runs ON a ROCm box it'd be a real arch.
+    # Just assert it's a valid gfx string or None.
+    assert detected is None or GFX_RE.match(detected), detected
+
+    # _gfx_major extracts the gfxNN prefix.
+    assert _gfx_major("gfx1100") == "gfx11"
+    assert _gfx_major("gfx1030") == "gfx10"
+    assert _gfx_major("gfx90a") == "gfx90"  # MI250 arch, letter suffix — major is gfx90
+    assert _gfx_major(None) is None
+    print("  OK (_gfx_major extracts gfxNN major prefix correctly)")
+
+    # find_override_target: same-family fallback exists.
+    torch_list = ["sm_90", "gfx900", "gfx906", "gfx90a", "gfx942",
+                  "gfx1030", "gfx1100"]
+    # gfx1010 (RDNA1) not in list, but gfx1030 (RDNA2) is same gfx10 family.
+    target = find_override_target("gfx1010", torch_list)
+    assert target == "gfx1030", f"expected gfx1030, got {target}"
+    # gfx1101 not in list, gfx1100 is same gfx11 family.
+    target = find_override_target("gfx1101", torch_list)
+    assert target == "gfx1100", f"expected gfx1100, got {target}"
+    # gfx803 (Fiji/Polaris) — no gfx08 family member in this list -> None.
+    target = find_override_target("gfx803", torch_list)
+    assert target is None, f"expected None for gfx803 (no gfx08 family), got {target}"
+    # Already-supported arch returns None (no override needed).
+    target = find_override_target("gfx1100", torch_list)
+    assert target is None, f"expected None for already-supported gfx1100, got {target}"
+    # Empty / None lists return None.
+    assert find_override_target("gfx1100", None) is None
+    assert find_override_target("gfx1100", []) is None
+    print("  OK (find_override_target picks closest same-family arch, "
+          "returns None when no family match or already supported)")
+
+    # setup_rocm_env with explicit override sets the env var directly.
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    info = setup_rocm_env(override="gfx1030", verbose=False)
+    assert info["action"] == "force-override"
+    assert os.environ.get("HSA_OVERRIDE_GFX_VERSION") == "gfx1030"
+    assert info["override_value"] == "gfx1030"
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    print("  OK (explicit override sets HSA_OVERRIDE_GFX_VERSION directly)")
+
+    # setup_rocm_env with no override on a non-ROCm box: action='skip', doesn't
+    # set the env var. (On a real ROCm box this would do real detection.)
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    info = setup_rocm_env(verbose=False)
+    assert info["action"] in ("skip", "no-override", "override"), info["action"]
+    if info["action"] == "skip" and "no AMD GPU" in info["reason"]:
+        assert "HSA_OVERRIDE_GFX_VERSION" not in os.environ, \
+            "should NOT set env var when no GPU detected"
+    print(f"  OK (auto-detect action={info['action']!r} on this host; env var "
+          f"{'set' if 'HSA_OVERRIDE_GFX_VERSION' in os.environ else 'not set'})")
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+
+    print("[selftest] PYTORCH_HIP_ALLOC_CONF is set by setup_rocm_env")
+    os.environ.pop("PYTORCH_HIP_ALLOC_CONF", None)
+    info = setup_rocm_env(override="gfx1030", verbose=False)
+    assert "PYTORCH_HIP_ALLOC_CONF" in os.environ, \
+        "setup_rocm_env should set PYTORCH_HIP_ALLOC_CONF"
+    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == "max_split_size_mb:128"
+    os.environ.pop("PYTORCH_HIP_ALLOC_CONF", None)
+    # User-set value should NOT be overridden.
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.5"
+    info = setup_rocm_env(override="gfx1030", verbose=False)
+    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == "garbage_collection_threshold:0.5", \
+        "user-set PYTORCH_HIP_ALLOC_CONF should not be overridden"
+    os.environ.pop("PYTORCH_HIP_ALLOC_CONF", None)
+    # None disables it entirely.
+    info = setup_rocm_env(override="gfx1030", hip_alloc_conf=None, verbose=False)
+    assert "PYTORCH_HIP_ALLOC_CONF" not in os.environ, \
+        "hip_alloc_conf=None should not set the env var"
+    os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    print("  OK (sets default, respects user-set value, None disables)")
+
+    print("\n[selftest] All checks passed (no GPU required — run on real AMD "
+          "hardware to verify detection + override actually work).")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    ap.add_argument("--gfx-override", type=str, default=None,
+                    help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. "
+                         "gfx1100), skipping auto-detection.")
+    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+                    help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator "
+                         "config). Default 'max_split_size_mb:128' prevents "
+                         "fragmentation OOMs. Pass 'none' to skip.")
+    args = ap.parse_args()
+    if args.selftest:
+        _self_test()
+    else:
+        conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
+        info = setup_rocm_env(override=args.gfx_override, hip_alloc_conf=conf)
+        print(f"\n{info}")
+
+
+if __name__ == "__main__":
+    main()

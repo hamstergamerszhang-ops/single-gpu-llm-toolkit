@@ -30,9 +30,10 @@ Usage as a library:
     optimizer, kind = build_optimizer(trainable_params, lr=8e-7, weight_decay=0.01)
     print(f"[cpt] optimizer: {kind}")
 
-Self-test (no GPU/model required -- constructs both optimizer types against a
-tiny dummy tensor and checks the fallback path is reachable without
-bitsandbytes installed):
+Self-test (no GPU/model required -- constructs whichever optimizer is available
+in the current environment against a tiny dummy tensor, and checks the fallback
+path is reachable without bitsandbytes installed; re-run on a box WITH
+bitsandbytes to confirm 'kind' comes back as bnb_adam8bit):
     python3 bnb_optimizer.py --selftest
 """
 
