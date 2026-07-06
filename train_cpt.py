@@ -317,7 +317,6 @@ def pack_examples(examples: list[dict], max_seq_len: int):
     return packed
 
 
-@torch.no_grad() if False else (lambda f: f)
 def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int,
              batch: int, device: str, pack: bool, pad_token_id: int):
     """Run a no-grad forward pass over the full valid set, return mean loss.
@@ -331,23 +330,24 @@ def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int
     total_tokens = 0
     model.eval()
     try:
-        for i in range(0, len(valid_rows), batch):
-            chunk = valid_rows[i:i + batch]
-            examples = [builder(r, tokenizer, max_seq_len) for r in chunk]
-            if pack:
-                examples = pack_examples(examples, max_seq_len)
-            if not examples:
-                continue
-            batch_data = collate(examples, pad_token_id)
-            batch_data = {k: v.to(device) for k, v in batch_data.items()}
-            outputs = model(**batch_data)
-            # outputs.loss is mean over non-ignored tokens in the batch — scale
-            # by token count for a correct weighted mean across the whole set.
-            labels = batch_data["labels"]
-            n_tokens = (labels != -100).sum().item()
-            if n_tokens > 0:
-                total_loss += outputs.loss.item() * n_tokens
-                total_tokens += n_tokens
+        with torch.no_grad():
+            for i in range(0, len(valid_rows), batch):
+                chunk = valid_rows[i:i + batch]
+                examples = [builder(r, tokenizer, max_seq_len) for r in chunk]
+                if pack:
+                    examples = pack_examples(examples, max_seq_len)
+                if not examples:
+                    continue
+                batch_data = collate(examples, pad_token_id)
+                batch_data = {k: v.to(device) for k, v in batch_data.items()}
+                outputs = model(**batch_data)
+                # outputs.loss is mean over non-ignored tokens in the batch — scale
+                # by token count for a correct weighted mean across the whole set.
+                labels = batch_data["labels"]
+                n_tokens = (labels != -100).sum().item()
+                if n_tokens > 0:
+                    total_loss += outputs.loss.item() * n_tokens
+                    total_tokens += n_tokens
     finally:
         model.train()
     return total_loss / max(total_tokens, 1)
@@ -706,6 +706,31 @@ def main():
             raise SystemExit(f"ERROR: no training rows found in {train_file} — cannot "
                              f"train on an empty dataset.")
         print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
+
+    # Held-out validation set: load valid.jsonl if present in the --data dir and
+    # eval isn't disabled. This makes the --data help string's valid.jsonl promise
+    # real (it previously advertised valid.jsonl but never read it). valid_loss is
+    # a more honest signal than train loss for catch_and_resume.sh's rollback.
+    valid_rows = None
+    eval_every = args.eval_every or args.checkpoint_every
+    if not args.no_eval and args.data and Path(args.data).is_dir():
+        valid_file = Path(args.data) / "valid.jsonl"
+        if valid_file.exists():
+            valid_rows = load_jsonl(valid_file)
+            if valid_rows:
+                print(f"[cpt] {len(valid_rows):,} validation rows loaded from {valid_file} "
+                      f"-- eval every {eval_every} steps")
+            else:
+                valid_rows = None
+                print(f"[cpt] WARNING: {valid_file} exists but is empty — eval disabled")
+
+    # TensorBoard logging (local event files only, no external service). torch
+    # already bundles tensorboard as a dependency, so no new install needed.
+    tb_writer = None
+    if args.tb:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(args.tb)
+        print(f"[cpt] TensorBoard logging -> {args.tb}")
 
     model.train()
     async_ckpt = AsyncCheckpointer() if args.async_checkpoint else None
