@@ -73,6 +73,14 @@ network path):
 Self-test (no model/GPU required -- checks schedule math, masking, and the
 atomic checkpoint rename logic against a tmp dir):
     python3 train_cpt.py --selftest
+
+Four pieces that used to be inlined directly in this file's main() are now
+their own standalone modules, imported below: optimizer construction
+(bnb_optimizer.py), async checkpoint writes (async_checkpoint.py), the
+optimizer-type resume guard (optimizer_compat_guard.py), and local-cache
+data streaming (local_cache_stream.py). Each is independently
+importable/runnable with its own --selftest -- see README.md's "Standalone
+utilities" section for what each one solves on its own.
 """
 
 import argparse
@@ -84,6 +92,11 @@ import signal
 import sys
 import time
 from pathlib import Path
+
+from async_checkpoint import AsyncCheckpointer
+from bnb_optimizer import build_optimizer
+from local_cache_stream import stream_from_cache
+from optimizer_compat_guard import check_optimizer_compat
 
 
 # ── LR schedule ───────────────────────────────────────────────────────────
@@ -152,130 +165,11 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
     print(f"[cpt] saved step {step} -> {save_dir}")
 
 
-def _move_to_cpu(obj):
-    """Recursively moves tensors in a nested dict/list to CPU. Used to snapshot
-    optimizer.state_dict() (a dict of dicts of tensors, e.g. Adam's per-param moment
-    buffers) before handing it to a background thread -- the GPU-resident originals
-    keep getting mutated by the next training step the moment this snapshot is taken,
-    so nothing downstream may still reference the live GPU tensors."""
-    import torch
-    if torch.is_tensor(obj):
-        return obj.detach().to("cpu", copy=True)
-    if isinstance(obj, dict):
-        return {k: _move_to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_move_to_cpu(v) for v in obj]
-    return obj
-
-
-class AsyncCheckpointer:
-    """Non-blocking checkpoint writes: the expensive part (serializing tens of
-    GB to a possibly-slow disk/NFS mount) happens on a background thread while
-    the GPU immediately continues training the next step, instead of sitting
-    idle for the whole write.
-
-    Split into two phases, matching the standard async-checkpoint pattern:
-      1. SYNCHRONOUS snapshot -- copy model + optimizer state to CPU RAM. This
-         still blocks the training loop briefly (a GPU->CPU copy over
-         PCIe/interconnect), but that's a small fraction of the time a full
-         disk write takes on a slow mount, and it's the only phase that MUST
-         be synchronous (the GPU tensors are about to be mutated by the next
-         step, so the copy has to happen before that).
-      2. ASYNC write -- everything from "turn these CPU tensors into files on
-         disk" onward runs in a background thread and never touches the live
-         model/optimizer again, so it's safe to run concurrently with the
-         next several training steps.
-
-    Bounded to ONE in-flight write at a time (save() blocks on any
-    still-running previous write before starting a new snapshot) -- prevents
-    unbounded CPU-RAM growth from queueing multiple large snapshots if writes
-    fall behind the checkpoint interval, at the cost of occasionally still
-    waiting on a slow write. With --checkpoint-every raised to a sane interval
-    this should be rare in practice.
-
-    NOTE: this is where checkpoints land in local disk, and nothing more --
-    getting them onto durable/shared storage (e.g. a periodic rsync to a
-    network volume) is a separate, deliberately decoupled concern. See
-    README.md for why this repo does not wire in a cloud-object-store push
-    here, even though that's a common design for this kind of script.
-    """
-
-    def __init__(self):
-        self._thread = None
-
-    def save(self, model, optimizer, step: int, save_dir: Path, tokenizer=None,
-             extra_state: dict | None = None, custom_code_src: Path | None = None):
-        import threading
-
-        if self._thread is not None and self._thread.is_alive():
-            print("[ckpt-async] previous async write still in flight -- waiting for it "
-                  "before starting a new snapshot (checkpoint interval may be too tight "
-                  "relative to write speed on this disk)")
-            self._thread.join()
-
-        # Phase 1 (synchronous, blocks briefly): snapshot to CPU.
-        # Drop tied-weight duplicates BEFORE copying (e.g. tie_word_embeddings=True
-        # means lm_head.weight and embed_tokens.weight share the same storage) --
-        # a naive model.state_dict() copy loses the tie relationship (each
-        # .to('cpu', copy=True) makes an independent copy), and passing that as an
-        # explicit state_dict= override to save_pretrained() skips its normal
-        # tied-weight dedup, silently writing a full extra copy of the embedding
-        # matrix (GB-scale on a large-vocab model) into every checkpoint. Removing
-        # the known-duplicate key here restores the synchronous path's behavior
-        # exactly -- transformers re-derives it from config on load either way.
-        tied_keys = set(getattr(model, "_tied_weights_keys", {}) or {})
-        raw_state = model.state_dict()
-        model_state_cpu = {k: v.detach().to("cpu", copy=True)
-                           for k, v in raw_state.items() if k not in tied_keys}
-        opt_state_cpu = {
-            "optimizer": _move_to_cpu(optimizer.state_dict()),
-            "optimizer_type": type(optimizer).__name__,
-            "step": step,
-            **(extra_state or {}),
-        }
-        print(f"[ckpt-async] step {step}: CPU snapshot done, disk write continuing in "
-              f"background -- training resumes immediately")
-
-        # Phase 2 (async): everything below only touches CPU tensors/disk, never the
-        # live model/optimizer, so it's safe to run while training proceeds.
-        def _write():
-            import torch
-            tmp_dir = save_dir.parent / (save_dir.name + ".tmp_ckpt")
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-            model.save_pretrained(tmp_dir, safe_serialization=True, state_dict=model_state_cpu)
-            if tokenizer is not None:
-                tokenizer.save_pretrained(tmp_dir)
-            if custom_code_src is not None:
-                src_file = Path(custom_code_src) / "modeling_custom.py"
-                if src_file.exists():
-                    shutil.copy2(src_file, tmp_dir / "modeling_custom.py")
-
-            torch.save(opt_state_cpu, tmp_dir / "training_state.pt")
-
-            if save_dir.exists():
-                backup = save_dir.parent / (save_dir.name + ".prev")
-                if backup.exists():
-                    shutil.rmtree(backup)
-                os.replace(save_dir, backup)
-            os.replace(tmp_dir, save_dir)
-            backup = save_dir.parent / (save_dir.name + ".prev")
-            if backup.exists():
-                shutil.rmtree(backup)
-
-            print(f"[ckpt-async] step {step}: background write finished -> {save_dir}")
-
-        self._thread = threading.Thread(target=_write, daemon=False)
-        self._thread.start()
-
-    def wait(self):
-        """Block until any in-flight write finishes -- call before process exit
-        (SIGTERM handler, final checkpoint) so the process never dies mid-write."""
-        if self._thread is not None and self._thread.is_alive():
-            print("[ckpt-async] waiting for final background write to finish before exit...")
-            self._thread.join()
+# AsyncCheckpointer (background-thread checkpoint writer) now lives in
+# async_checkpoint.py, imported at the top of this file -- extracted so it's
+# independently importable/testable without the rest of this training loop.
+# See that module's docstring for the two-phase sync-snapshot/async-write
+# design and why only one write is ever in flight at a time.
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
@@ -560,16 +454,11 @@ def main():
     n_layers, end_idx = apply_window_freeze(model, args.start, args.end)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.lr, weight_decay=0.01)
-        print("[cpt] optimizer: bitsandbytes 8-bit Adam")
-    except ImportError:
-        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
-        print("[cpt] optimizer: torch.optim.AdamW (bitsandbytes not installed -- "
-              "install it for ~4x less optimizer-state memory. See README.md: this "
-              "silent fallback is a real, observed OOM source on large models, not "
-              "a hypothetical one -- reinstall bitsandbytes on every fresh container.)")
+    # build_optimizer() lives in bnb_optimizer.py (extracted so it's independently
+    # importable/testable) -- tries bitsandbytes 8-bit Adam, falls back to plain
+    # torch.optim.AdamW with a clear warning if bitsandbytes isn't installed.
+    optimizer, optimizer_kind = build_optimizer(trainable_params, lr=args.lr, weight_decay=0.01)
+    print(f"[cpt] optimizer: {optimizer_kind}")
 
     start_step = 0
     if resumed:
@@ -579,20 +468,17 @@ def main():
             start_step = state.get("step", 0)
             saved_optimizer_type = state.get("optimizer_type", "unknown")
             current_optimizer_type = type(optimizer).__name__
-            if saved_optimizer_type != current_optimizer_type:
-                # Loading one optimizer type's state_dict into a DIFFERENT optimizer
-                # class is not just "ignored, harmless" -- this has been observed to
-                # silently accept the mismatched state and inflate GPU memory well
-                # beyond what the current optimizer should need, OOMing on the very
-                # first forward pass. Skip the load entirely rather than risk that
-                # again -- losing optimizer momentum on an optimizer-type switch is a
-                # known, bounded cost; silent memory corruption is not.
-                print(f"[cpt] WARNING: checkpoint's optimizer was {saved_optimizer_type}, "
-                      f"this run is using {current_optimizer_type} -- skipping optimizer "
-                      f"state load (incompatible state_dicts, confirmed to risk OOM if "
-                      f"forced). Starting this optimizer's momentum fresh; step count "
-                      f"still resumes.")
-            else:
+            # check_optimizer_compat() lives in optimizer_compat_guard.py (extracted
+            # so the load-vs-skip decision has one canonical implementation) -- loading
+            # one optimizer type's state_dict into a DIFFERENT optimizer class has been
+            # observed to silently accept the mismatched state and inflate GPU memory
+            # well beyond what the current optimizer needs, OOMing on the first forward
+            # pass. safe_to_load=False means: skip the load, restart momentum fresh,
+            # keep the step count.
+            safe_to_load, compat_msg = check_optimizer_compat(saved_optimizer_type,
+                                                               current_optimizer_type)
+            print(f"[cpt] {compat_msg}")
+            if safe_to_load:
                 optimizer.load_state_dict(state["optimizer"])
                 print(f"[cpt] resumed at step {start_step} (optimizer state restored -- "
                       f"cold-restarting momentum measurably hurts quality, so this matters)")
@@ -609,18 +495,14 @@ def main():
         # its own retry/timeout handling). Prefer this over live streaming whenever
         # the training box's network path to the data source is unreliable -- see
         # README.md for the concrete incident this was built to route around.
-        def _cache_stream(path, seed):
-            _rng = _random.Random(seed)
-            rows = load_jsonl(Path(path))
-            if not rows:
-                raise SystemExit(f"--cpt-cache {path} contained zero rows")
-            order = list(range(len(rows)))
-            while True:
-                _rng.shuffle(order)
-                for i in order:
-                    yield rows[i]
-
-        stream_gen = _cache_stream(args.cpt_cache, args.seed)
+        # stream_from_cache() lives in local_cache_stream.py (extracted so the
+        # cache-reading side is independently importable/testable) -- loads the
+        # cache once, shuffles with the given seed, and reshuffles on every full
+        # pass instead of stopping once exhausted.
+        try:
+            stream_gen = stream_from_cache(args.cpt_cache, seed=args.seed)
+        except RuntimeError as e:
+            raise SystemExit(str(e))
         print(f"[cpt] training from local cache ({args.cpt_cache}) -- zero network "
               f"dependency, safe against source/network instability")
     else:
@@ -667,7 +549,7 @@ def main():
                 # background thread keeps writing while training continues; save()
                 # itself waits on any still-in-flight write before starting the next one.
                 if _SHOULD_STOP or it == args.iters:
-                    async_ckpt.wait()
+                    async_ckpt.wait_for_pending()
             else:
                 atomic_save_checkpoint(model, optimizer, it, save_dir, tokenizer,
                                        custom_code_src=Path(args.model))
