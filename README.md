@@ -10,6 +10,15 @@ fixing each one for real instead of writing around it. Every script here is
 real, run code, not a from-scratch rewrite for this repo — project-specific
 naming genericized, everything else unchanged.
 
+None of this is pinned to one GPU. There's no device-name check, no
+architecture branch, no hardcoded VRAM figure anywhere in the source —
+batch size, sequence length, and how many layers stay unfrozen are all
+plain CLI flags, so the same scripts scale down to a smaller card by
+freezing more layers and shrinking the batch, or scale up by unfreezing
+more and running bigger batches. Standard ROCm/PyTorch throughout — nothing
+here calls out to an MI300X-only code path. It happens to have been built
+and run on one MI300X; there's nothing in it that ties it there.
+
 Every model-family-specific assumption that used to be a hardcoded constant
 — the embedding tensor's key name, the vocab_size config path, the
 layer-naming prefix, the sharding size, the depth/width step sizes — is now
