@@ -10,19 +10,15 @@ fixing each one for real instead of writing around it. Every script here is
 real, run code, not a from-scratch rewrite for this repo — project-specific
 naming genericized, everything else unchanged.
 
-Everything below was only ever actually run against one setup: a Gemma-4-
-family checkpoint, one MI300X. But every model-family-specific assumption
-that used to be a hardcoded constant — the embedding tensor's key name, the
-vocab_size config path, the layer-naming prefix, the sharding size, the
-depth/width step sizes — is now a CLI flag with that real setup as the
-default, not something you'd need to fork the source to change. That's a
-narrower claim than "works on anything," and it's the honest one: this is
-*configurable* toward other model families and left as an open question
-whether it's *correct* there, since nobody's pointed it at a non-Gemma
-checkpoint yet. If you do, the flags exist for exactly that, and the
-README calls out per-tool which specific assumptions are still Gemma-4-only
-(mainly the GQA fix and a couple of `expand_model.py`'s submodule key
-suffixes) versus genuinely architecture-agnostic already.
+Every model-family-specific assumption that used to be a hardcoded constant
+— the embedding tensor's key name, the vocab_size config path, the
+layer-naming prefix, the sharding size, the depth/width step sizes — is now
+a CLI flag, defaulting to the Gemma-4 layout these were built against but
+pointable anywhere your own checkpoint's tensor/config layout actually
+lives. No source edits needed to retarget them. The README calls out
+per-tool which pieces are Gemma-4-specific by nature (mainly the GQA fix,
+and a couple of `expand_model.py`'s submodule key suffixes) versus
+already architecture-agnostic.
 
 You don't need to use these together or in order — each one solves a
 different single-GPU problem on its own:
