@@ -24,6 +24,30 @@ Usage:
     python3 prune_vocab.py \\
         --src ./checkpoints/base_12b_bf16 \\
         --dst ./checkpoints/base_12b_pruned
+
+Model-family scope, spelled out plainly: the character-script vocab-dropping
+logic above (classify(), REMOVABLE) is genuinely architecture-agnostic — it
+only looks at token strings and tokenizer.json, nothing Gemma-specific. But
+the config.json post-processing below it is NOT generic, and isn't
+pretending to be:
+
+  - The `model_type == "gemma4_unified"` rename to `"gemma4"` is a real,
+    narrow fix for one specific transformers-install quirk on Gemma-4-family
+    checkpoints (see the code comment at that block for the exact mechanism).
+    It only fires when the checkpoint's own model_type matches that string,
+    so it's already a no-op for any other model family's config.json --
+    running this against a non-Gemma checkpoint simply skips it, it does not
+    need a flag to disable.
+  - The vocab_size field paths (top-level `vocab_size` plus a nested
+    `text_config.vocab_size`) are a Gemma-4-family config layout, but WHICH
+    paths get updated is now a `--vocab-size-paths` flag (default: the two
+    Gemma-4 paths below), not a hardcoded assumption -- a different model
+    family with its own similarly-nested-but-differently-named vocab_size
+    field can point this at its own dotted config path(s) instead of needing
+    a source edit.
+
+Neither of these two config fixes has been tested against any non-Gemma-4
+checkpoint. Configurable is not the same claim as verified.
 """
 
 import argparse
@@ -67,11 +91,32 @@ def classify(tok: str) -> str:
 REMOVABLE = {"cjk", "cyrillic", "arabic", "devanagari_hindi", "mongolian_script", "romance_germanic_chars"}
 
 
+def set_dotted_path(cfg: dict, dotted_path: str, value) -> None:
+    """Sets cfg[a][b]...[z] = value given "a.b...z". Every intermediate segment
+    must already exist as a dict in cfg (raises KeyError, loudly, rather than
+    silently creating a new nested structure the checkpoint's config schema
+    never asked for -- a typo'd --vocab-size-paths entry should fail fast, not
+    quietly write a field nothing will ever read)."""
+    parts = dotted_path.split(".")
+    node = cfg
+    for part in parts[:-1]:
+        node = node[part]
+    node[parts[-1]] = value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="Source model dir (read-only, never modified)")
     ap.add_argument("--dst", required=True, help="Output dir for the pruned model")
     ap.add_argument("--dry-run", action="store_true", help="Print stats only, write nothing")
+    ap.add_argument("--vocab-size-paths", type=str, nargs="+",
+                    default=["vocab_size", "text_config.vocab_size"],
+                    help="One or more dotted config.json paths to set to the new vocab "
+                         "size. Defaults to the two Gemma-4-family locations (top-level "
+                         "'vocab_size' plus nested 'text_config.vocab_size') -- see module "
+                         "docstring for why both matter on Gemma-4. Pass your own dotted "
+                         "path(s) if a different model family nests vocab_size somewhere "
+                         "else, e.g. --vocab-size-paths vocab_size some_other.nested.path")
     args = ap.parse_args()
 
     src, dst = args.src, args.dst
@@ -164,20 +209,25 @@ def main():
         if os.path.isfile(s):
             shutil.copy2(s, d)
 
-    # Update vocab_size in config.json. MUST be set at BOTH the top level
-    # AND inside text_config — discovered via a real load-test failure:
-    # mlx_lm's Gemma4UnifiedModelArgs.__post_init__ does
+    # Update vocab_size in config.json at every path in --vocab-size-paths.
+    # On Gemma-4-family checkpoints (the default paths) this MUST be set at
+    # BOTH the top level AND inside text_config — discovered via a real
+    # load-test failure: mlx_lm's Gemma4UnifiedModelArgs.__post_init__ does
     # `self.text_config["vocab_size"] = self.vocab_size`, where
     # `self.vocab_size` defaults to 262144 if the top-level key is absent.
     # That overwrite CLOBBERS a correctly-set text_config.vocab_size if the
     # top-level key is missing — setting only the nested field (the first
     # version of this script did exactly that) silently reverts to 262144
     # at model-build time, caught by a strict load_weights() shape mismatch.
+    # A different model family with a different (or single, unnested)
+    # vocab_size layout should pass its own path(s) via --vocab-size-paths
+    # rather than relying on this being universal -- it isn't tested against
+    # any non-Gemma-4 config.json.
     cfg_path = os.path.join(dst, "config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
-    cfg["vocab_size"] = len(new_vocab)
-    cfg["text_config"]["vocab_size"] = len(new_vocab)
+    for path in args.vocab_size_paths:
+        set_dotted_path(cfg, path, len(new_vocab))
 
     # model_type fix -- confirmed via a real crash: some Gemma-4-family
     # checkpoints ship "gemma4_unified" as the top-level model_type, but a
@@ -197,7 +247,8 @@ def main():
 
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"[prune_vocab] config.json vocab_size -> {len(new_vocab):,} (top-level + text_config)")
+    print(f"[prune_vocab] config.json vocab_size -> {len(new_vocab):,} "
+          f"(paths: {', '.join(args.vocab_size_paths)})")
 
     # Save the old->new id remap for the embedding-slicing step.
     remap_path = os.path.join(dst, "_old_to_new_ids.json")

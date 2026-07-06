@@ -36,19 +36,23 @@ Key design decisions (the genuinely interesting engineering here):
     existing layer, where zero-init would starve gradient flow to those
     columns specifically) — hence the two different init strategies for two
     different insertion patterns, by design, not by accident.
-  - **Real GQA fix on MQA-style attention layers.** Some full-attention layers
-    in this model family ship with an extreme "1 shared KV head, V literally
-    reuses K, no separate v_proj weight exists at all" MQA setup (confirmed by
-    inspecting the actual checkpoint's safetensors header — there's no
-    `v_proj` key for these layers). That's a real memory optimization, but on
-    a GPU with enough VRAM that KV-cache size at long context isn't actually
-    the bottleneck, it's trading away model quality for a saving this
-    deployment doesn't need. `--gqa-kv-heads N` (default 8) grows `k_proj` to
-    N real KV heads via orthogonal padding (preserving already-learned K
-    directions) and builds a brand-new `v_proj` from scratch via a fresh
-    orthogonal QR init (there's no existing V data to pad from — V never
-    existed as a separate matrix before). Set `--gqa-kv-heads 0` to skip this
-    and keep the stock MQA behavior.
+  - **Real GQA fix on MQA-style attention layers -- Gemma-4-family-specific,
+    not a general architecture fix.** Some full-attention layers in
+    Gemma-4-family checkpoints specifically ship with an extreme "1 shared KV
+    head, V literally reuses K, no separate v_proj weight exists at all" MQA
+    setup (confirmed by inspecting the actual checkpoint's safetensors header
+    — there's no `v_proj` key for these layers). That's a real memory
+    optimization, but on a GPU with enough VRAM that KV-cache size at long
+    context isn't actually the bottleneck, it's trading away model quality
+    for a saving this deployment doesn't need. `--gqa-kv-heads N` (default 8)
+    grows `k_proj` to N real KV heads via orthogonal padding (preserving
+    already-learned K directions) and builds a brand-new `v_proj` from
+    scratch via a fresh orthogonal QR init (there's no existing V data to pad
+    from — V never existed as a separate matrix before). Set
+    `--gqa-kv-heads 0` to skip this and keep the stock MQA behavior -- this is
+    the right default for any checkpoint that doesn't share Gemma-4's
+    specific "no v_proj at all" MQA layout, since the fix assumes that exact
+    missing-tensor shape and isn't a generic GQA-widening tool.
   - **numpy QR, not `torch.nn.init.orthogonal_`, for the orthogonal
     constructions.** This ROCm PyTorch build's CPU tensors don't have LAPACK
     support (`torch.linalg.qr` / `torch.geqrf` raise a clear error asking for
@@ -75,6 +79,22 @@ Usage:
     python3 expand_model.py --dry-run --src ./checkpoints/base_pruned
     python3 expand_model.py \\
         --src ./checkpoints/base_pruned --dst ./checkpoints/base_expanded
+
+Configurability note: --width-step, --depth-step, --mtp-depths,
+--mtp-loss-weight, --gqa-kv-heads, and --layer-prefix were already CLI flags
+before this pass (their module-level DEFAULT_* constants are just the
+argparse defaults). --interleave-every and --max-shard-bytes are new in this
+pass -- they used to be hardcoded module constants (INTERLEAVE_EVERY,
+MAX_SHARD_BYTES) with no way to override them without editing source; now
+they're flags too, same pattern as the others. --layer-prefix in particular
+matters for pointing this at a different model family's tensor naming, since
+gate/up/down_proj and self_attn.k_proj/v_proj/o_proj key SUFFIXES are still
+assumed fixed below (only the prefix before the layer index is
+parameterized) -- a model family with different attention/MLP submodule
+names would need those suffixes edited in width_expand_layer() /
+gqa_expand_kv() / clone_layer_tensors(), not just a flag change. This has
+only ever actually been run against Gemma-4-family checkpoints on a single
+MI300X; the flags make it plausible to point elsewhere, not verified there.
 """
 
 import argparse
@@ -269,7 +289,17 @@ def main():
                          "'model.language_model.layers.0.mlp...'. Different Gemma-4-family "
                          "checkpoint variants use different attribute orders here (e.g. "
                          "'language_model.model.layers' on some) -- confirm yours via a "
-                         "quick safetensors header inspection before running for real.")
+                         "quick safetensors header inspection before running for real. "
+                         "Submodule key SUFFIXES (mlp.gate_proj, self_attn.k_proj, etc.) "
+                         "are NOT parameterized here -- only the prefix before the layer "
+                         "index is. See module docstring.")
+    ap.add_argument("--interleave-every", type=int, default=INTERLEAVE_EVERY,
+                    help="Insert one duplicated layer after every N original layers "
+                         "(subject to --depth-step's total cap). Was a hardcoded module "
+                         "constant; now a flag with the same default.")
+    ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,
+                    help="Byte budget per output safetensors shard (default 5GB). Was a "
+                         "hardcoded module constant; now a flag with the same default.")
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -295,7 +325,7 @@ def main():
     log(f"  layers: {orig_layers} -> {new_layers}  (+{depth_step})")
     log(f"  intermediate_size: {orig_intermediate} -> {new_intermediate}  (+{width_step})")
 
-    depth_plan = build_depth_plan(orig_layers, depth_step, INTERLEAVE_EVERY)
+    depth_plan = build_depth_plan(orig_layers, depth_step, args.interleave_every)
     new_layer_types = [layer_types[old_idx] for (_, old_idx, _) in depth_plan]
 
     if args.dry_run:
@@ -405,7 +435,7 @@ def main():
             shutil.copy2(s, d)
     log("copied tokenizer + auxiliary files")
 
-    write_sharded(final_tensors, args.dst, MAX_SHARD_BYTES)
+    write_sharded(final_tensors, args.dst, args.max_shard_bytes)
 
     log("done. NEXT: load-test before trusting this for CPT (check for NaN/Inf in "
         "logits on a raw forward pass against a real input before committing to a "
