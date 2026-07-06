@@ -11,6 +11,16 @@ Usage:
     python3 prune_embeddings_torch.py \\
         --src ./checkpoints/base_12b \\
         --dst ./checkpoints/base_12b_pruned
+
+The embedding tensor's key defaults to the Gemma-4-family layout this was
+built and run against, but is a plain CLI flag (--embed-key), not a
+hardcoded assumption -- point it at whatever your own checkpoint's
+safetensors header actually calls the embedding weight (e.g. plain
+`model.embed_tokens.weight` on many non-Gemma architectures) and the tensor
+surgery below is otherwise architecture-agnostic: it only ever reads one
+named tensor out of the state dict, slices its rows, and writes it back.
+Configurable is not the same claim as verified -- this has only actually
+been run against the Gemma-4-family key below.
 """
 
 import argparse
@@ -21,15 +31,25 @@ import shutil
 import torch
 from safetensors.torch import load_file, save_file
 
-EMBED_KEY = "model.language_model.embed_tokens.weight"
+# Default matches the Gemma-4-family checkpoints this script has actually been
+# run against. Override with --embed-key for a different model family's key
+# layout -- see module docstring.
+DEFAULT_EMBED_KEY = "model.language_model.embed_tokens.weight"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--dst", required=True)
+    ap.add_argument("--embed-key", type=str, default=DEFAULT_EMBED_KEY,
+                    help="Safetensors key for the embedding weight tensor to slice. "
+                         f"Default ({DEFAULT_EMBED_KEY!r}) matches the Gemma-4-family "
+                         "layout this script was built and run against -- for another "
+                         "model family, check its safetensors header (e.g. via "
+                         "safetensors.safe_open(...).keys()) and pass the real key here.")
     args = ap.parse_args()
     src, dst = args.src, args.dst
+    embed_key = args.embed_key
 
     remap_path = os.path.join(dst, "_old_to_new_ids.json")
     if not os.path.exists(remap_path):
@@ -67,7 +87,7 @@ def main():
         index = {"metadata": {"total_size": os.path.getsize(os.path.join(src, single_file))}, "weight_map": weight_map}
         print(f"[prune_embed] no index.json found -- synthesized one for the single-file checkpoint ({single_file})")
 
-    embed_shard = index["weight_map"][EMBED_KEY]
+    embed_shard = index["weight_map"][embed_key]
     all_shards = sorted(set(index["weight_map"].values()))
 
     print(f"[prune_embed] embed tensor lives in shard: {embed_shard}")
@@ -91,12 +111,12 @@ def main():
         tensors_in = load_file(src_path)
         tensors_out = {}
         for key, val in tensors_in.items():
-            if key == EMBED_KEY:
+            if key == embed_key:
                 sliced = val[keep_idx, :].contiguous()
                 tensors_out[key] = sliced
                 removed_rows = val.shape[0] - sliced.shape[0]
                 new_param_delta -= removed_rows * val.shape[1]
-                print(f"[prune_embed] {EMBED_KEY}: {tuple(val.shape)} -> {tuple(sliced.shape)}")
+                print(f"[prune_embed] {embed_key}: {tuple(val.shape)} -> {tuple(sliced.shape)}")
             else:
                 tensors_out[key] = val
 
