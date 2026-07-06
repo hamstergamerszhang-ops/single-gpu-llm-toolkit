@@ -63,25 +63,22 @@ Key design decisions (the genuinely interesting engineering here):
   - **Sharded safetensors output** with a real `model.safetensors.index.json`,
     splitting shards at a configurable byte budget (default 5GB/shard) so the
     output is loadable the same way any standard sharded HF checkpoint is.
-  - **Optional Multi-Token-Prediction (MTP) head expansion** (`--mtp-depths`,
-    default 2): if the checkpoint's architecture supports an auxiliary
-    multi-token-prediction loss, this instantiates fresh MTP module blocks
-    sized to match the newly-expanded config and appends them as an
-    additional safetensors shard, merged into the index. This is optional and
-    architecture-specific — most Gemma-4-family checkpoints won't have an
-    `mtp_modules`-style attribute, and the flag is a no-op (aside from setting
-    two harmless config fields) unless your fork of the modeling code
-    actually defines that class. Left in because it's real, working code
-    against a real architecture variant, not because every reader will use it
-    — set `--mtp-depths 0` to skip it entirely.
+
+MTP note: this script does NOT touch multi-token-prediction at all. An earlier
+version of this docstring claimed it instantiated MTP modules and appended them
+as a safetensors shard — that claim was false (the code only wrote two config
+fields). The real MTP weight generation + shard/index merge now lives in its
+own standalone tool, `mtp_head.py` — run that AFTER expand_model.py if you want
+an MTP head. See mtp_head.py's docstring for the architecture it implements
+(DeepSeek-V3 MTP pattern) and what it does vs. does not provide.
 
 Usage:
     python3 expand_model.py --dry-run --src ./checkpoints/base_pruned
     python3 expand_model.py \\
         --src ./checkpoints/base_pruned --dst ./checkpoints/base_expanded
 
-Configurability note: --width-step, --depth-step, --mtp-depths,
---mtp-loss-weight, --gqa-kv-heads, and --layer-prefix were already CLI flags
+Configurability note: --width-step, --depth-step,
+--gqa-kv-heads, and --layer-prefix were already CLI flags
 before this pass (their module-level DEFAULT_* constants are just the
 argparse defaults). --interleave-every and --max-shard-bytes are new in this
 pass -- they used to be hardcoded module constants (INTERLEAVE_EVERY,
@@ -111,8 +108,6 @@ DEFAULT_DEPTH_STEP = 12
 INTERLEAVE_EVERY = 4
 INIT_SCALE = 0.02
 MAX_SHARD_BYTES = 5 * 1024**3
-DEFAULT_MTP_DEPTHS = 2
-DEFAULT_MTP_LOSS_WEIGHT = 0.3
 DEFAULT_GQA_KV_HEADS = 8  # matches sliding-attention layers' existing kv head count
 
 
@@ -276,11 +271,6 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--width-step", type=int, default=DEFAULT_WIDTH_STEP)
     ap.add_argument("--depth-step", type=int, default=DEFAULT_DEPTH_STEP)
-    ap.add_argument("--mtp-depths", type=int, default=DEFAULT_MTP_DEPTHS,
-                    help="Multi-Token Prediction depths to add (0 disables MTP entirely "
-                         "-- only meaningful if your modeling code defines an MTP module "
-                         "class; harmless no-op config fields otherwise)")
-    ap.add_argument("--mtp-loss-weight", type=float, default=DEFAULT_MTP_LOSS_WEIGHT)
     ap.add_argument("--gqa-kv-heads", type=int, default=DEFAULT_GQA_KV_HEADS,
                     help="Replace full-attention layers' MQA (1 shared kv head, V=K) with "
                          "real GQA at this many kv heads (0 disables, keeps stock MQA)")
@@ -406,19 +396,6 @@ def main():
         cfg["text_config"]["attention_k_eq_v"] = False
         log(f"GQA fix applied: attention_k_eq_v -> False, "
             f"full-attention layers now use {args.gqa_kv_heads} real kv heads (was MQA=1, V=K)")
-
-    if args.mtp_depths > 0:
-        cfg["text_config"]["mtp_depths"] = args.mtp_depths
-        cfg["text_config"]["mtp_loss_weight"] = args.mtp_loss_weight
-        # auto_map wires AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)
-        # to a custom modeling class instead of the stock architecture -- only meaningful
-        # if modeling_custom.py (with a matching *ForCausalLM class) actually exists
-        # alongside this checkpoint. If you don't have a custom MTP-capable modeling
-        # file, use --mtp-depths 0.
-        cfg["auto_map"] = {"AutoModelForCausalLM": "modeling_custom.CustomForCausalLM"}
-        log(f"MTP enabled: mtp_depths={args.mtp_depths}, mtp_loss_weight={args.mtp_loss_weight}")
-    else:
-        log("MTP disabled (--mtp-depths 0)")
 
     os.makedirs(args.dst, exist_ok=True)
     with open(os.path.join(args.dst, "config.json"), "w") as f:

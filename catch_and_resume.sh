@@ -89,7 +89,11 @@ state_path = save_dir / "training_state.pt"
 if not state_path.exists():
     print(0)
 else:
-    state = torch.load(state_path, map_location="cpu")
+    # weights_only=False matches train_cpt.py's resume path: training_state.pt
+    # holds an optimizer state_dict with non-allowlisted pickle objects, which
+    # torch >= 2.6's default weights_only=True would reject. PyTorch 2.6+
+    # defaults to weights_only=True, breaking resume without this.
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
     print(state.get("step", 0))
 PYEOF
 }

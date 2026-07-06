@@ -166,14 +166,31 @@ def main():
     # Filter merge rules: a merge (a, b) -> a+b is only valid if a, b, AND
     # the merged result all survive pruning. Order is preserved (BPE merge
     # priority is positional).
+    #
+    # Merges come in two on-disk formats depending on the tokenizer.json source:
+    #   - HF `tokenizers` default: a list of "a b" space-separated STRINGS
+    #     (e.g. "Ġ t"). Splitting on the first space gives the two parts, and
+    #     the composed token is a+b (no space) — exactly what the vocab stores.
+    #   - Older/list format: a 2-element list [a, b].
+    # The pre-fix code did `a, b = pair[0], pair[1]`, which on a STRING pair
+    # unpacked the first two CHARACTERS — silently gutting the merge table to
+    # near-empty (only the rare merge whose first two chars were both surviving
+    # single-char vocab entries survived). Handle both formats explicitly.
     old_merges = tok["model"]["merges"]
     new_merges = []
     dropped_merges = 0
     for pair in old_merges:
-        a, b = pair[0], pair[1]
+        if isinstance(pair, str):
+            a, b = pair.split(" ", 1)
+            # Preserve the original string in the output so the format round-trips
+            # exactly for tokenizers that read the string form.
+            out_pair = pair
+        else:
+            a, b = pair[0], pair[1]
+            out_pair = pair
         merged = a + b
         if a in keep_tok_strs and b in keep_tok_strs and merged in keep_tok_strs:
-            new_merges.append(pair)
+            new_merges.append(out_pair)
         else:
             dropped_merges += 1
     print(f"[prune_vocab] merges: {len(old_merges):,} -> {len(new_merges):,}  (dropped {dropped_merges:,})")

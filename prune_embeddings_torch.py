@@ -56,7 +56,7 @@ def main():
         raise SystemExit(f"ERROR: {remap_path} not found — run prune_vocab.py against "
                           f"this --dst first, it produces the id remap this script needs.")
     with open(remap_path) as f:
-        old_to_new = {int(k): v for k, v in json.load(f).items()}
+        old_to_new = {int(k): int(v) for k, v in json.load(f).items()}
 
     keep_old_ids = sorted(old_to_new.keys())
     new_vocab_size = len(keep_old_ids)

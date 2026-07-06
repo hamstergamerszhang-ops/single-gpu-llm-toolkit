@@ -83,6 +83,12 @@ class AsyncCheckpointer:
 
     def __init__(self):
         self._thread = None
+        # If a background write raised, the exception is stored here and
+        # re-raised on the next save()/wait_for_pending() call. Without this,
+        # a failed write (disk full, NFS error, permission denied) would die
+        # silently inside the thread — the training loop would keep running in
+        # the belief that it has checkpoints it does not have.
+        self._last_error = None
 
     def is_write_in_flight(self) -> bool:
         """True if a background write is currently running. save() will
@@ -90,8 +96,24 @@ class AsyncCheckpointer:
         avoid blocking can check this first and skip a checkpoint tick."""
         return self._thread is not None and self._thread.is_alive()
 
+    def check_error(self):
+        """Re-raise any exception captured by the background write thread.
+        Call this after save() (or at any point) to surface a failed write
+        instead of continuing to train checkpoint-less."""
+        if self._last_error is not None:
+            err = self._last_error
+            self._last_error = None
+            raise RuntimeError(
+                f"async checkpoint write failed (training continued without a "
+                f"valid checkpoint on disk): {err}"
+            ) from err
+
     def save(self, model, optimizer, step: int, save_dir: Path, tokenizer=None,
              extra_state: dict | None = None, custom_code_src: Path | None = None):
+        # Surface any error from a PRIOR background write before starting a new
+        # one — otherwise we'd silently overwrite the lost-write state with a
+        # fresh snapshot and the prior failure would be gone forever.
+        self.check_error()
         if self.is_write_in_flight():
             print("[ckpt-async] previous async write still in flight -- waiting for it "
                   "before starting a new snapshot (checkpoint interval may be too tight "
@@ -125,44 +147,62 @@ class AsyncCheckpointer:
 
         # Phase 2 (async): everything below only touches CPU tensors/disk, never the
         # live model/optimizer, so it's safe to run while training proceeds.
+        # Errors here are captured into self._last_error rather than propagating
+        # (an uncaught exception in a thread just prints a traceback to stderr
+        # and dies — the training loop would never know the write failed). The
+        # next save()/wait_for_pending() call re-raises it via check_error().
         def _write():
             import torch
-            tmp_dir = save_dir.parent / (save_dir.name + ".tmp_ckpt")
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            tmp_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp_dir = save_dir.parent / (save_dir.name + ".tmp_ckpt")
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
 
-            model.save_pretrained(tmp_dir, safe_serialization=True, state_dict=model_state_cpu)
-            if tokenizer is not None:
-                tokenizer.save_pretrained(tmp_dir)
-            if custom_code_src is not None:
-                src_file = Path(custom_code_src) / "modeling_custom.py"
-                if src_file.exists():
-                    shutil.copy2(src_file, tmp_dir / "modeling_custom.py")
+                model.save_pretrained(tmp_dir, safe_serialization=True, state_dict=model_state_cpu)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(tmp_dir)
+                if custom_code_src is not None:
+                    src_file = Path(custom_code_src) / "modeling_custom.py"
+                    if src_file.exists():
+                        shutil.copy2(src_file, tmp_dir / "modeling_custom.py")
 
-            torch.save(opt_state_cpu, tmp_dir / "training_state.pt")
+                torch.save(opt_state_cpu, tmp_dir / "training_state.pt")
 
-            if save_dir.exists():
+                # Retain the previous checkpoint as .prev (a real backup, not
+                # deleted) so a crash mid-write or a corrupt new write can be
+                # rolled back. The recovery path in train_cpt.py restores .prev
+                # if the live save_dir is missing training_state.pt on resume.
                 backup = save_dir.parent / (save_dir.name + ".prev")
-                if backup.exists():
-                    shutil.rmtree(backup)
-                os.replace(save_dir, backup)
-            os.replace(tmp_dir, save_dir)
-            backup = save_dir.parent / (save_dir.name + ".prev")
-            if backup.exists():
-                shutil.rmtree(backup)
+                if save_dir.exists():
+                    if backup.exists():
+                        shutil.rmtree(backup)
+                    os.replace(save_dir, backup)
+                os.replace(tmp_dir, save_dir)
+                # NOTE: .prev is intentionally NOT deleted here — it is the
+                # retained backup. The next successful write rotates it out
+                # (rmtree + os.replace above) when a newer good checkpoint
+                # supersedes it.
 
-            print(f"[ckpt-async] step {step}: background write finished -> {save_dir}")
+                print(f"[ckpt-async] step {step}: background write finished -> {save_dir}")
+            except Exception as e:
+                self._last_error = e
+                print(f"[ckpt-async] step {step}: BACKGROUND WRITE FAILED — "
+                      f"error stored, will be raised on next save()/wait. "
+                      f"Previous checkpoint retained at {save_dir}.prev if it "
+                      f"existed. Failure: {e}", file=__import__('sys').stderr)
 
         self._thread = threading.Thread(target=_write, daemon=False)
         self._thread.start()
 
     def wait_for_pending(self):
         """Block until any in-flight write finishes -- call before process exit
-        (SIGTERM handler, final checkpoint) so the process never dies mid-write."""
+        (SIGTERM handler, final checkpoint) so the process never dies mid-write.
+        Re-raises any error captured by the background thread."""
         if self.is_write_in_flight():
             print("[ckpt-async] waiting for final background write to finish before exit...")
             self._thread.join()
+        self.check_error()
 
 
 def _self_test():
@@ -207,6 +247,7 @@ def _self_test():
         assert state["step"] == 1
         assert state["optimizer_type"] == "AdamW"
         assert not (save_dir.parent / (save_dir.name + ".tmp_ckpt")).exists()
+        # First write: no prior checkpoint, so .prev is not created.
         assert not (save_dir.parent / (save_dir.name + ".prev")).exists()
         print("  OK (model + optimizer state on disk, no leftover tmp/backup dirs)")
 
@@ -219,7 +260,48 @@ def _self_test():
         ckpt.wait_for_pending()
         state = torch.load(save_dir / "training_state.pt", weights_only=False)
         assert state["step"] == 2
-        print("  OK")
+        # Second write: the prior (step 1) checkpoint is RETAINED as .prev, not
+        # deleted — so a crash or corrupt later write can roll back to it.
+        prev = save_dir.parent / (save_dir.name + ".prev")
+        assert prev.exists(), "second write should retain .prev backup"
+        prev_state = torch.load(prev / "training_state.pt", weights_only=False)
+        assert prev_state["step"] == 1, ".prev should hold the prior (step 1) checkpoint"
+        print("  OK (step 2 live; step 1 retained as .prev backup)")
+
+        print("[selftest] a failed background write surfaces its error on the next call")
+        # Monkeypatch save_pretrained to raise, forcing the background thread to
+        # capture the error. Without check_error()/self._last_error, this error
+        # would be silently swallowed and training would continue checkpoint-less.
+        def raise_save_pretrained(*a, **kw):
+            raise OSError("simulated disk full")
+        model.save_pretrained = raise_save_pretrained
+        ckpt.save(model, optimizer, step=3, save_dir=save_dir)
+        # wait_for_pending() re-raises via check_error() — the error surfaces
+        # here, exactly where a caller would discover it on exit.
+        raised = False
+        try:
+            ckpt.wait_for_pending()
+        except RuntimeError as e:
+            raised = True
+            assert "simulated disk full" in str(e), str(e)
+        assert raised, "wait_for_pending() should re-raise the background write failure"
+
+        # A second failing write: save() returns (the write runs in the
+        # background), and the error surfaces on the next wait_for_pending().
+        # This is the correct semantics — save() surfaces PRIOR errors (via
+        # check_error at its top), not the current write's error (which hasn't
+        # happened yet when save() returns).
+        ckpt.save(model, optimizer, step=4, save_dir=save_dir)
+        raised2 = False
+        try:
+            ckpt.wait_for_pending()
+        except RuntimeError as e:
+            raised2 = True
+            assert "simulated disk full" in str(e), str(e)
+        assert raised2, "second failed write should surface on wait_for_pending()"
+        print("  OK (failed write errors surface via wait_for_pending(), not swallowed)")
+
+
 
     print("[selftest] _move_to_cpu recurses through nested dict/list of tensors")
     nested = {"a": torch.randn(2, 2), "b": [torch.randn(1), {"c": torch.randn(3)}]}

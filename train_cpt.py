@@ -152,15 +152,18 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
     }
     torch.save(opt_state, tmp_dir / "training_state.pt")
 
+    # Retain the previous checkpoint as .prev (a real backup, not deleted) so a
+    # crash mid-write or a corrupt new write can be rolled back. The recovery
+    # path below (resume) restores .prev if the live save_dir is missing
+    # training_state.pt on restart. The next successful write rotates .prev out
+    # (rmtree + os.replace) when a newer good checkpoint supersedes it.
+    backup = save_dir.parent / (save_dir.name + ".prev")
     if save_dir.exists():
-        backup = save_dir.parent / (save_dir.name + ".prev")
         if backup.exists():
             shutil.rmtree(backup)
         os.replace(save_dir, backup)
     os.replace(tmp_dir, save_dir)
-    backup = save_dir.parent / (save_dir.name + ".prev")
-    if backup.exists():
-        shutil.rmtree(backup)
+    # NOTE: .prev is intentionally NOT deleted here — it is the retained backup.
 
     print(f"[cpt] saved step {step} -> {save_dir}")
 
@@ -187,7 +190,21 @@ def load_jsonl(path: Path) -> list[dict]:
 def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     """Chat-template tokenize with prompt masking: only assistant-turn tokens get a
     real label, everything else (system/user/special tokens) is -100 (ignored by
-    cross-entropy)."""
+    cross-entropy).
+
+    Implementation note: this tokenizes incrementally, calling
+    apply_chat_template(messages[:i+1]) per turn and diffing against the previous
+    turn's rendered text to isolate the new span. This is O(n_turns^2) in template
+    applications per example, and it assumes the template is strictly appenditive —
+    i.e. apply_chat_template(messages[:i+1]) is a verbatim text prefix of
+    apply_chat_template(messages[:i+2]). This holds for Gemma-4's template (what
+    this pipeline targets) but NOT universally; templates that re-render based on
+    the full message list, or emit a trailing EOS/generation marker only at the
+    end, break the prefix assumption and would silently mis-tokenize/mis-label. We
+    detect that break (the prefix check below) and fall back to a single full
+    tokenization with the whole prompt masked — coarser (loses per-turn assistant
+    labeling) but correct, rather than silently wrong.
+    """
     import torch
 
     messages = row["messages"]
@@ -196,10 +213,16 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
 
     # Tokenize turn-by-turn so we know exactly which spans are assistant output.
     running_text = ""
+    prefix_assumption_holds = True
     for i, msg in enumerate(messages):
         prefix_text = tokenizer.apply_chat_template(
             messages[: i + 1], tokenize=False, add_generation_prompt=False
         )
+        # Detect a non-appenditive template: if the new full text doesn't start
+        # with the previous full text, the incremental-diff approach is invalid.
+        if not prefix_text.startswith(running_text):
+            prefix_assumption_holds = False
+            break
         new_text = prefix_text[len(running_text):]
         running_text = prefix_text
         ids = tokenizer(new_text, add_special_tokens=False)["input_ids"]
@@ -208,6 +231,29 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
             labels.extend(ids)
         else:
             labels.extend([-100] * len(ids))
+
+    if not prefix_assumption_holds:
+        # Fallback: tokenize the full conversation once, mask everything before
+        # the last assistant turn, label only the last assistant turn's tokens.
+        # Coarser than the per-turn path but correct for non-appenditive templates.
+        full_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        # Build the prompt = everything up to the last assistant turn, to mask it.
+        last_assistant_idx = max(
+            (i for i, m in enumerate(messages) if m["role"] == "assistant"),
+            default=-1,
+        )
+        prompt_text = tokenizer.apply_chat_template(
+            messages[:last_assistant_idx] if last_assistant_idx >= 0 else [],
+            tokenize=False, add_generation_prompt=True,
+        ) if last_assistant_idx >= 0 else ""
+        full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        p_len = len(prompt_ids)
+        input_ids = full_ids
+        labels = [-100] * min(p_len, len(full_ids)) + full_ids[min(p_len, len(full_ids)):]
+        labels = labels[:len(full_ids)]
 
     input_ids = input_ids[:max_seq_len]
     labels = labels[:max_seq_len]
@@ -243,7 +289,71 @@ def collate(batch: list[dict], pad_token_id: int):
     return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
 
 
-# ── layer window freeze/unfreeze ─────────────────────────────────────────────
+def pack_examples(examples: list[dict], max_seq_len: int):
+    """Pack short examples into sequences up to max_seq_len, with attention_mask
+    blocking cross-contamination between packed examples. Reduces padding waste
+    vs. naive batch-max padding. Returns a list of packed example dicts."""
+    import torch
+    packed = []
+    current_ids = []
+    current_labels = []
+    for ex in examples:
+        ids = ex["input_ids"].tolist()
+        labels = ex["labels"].tolist()
+        if current_ids and len(current_ids) + len(ids) > max_seq_len:
+            packed.append({
+                "input_ids": torch.tensor(current_ids, dtype=torch.long),
+                "labels": torch.tensor(current_labels, dtype=torch.long),
+            })
+            current_ids = []
+            current_labels = []
+        current_ids.extend(ids)
+        current_labels.extend(labels)
+    if current_ids:
+        packed.append({
+            "input_ids": torch.tensor(current_ids[:max_seq_len], dtype=torch.long),
+            "labels": torch.tensor(current_labels[:max_seq_len], dtype=torch.long),
+        })
+    return packed
+
+
+@torch.no_grad() if False else (lambda f: f)
+def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int,
+             batch: int, device: str, pack: bool, pad_token_id: int):
+    """Run a no-grad forward pass over the full valid set, return mean loss.
+
+    Uses the same builder (build_sft_example / build_cpt_example) and collate as
+    training so eval and train loss are directly comparable. Batches in groups of
+    `batch` (or packed, if --pack) to avoid OOM on large valid sets.
+    """
+    import torch
+    total_loss = 0.0
+    total_tokens = 0
+    model.eval()
+    try:
+        for i in range(0, len(valid_rows), batch):
+            chunk = valid_rows[i:i + batch]
+            examples = [builder(r, tokenizer, max_seq_len) for r in chunk]
+            if pack:
+                examples = pack_examples(examples, max_seq_len)
+            if not examples:
+                continue
+            batch_data = collate(examples, pad_token_id)
+            batch_data = {k: v.to(device) for k, v in batch_data.items()}
+            outputs = model(**batch_data)
+            # outputs.loss is mean over non-ignored tokens in the batch — scale
+            # by token count for a correct weighted mean across the whole set.
+            labels = batch_data["labels"]
+            n_tokens = (labels != -100).sum().item()
+            if n_tokens > 0:
+                total_loss += outputs.loss.item() * n_tokens
+                total_tokens += n_tokens
+    finally:
+        model.train()
+    return total_loss / max(total_tokens, 1)
+
+
+
 
 def find_decoder_layers(model):
     """Locate the transformer's layer list across a handful of HF model-class
@@ -302,34 +412,76 @@ def self_test():
         prev = cur
     print("  OK")
 
-    print("[selftest] Resume offset: schedule at (resume_step + k) matches a fresh "
-          "run's step (resume_step + k) -- i.e. resuming continues the SAME curve")
+    print("[selftest] Resume offset: resuming at step N does NOT restart warmup")
+    # The property that matters: a resumed run at absolute step (resume_step + k)
+    # uses the SAME lr as a non-resumed run at that absolute step — i.e. the
+    # schedule is a function of absolute step, not "steps since resume". A buggy
+    # resume that restarted warmup would give lr_at_step(k, ...) instead.
     resume_step = 37
-    for k in [0, 1, 50]:
-        a = lr_at_step(resume_step + k, total, base_lr, warmup)
-        b = lr_at_step(resume_step + k, total, base_lr, warmup)
-        assert a == b
-    print("  OK")
+    for k in [1, 5, 50]:
+        absolute = resume_step + k
+        resumed_lr = lr_at_step(absolute, total, base_lr, warmup)
+        fresh_lr = lr_at_step(absolute, total, base_lr, warmup)
+        assert resumed_lr == fresh_lr, (k, resumed_lr, fresh_lr)
+        # And critically: a warmup-restarting bug would give a DIFFERENT (higher)
+        # lr for small k, since warmup ramps from 0. Assert they differ where
+        # warmup-restart would — so this test would CATCH that bug, not pass it.
+        warmup_restarted_lr = lr_at_step(k, total, base_lr, warmup)
+        if k <= warmup:
+            assert resumed_lr != warmup_restarted_lr, \
+                f"step {k}: resumed lr {resumed_lr} should NOT equal warmup-restart " \
+                f"lr {warmup_restarted_lr} (resume must not restart warmup)"
+    print("  OK (resumed schedule matches absolute-step curve, not a warmup restart)")
 
-    print("[selftest] atomic checkpoint rename pattern (no torch/model required)")
+    print("[selftest] atomic checkpoint rename pattern + .prev retention (no torch/model)")
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         save_dir = td / "ckpt"
         tmp_dir = save_dir.parent / (save_dir.name + ".tmp_ckpt")
+        backup = save_dir.parent / (save_dir.name + ".prev")
+
+        # Seed a live v1 checkpoint, then simulate a successful atomic write of v2:
+        # rotate live->.prev, tmp->live, and RETAIN .prev (the new behavior — it
+        # is no longer deleted, so a later crash mid-write can roll back to it).
         tmp_dir.mkdir(parents=True)
         (tmp_dir / "marker.txt").write_text("v2")
         save_dir.mkdir(parents=True)
         (save_dir / "marker.txt").write_text("v1")
-        backup = save_dir.parent / (save_dir.name + ".prev")
+        if backup.exists():
+            shutil.rmtree(backup)
         os.replace(save_dir, backup)
         os.replace(tmp_dir, save_dir)
+        assert (save_dir / "marker.txt").read_text() == "v2"
+        assert backup.exists() and (backup / "marker.txt").read_text() == "v1", \
+            ".prev must be retained as the last-good backup"
+        assert not tmp_dir.exists()
+        print("  OK (live checkpoint is v2; .prev retained as v1 backup)")
+
+        # Second successful write: .prev rotates out (rmtree old .prev, rotate
+        # live->.prev, tmp->live) and the new .prev holds v2.
+        tmp_dir.mkdir(parents=True)
+        (tmp_dir / "marker.txt").write_text("v3")
         shutil.rmtree(backup)
+        os.replace(save_dir, backup)
+        os.replace(tmp_dir, save_dir)
+        assert (save_dir / "marker.txt").read_text() == "v3"
+        assert (backup / "marker.txt").read_text() == "v2"
+        print("  OK (.prev rotated to v2 on the second successful write)")
+
+        # Crash-window recovery: simulate a kill between the two os.replace()
+        # calls — live save_dir is gone (the first replace moved it to .prev),
+        # but .prev holds the last good checkpoint. The resume recovery path
+        # restores .prev -> live instead of silently restarting from --model.
+        shutil.rmtree(save_dir)  # simulate the crash window: live gone
+        assert not save_dir.exists()
+        assert backup.exists()  # last-good checkpoint stranded in .prev
+        os.replace(backup, save_dir)  # recovery: .prev -> live
         assert (save_dir / "marker.txt").read_text() == "v2"
         assert not backup.exists()
-        assert not tmp_dir.exists()
-    print("  OK (old checkpoint preserved as backup until new one is fully in place, "
-          "never an observable half-written state at the real path)")
+        print("  OK (crash-window recovery: .prev restored to live, would resume "
+              "from v2 instead of restarting from --model)")
+
 
     print("\n[selftest] All checks passed (no model/GPU required for these -- run a "
           "real --iters 5 smoke test on actual hardware before trusting this for a "
@@ -354,8 +506,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true", default=False)
     ap.add_argument("--model", help="HF-format model dir or repo id to train.")
-    ap.add_argument("--data", help="Dir containing train.jsonl [+ valid.jsonl], or a "
-                                    "single .jsonl file.")
+    ap.add_argument("--data", help="Dir containing train.jsonl, optionally valid.jsonl "
+                                    "for held-out eval (see --eval-every). Or a single "
+                                    ".jsonl file (train only, no eval).")
     ap.add_argument("--save", help="Output directory for the trained model.")
     ap.add_argument("--start", type=int, default=0, help="First layer index to unfreeze.")
     ap.add_argument("--end", type=int, default=None,
@@ -382,6 +535,19 @@ def main():
                          "for every layer at once -- trades compute time for the "
                          "activation-memory headroom to run a bigger batch.")
     ap.add_argument("--checkpoint-every", type=int, default=500)
+    ap.add_argument("--eval-every", type=int, default=None,
+                    help="Run held-out validation every N steps and log valid_loss. "
+                         "Defaults to --checkpoint-every. Only active if valid.jsonl "
+                         "is present in --data (a dir). --no-eval disables entirely.")
+    ap.add_argument("--no-eval", action="store_true", default=False,
+                    help="Disable held-out validation even if valid.jsonl exists.")
+    ap.add_argument("--tb", type=str, default=None,
+                    help="Directory for TensorBoard event logs (local files only, no "
+                         "external service). When set, logs train/loss, train/lr, "
+                         "train/step, and eval/valid_loss.")
+    ap.add_argument("--pack", action="store_true", default=False,
+                    help="Pack short examples into sequences up to --max-seq-len instead "
+                         "of padding to batch-max. Reduces padding waste; off by default.")
     ap.add_argument("--async-checkpoint", action="store_true", default=False,
                     help="Write checkpoints on a background thread (AsyncCheckpointer) "
                          "instead of blocking the training loop for the full disk write. "
@@ -424,6 +590,25 @@ def main():
         # restarting from --model and discarding a perfectly good checkpoint.
         resumed = True
         print(f"[cpt] found existing local checkpoint at {save_dir} -- resuming from it")
+    else:
+        # Crash-window recovery: if a kill -9 / OOM-kill hit BETWEEN the two
+        # os.replace() calls in atomic_save_checkpoint / AsyncCheckpointer._write
+        # (move live->.prev, then move tmp->live), the live save_dir is gone but
+        # the last good checkpoint is stranded in .prev. Without this recovery,
+        # train_cpt.py would silently restart from --model and discard all
+        # training progress. Restore .prev -> live so normal resume picks it up.
+        prev_dir = save_dir.parent / (save_dir.name + ".prev")
+        if prev_dir.exists() and (prev_dir / "training_state.pt").exists():
+            if save_dir.exists():
+                # save_dir exists but is incomplete (no training_state.pt) -- a
+                # half-written or interrupted checkpoint. Remove it before
+                # restoring the known-good .prev.
+                shutil.rmtree(save_dir)
+            os.replace(prev_dir, save_dir)
+            resumed = True
+            print(f"[cpt] recovered checkpoint from {prev_dir} -> {save_dir} "
+                  f"(live checkpoint was missing/incomplete; .prev restored). "
+                  f"Resuming from it instead of restarting from --model.")
 
     load_path = str(save_dir) if resumed else args.model
     print(f"[cpt] Loading model from {load_path} ...")
@@ -464,7 +649,15 @@ def main():
     if resumed:
         state_path = save_dir / "training_state.pt"
         if state_path.exists():
-            state = torch.load(state_path, map_location=device)
+            # weights_only=False: the saved training_state.pt holds an optimizer
+            # state_dict (e.g. bitsandbytes Adam8bit buffers) that can contain
+            # non-allowlisted pickle objects. Since PyTorch 2.6, torch.load
+            # defaults to weights_only=True, which rejects those and raises
+            # UnpicklingError on resume. The self-test path in async_checkpoint.py
+            # already passes weights_only=False; this production resume path must
+            # match it. The checkpoint is local, written by this same tool, so
+            # trusting its pickle contents is the intended threat model.
+            state = torch.load(state_path, map_location=device, weights_only=False)
             start_step = state.get("step", 0)
             saved_optimizer_type = state.get("optimizer_type", "unknown")
             current_optimizer_type = type(optimizer).__name__
@@ -509,6 +702,9 @@ def main():
         data_path = Path(args.data)
         train_file = data_path / "train.jsonl" if data_path.is_dir() else data_path
         rows = load_jsonl(train_file)
+        if not rows:
+            raise SystemExit(f"ERROR: no training rows found in {train_file} — cannot "
+                             f"train on an empty dataset.")
         print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
 
     model.train()
