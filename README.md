@@ -1,16 +1,15 @@
 # gemma-mi300x-prune-cpt
 
 Twelve real, independently-runnable tools (ten Python + two shell) for
-adapting an LLM checkpoint on a
-**single AMD GPU** under ROCm/PyTorch — no multi-node cluster, no
-distributed training framework. They came out of actually doing this once,
-for real: shrinking a tokenizer, growing a model, and continue-pretraining
-it, all on one MI300X, and then hitting the specific ways a single GPU
-fails you (OOM, crashes, a data source that goes unreachable mid-run) and
-fixing each one for real instead of writing around it. Every script here is
-real, run code, not a from-scratch rewrite for this repo — core training
-logic unchanged; refactored into standalone modules and parameterized into
-CLI flags.
+adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
+multi-node cluster, no distributed training framework. They came out of
+actually doing this once, for real: shrinking a tokenizer, growing a model,
+and continue-pretraining it, all on one MI300X, and then hitting the
+specific ways a single GPU fails you (OOM, crashes, a data source that goes
+unreachable mid-run) and fixing each one for real instead of writing around
+it. Every script here is real, run code, not a from-scratch rewrite for this
+repo — core training logic unchanged; refactored into standalone modules
+and parameterized into CLI flags.
 
 None of this is pinned to one GPU. There's no device-name check, no
 architecture branch, no hardcoded VRAM figure anywhere in the source —
@@ -21,17 +20,28 @@ more and running bigger batches. Standard ROCm/PyTorch throughout — nothing
 here calls out to an MI300X-only code path. It happens to have been built
 and run on one MI300X; there's nothing in it that ties it there.
 
-Every model-family-specific assumption that used to be a hardcoded constant
-— the embedding tensor's key name, the vocab_size config path, the
-layer-naming prefix, the sharding size, the depth/width step sizes — is now
-a CLI flag, defaulting to the Gemma-4 layout these were built against but
-pointable anywhere your own checkpoint's tensor/config layout actually
-lives. Most model-family constants are CLI flags; `expand_model.py`'s
-submodule key suffixes (`gate_proj`, `k_proj`, etc.) still need source edits
-for non-Gemma layouts (see its docstring). The README calls out
-per-tool which pieces are Gemma-4-specific by nature (mainly the GQA fix,
-and those `expand_model.py` submodule key suffixes) versus
-already architecture-agnostic.
+Model-family lock-in got the same treatment, and it's worth being precise
+about where that claim actually stands rather than rounding it up. Every
+model-specific constant that used to be hardcoded — the embedding tensor's
+key name, the vocab_size config path, the layer-naming prefix, the sharding
+size, the depth/width step sizes, the GQA head count — is a CLI flag now,
+defaulting to the Gemma-4 layout these were built against but pointable at
+whatever your own checkpoint actually uses. The one piece that doesn't
+become a flag is `expand_model.py`'s submodule key *suffixes*
+(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`) —
+and having actually gone and checked the installed `transformers` library's
+own modeling source rather than assuming, those suffixes turn out to be
+shared by most Llama-derived decoder architectures (Llama, Mistral,
+Qwen2/3, every Gemma generation), not just Gemma's. So "Gemma-4-specific"
+undersold it — but it's still not universal: GPT-2, the original Phi, Phi-3,
+Falcon, MPT, and BLOOM all use genuinely different, fused-QKV naming and
+would need real code changes, not a flag, to support. The per-tool sections
+below spell out exactly what's been checked where, including the one place
+that stayed narrowly Gemma-4-specific on purpose: `expand_model.py`'s GQA
+fix now runs an actual detection pass against the loaded checkpoint's
+tensors before touching anything, and skips cleanly with a warning if the
+checkpoint doesn't match the layout it targets, rather than assuming every
+input does.
 
 You don't need to use these together or in order — each one solves a
 different single-GPU problem on its own. The canonical pipeline order, if
@@ -41,8 +51,9 @@ you use them together, is:
 prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py
 ```
 
-Each step is optional — you can skip pruning, skip expansion, skip MTP, and
-just train directly against a base checkpoint.
+Skip whichever steps you don't need — pruning, expansion, and MTP are all
+independently optional, and training directly against an unmodified base
+checkpoint is a completely normal way to use `train_cpt.py` on its own.
 
 ## Table of Contents
 
@@ -58,7 +69,9 @@ just train directly against a base checkpoint.
   - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
 - [Tips / Troubleshooting](#tips--troubleshooting)
 - [Where this hits a real ceiling](#where-this-hits-a-real-ceiling)
+- [Testing](#testing)
 - [Requirements](#requirements)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Installation
@@ -92,14 +105,25 @@ below. You can also force it with `--gfx-override gfx1100`.
 A Gemma-4 tokenizer ships vocabulary for scripts you may never see — CJK,
 Cyrillic, Arabic, Devanagari, Mongolian, a long tail of accented Latin. If
 your use case doesn't need all of that, `prune_vocab.py` drops those entries
-by a configurable character-script heuristic, remaps every surviving token
-to a contiguous new ID space, and filters the BPE merge table to match. One
-detail that mattered in practice: some Gemma-4 configs store `vocab_size` in
-two places, a top-level field and a nested one, and missing either one
-silently reverts the vocab size at load time — this script fixes both, and
-it fixes both because a real load crashed on exactly this the first time
-around. Useful on its own any time you want a smaller embedding table
-without retraining the tokenizer from scratch.
+by a character-script heuristic, remaps every surviving token to a
+contiguous new ID space, and filters the BPE merge table to match. That
+part — the classification and the vocab/merge surgery — only ever looks at
+token strings and `tokenizer.json`; there's nothing Gemma-specific in it, so
+it runs the same way against any tokenizer.
+
+The `config.json` side is where the model-family specifics live, and
+they're flag-driven rather than hardcoded. One detail that mattered in
+practice: some Gemma-4 configs store `vocab_size` in two places, a top-level
+field and a nested one, and missing either one silently reverts the vocab
+size at load time — this script fixes both by default (`--vocab-size-paths`
+if your own config nests it somewhere else), and it fixes both because a
+real load crashed on exactly this the first time around. A second, narrower
+fix renames `model_type: "gemma4_unified"` to `"gemma4"` when a checkpoint's
+`config.json` uses the older string but the installed `transformers`
+registers Gemma4Config under the shorter name — it only fires on that exact
+match, so it's already a no-op against any other model family's config.
+Useful on its own any time you want a smaller embedding table without
+retraining the tokenizer from scratch.
 
 ```
 python3 prune_vocab.py --src <base_checkpoint> --dst <pruned_checkpoint>
@@ -109,11 +133,20 @@ python3 prune_vocab.py --src <base_checkpoint> --dst <pruned_checkpoint>
 
 Dropping tokenizer entries doesn't shrink anything until the model's actual
 weights follow. This script takes the ID remap the tool above produces and
-slices `embed_tokens.weight` down to match, handling both sharded (with an
+slices the embedding tensor down to match, handling both sharded (with an
 `index.json`) and single-file checkpoints — it rewrites only the shard that
 changed and copies the rest through untouched, rather than reserializing
-weights it didn't need to touch. Useful standalone any time you've already
-got a vocab remap and just need the tensor surgery.
+weights it didn't need to touch. Which tensor gets sliced is a `--embed-key`
+flag (defaults to the Gemma-4-family key,
+`model.language_model.embed_tokens.weight`); everything past that lookup —
+reading one named tensor out of the state dict, slicing its rows, writing
+it back — doesn't care what architecture it came from. Point `--embed-key`
+at whatever your own checkpoint's safetensors header actually calls its
+embedding weight (e.g. plain `model.embed_tokens.weight` on many non-Gemma
+architectures) and the rest just works — though that's only been exercised
+against the Gemma-4-family key by this repo, not verified against another
+architecture. Useful standalone any time you've already got a vocab remap
+and just need the tensor surgery.
 
 ```
 python3 prune_embeddings_torch.py --src <base_checkpoint> --dst <pruned_checkpoint>
@@ -130,12 +163,33 @@ non-conflicting gradient signal from step one — zero-init would leave them
 starved. Newly duplicated layers get **zero-init on their output
 projections only**, which makes the insertion a true no-op: the layer runs
 a real forward pass, but contributes nothing to the residual stream until
-training turns it on. There's also an optional GQA fix for full-attention
-layers that ship with a single shared KV head and no separate `v_proj` —
-worth applying when KV-cache size isn't your actual memory bottleneck. Uses
-PyTorch + numpy + safetensors (no Apple-Silicon-only MLX dependency), usable
-on Gemma-4-family checkpoints; retargeting to other families needs the
-submodule key suffix edits noted in the docstring.
+training turns it on.
+
+There's also an optional GQA fix for full-attention layers that ship with a
+single shared KV head and no separate `v_proj` at all — worth applying when
+KV-cache size isn't your actual memory bottleneck, since the compression is
+otherwise just trading away model quality for a saving you don't need. This
+used to be a fix that quietly assumed every checkpoint it touched had that
+exact layout. It doesn't anymore: before rewriting anything, it now checks
+the loaded checkpoint's real tensors — does a `v_proj` key actually exist
+for these layers (it shouldn't, if the fix applies), does `k_proj`'s real
+shape agree with what the config claims the kv-head count is — and skips
+the pass cleanly with a specific reason logged if either check fails,
+instead of running anyway and either crashing on a shape mismatch or
+silently overwriting a real, already-trained V projection on an
+architecture that has one. `--force-gqa-fix` is there for the rare case
+you've verified by hand that the fix is still correct despite a failed
+check; don't reach for it unless you actually have.
+
+Uses PyTorch + numpy + safetensors (no Apple-Silicon-only MLX dependency).
+The width/depth expansion logic and the tensor-key *prefix* are both
+parameterized and have been checked against how mainstream decoder
+architectures actually name their weights (see the intro above and the
+module docstring for the verified list of what matches and what doesn't) —
+but this has only ever been run end-to-end against Gemma-4-family
+checkpoints on one MI300X. Retargeting a genuinely different naming
+convention (fused-QKV architectures especially) still needs the submodule
+key suffix edits noted in the docstring, not just a flag.
 
 ```
 python3 expand_model.py --src <pruned_checkpoint> --dst <expanded_checkpoint>
@@ -517,8 +571,11 @@ training framework once the token budget gets into the trillions.
 Each module with logic that can be tested without a real checkpoint ships a
 `--selftest` (CPU-only, no GPU needed). Transformation tools (`prune_vocab.py`,
 `prune_embeddings_torch.py`, `expand_model.py`) are covered by the pytest suite
-in [`tests/`](tests/) instead. CI (`.github/workflows/selftest.yml`) runs both
-on every push/PR.
+in [`tests/`](tests/) instead — they need a real checkpoint to run their
+`main()` for real, so their pure-logic functions (depth planning, orthogonal
+padding shapes, merge-format parsing, the MQA layout detection) get exercised
+directly instead. CI (`.github/workflows/selftest.yml`) runs both on every
+push/PR.
 
 ```bash
 # Run all self-tests + pytest locally (CPU-only):
@@ -527,6 +584,12 @@ for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          rocm_env.py mtp_head.py; do python3 "$f" --selftest; done
 pytest tests/ -v
 ```
+
+`.gitignore` keeps the usual local-only noise (`.venv/`, `__pycache__/`,
+`.pytest_cache/`, `.DS_Store`) and `config.env` specifically — the file
+`catch_and_resume.sh` reads its real paths from, generated from
+`config.env.example`, never meant to be committed since it'll have your
+actual filesystem layout in it.
 
 ## Requirements
 
@@ -555,6 +618,16 @@ bakes in a ROCm torch + all deps):
 strict constraint — if your ROCm stack needs a different torch, override it.
 The only hard pin is `transformers` (the Gemma4Config model_type registration
 differs across versions).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the actual ground rules, but the
+short version is the same discipline this README tries to hold itself to: no
+claims the code doesn't back up, no mocked self-tests, and model-family
+constants go in CLI flags, not new hardcoded branches. If you add a tool,
+give it a `--selftest` (or, if it's a transformation tool that needs a real
+checkpoint to run, pytest coverage of its logic instead — see `tests/`
+above for what that looks like in practice).
 
 ## License
 

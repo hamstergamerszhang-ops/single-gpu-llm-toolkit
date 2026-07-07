@@ -155,6 +155,69 @@ def test_orthogonal_pad_shapes():
     assert pad2.shape == (16, 8), pad2.shape
 
 
+def test_detect_mqa_layout_matches_when_no_v_proj_and_shape_agrees():
+    """The real Gemma-4 layout: no v_proj key, k_proj output dim == kv_heads*head_dim.
+    Detection should say this matches, so the GQA fix is safe to apply."""
+    import torch
+    from expand_model import detect_mqa_v_shares_k_layout
+    head_dim, old_kv_heads, hidden = 4, 1, 16
+    tensors = {
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(old_kv_heads * head_dim, hidden),
+        # no v_proj key at all -- this is the layout being detected
+    }
+    matches, reason = detect_mqa_v_shares_k_layout(tensors, [0], "model.layers", head_dim, old_kv_heads)
+    assert matches is True, reason
+
+
+def test_detect_mqa_layout_rejects_when_v_proj_exists():
+    """A checkpoint with a real v_proj (standard GQA/MHA architectures -- Llama,
+    Mistral, Qwen, etc.) must NOT be treated as matching the Gemma-4 MQA layout,
+    or the fix would silently overwrite a real, already-trained V matrix."""
+    import torch
+    from expand_model import detect_mqa_v_shares_k_layout
+    head_dim, old_kv_heads, hidden = 4, 1, 16
+    tensors = {
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(old_kv_heads * head_dim, hidden),
+        "model.layers.0.self_attn.v_proj.weight": torch.randn(old_kv_heads * head_dim, hidden),
+    }
+    matches, reason = detect_mqa_v_shares_k_layout(tensors, [0], "model.layers", head_dim, old_kv_heads)
+    assert matches is False
+    assert "v_proj" in reason
+
+
+def test_detect_mqa_layout_rejects_on_kv_head_shape_mismatch():
+    """If the config's advertised kv-head count doesn't match k_proj's real
+    output shape, detection must refuse rather than let gqa_expand_kv()
+    concatenate against a wrong old_kv_heads and misshape the tensor."""
+    import torch
+    from expand_model import detect_mqa_v_shares_k_layout
+    head_dim, old_kv_heads, hidden = 4, 1, 16
+    # k_proj actually has 2 kv heads worth of output, but old_kv_heads says 1
+    tensors = {
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(2 * head_dim, hidden),
+    }
+    matches, reason = detect_mqa_v_shares_k_layout(tensors, [0], "model.layers", head_dim, old_kv_heads)
+    assert matches is False
+    assert "output dim" in reason
+
+
+def test_detect_mqa_layout_rejects_on_missing_k_proj():
+    """If k_proj itself can't be found (e.g. --layer-prefix doesn't match this
+    checkpoint's real key naming), detection must fail closed, not assume."""
+    from expand_model import detect_mqa_v_shares_k_layout
+    matches, reason = detect_mqa_v_shares_k_layout({}, [0], "model.layers", 4, 1)
+    assert matches is False
+    assert "not found" in reason
+
+
+def test_detect_mqa_layout_no_full_attention_layers():
+    """An empty full_attn_idxs list (e.g. a model with no layer marked
+    'full_attention') should report no-match rather than vacuously 'True'."""
+    from expand_model import detect_mqa_v_shares_k_layout
+    matches, reason = detect_mqa_v_shares_k_layout({}, [], "model.layers", 4, 1)
+    assert matches is False
+
+
 def test_clone_layer_tensors_copies_and_zeros_outputs():
     """clone_layer_tensors copies all suffix keys; zero_output_projections
     zeroes o_proj and down_proj while cloning the rest."""

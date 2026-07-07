@@ -40,23 +40,32 @@ Key design decisions (the genuinely interesting engineering here):
     existing layer, where zero-init would starve gradient flow to those
     columns specifically) — hence the two different init strategies for two
     different insertion patterns, by design, not by accident.
-  - **Real GQA fix on MQA-style attention layers -- Gemma-4-family-specific,
-    not a general architecture fix.** Some full-attention layers in
-    Gemma-4-family checkpoints specifically ship with an extreme "1 shared KV
-    head, V literally reuses K, no separate v_proj weight exists at all" MQA
-    setup (confirmed by inspecting the actual checkpoint's safetensors header
-    — there's no `v_proj` key for these layers). That's a real memory
-    optimization, but on a GPU with enough VRAM that KV-cache size at long
-    context isn't actually the bottleneck, it's trading away model quality
-    for a saving this deployment doesn't need. `--gqa-kv-heads N` (default 8)
-    grows `k_proj` to N real KV heads via orthogonal padding (preserving
-    already-learned K directions) and builds a brand-new `v_proj` from
-    scratch via a fresh orthogonal QR init (there's no existing V data to pad
-    from — V never existed as a separate matrix before). Set
-    `--gqa-kv-heads 0` to skip this and keep the stock MQA behavior -- this is
-    the right default for any checkpoint that doesn't share Gemma-4's
-    specific "no v_proj at all" MQA layout, since the fix assumes that exact
-    missing-tensor shape and isn't a generic GQA-widening tool.
+  - **Real GQA fix on MQA-style attention layers, with an actual detection
+    step in front of it -- not a blind Gemma-4-only assumption anymore.**
+    Some full-attention layers in Gemma-4-family checkpoints specifically
+    ship with an extreme "1 shared KV head, V literally reuses K, no separate
+    v_proj weight exists at all" MQA setup (confirmed by inspecting the
+    actual checkpoint's safetensors header — there's no `v_proj` key for
+    these layers). That's a real memory optimization, but on a GPU with
+    enough VRAM that KV-cache size at long context isn't actually the
+    bottleneck, it's trading away model quality for a saving this deployment
+    doesn't need. `--gqa-kv-heads N` (default 8) grows `k_proj` to N real KV
+    heads via orthogonal padding (preserving already-learned K directions)
+    and builds a brand-new `v_proj` from scratch via a fresh orthogonal QR
+    init (there's no existing V data to pad from — V never existed as a
+    separate matrix before). Before touching any tensor, though,
+    `detect_mqa_v_shares_k_layout()` actually checks the loaded checkpoint
+    against the assumed layout: does a `v_proj` key exist for these layers
+    (it shouldn't, if this optimization applies), and does `k_proj`'s real
+    shape agree with what the config claims the kv-head count is? If either
+    check fails — meaning this checkpoint doesn't have the MQA-with-no-v_proj
+    layout at all, e.g. any standard GQA/MHA architecture that ships a real
+    `v_proj` — the fix is skipped with a clear log message instead of running
+    anyway and either crashing on a shape mismatch or silently overwriting a
+    real, already-trained V matrix. `--force-gqa-fix` overrides the check for
+    the rare case you've verified by hand that it's still correct. Set
+    `--gqa-kv-heads 0` to skip this pass entirely and keep whatever attention
+    layout the checkpoint already has.
   - **numpy QR, not `torch.nn.init.orthogonal_`, for the orthogonal
     constructions.** This ROCm PyTorch build's CPU tensors don't have LAPACK
     support (`torch.linalg.qr` / `torch.geqrf` raise a clear error asking for
@@ -87,15 +96,36 @@ before this pass (their module-level DEFAULT_* constants are just the
 argparse defaults). --interleave-every and --max-shard-bytes are new in this
 pass -- they used to be hardcoded module constants (INTERLEAVE_EVERY,
 MAX_SHARD_BYTES) with no way to override them without editing source; now
-they're flags too, same pattern as the others. --layer-prefix in particular
-matters for pointing this at a different model family's tensor naming, since
-gate/up/down_proj and self_attn.k_proj/v_proj/o_proj key SUFFIXES are still
-assumed fixed below (only the prefix before the layer index is
-parameterized) -- a model family with different attention/MLP submodule
-names would need those suffixes edited in width_expand_layer() /
-gqa_expand_kv() / clone_layer_tensors(), not just a flag change. This has
-only ever actually been run against Gemma-4-family checkpoints on a single
-MI300X; the flags make it plausible to point elsewhere, not verified there.
+they're flags too, same pattern as the others.
+
+On tensor key SUFFIXES (gate/up/down_proj, self_attn.q/k/v/o_proj): these are
+NOT parameterized here (only the prefix before the layer index is, via
+--layer-prefix), but checked directly against the installed `transformers`
+library's own modeling source (not assumed) -- Llama, Mistral, Qwen2, Qwen3,
+and every Gemma generation all define these exact attribute names
+(`self.gate_proj`/`self.up_proj`/`self.down_proj`, `self.q_proj`/`k_proj`/
+`v_proj`/`o_proj`), because HF safetensors keys are just the module's
+attribute path, and this naming traces back to the original Llama
+implementation that most subsequent decoder-only architectures copied. So
+this suffix assumption is honestly broader than "Gemma-4-specific" -- it's
+"most Llama-derived decoder architectures," which is most of what's popular
+right now. It is NOT universal, though, and here are the real, verified
+exceptions: GPT-2 fuses QKV into one `c_attn` (a `Conv1D`, not `Linear`) and
+uses `c_fc`/`c_proj` for the MLP; the original Phi (phi-1/phi-2) uses
+`fc1`/`fc2` for its MLP instead of gate/up/down; Phi-3 fuses attention into
+one `qkv_proj` and the MLP into one `gate_up_proj`; Falcon, MPT, and BLOOM
+all fuse attention into a single `query_key_value` (or `Wqkv`) matrix and use
+model-specific MLP names (`dense_h_to_4h`/`dense_4h_to_h` or
+`up_proj`/`down_proj` with no `gate_proj` at all). Point this at one of those
+and it will KeyError cleanly on a missing tensor key rather than silently
+doing the wrong thing -- but it won't work without real code changes to
+width_expand_layer() / gqa_expand_kv() / clone_layer_tensors() for those
+architectures' actual submodule names.
+
+This has only ever actually been run end-to-end against Gemma-4-family
+checkpoints on a single MI300X; the flags plus the suffix research above make
+it plausible (and, for the common Llama-style suffix case, probably correct)
+to point elsewhere, but that's not the same as verified there.
 """
 
 import argparse
@@ -163,6 +193,63 @@ def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
     old_w = tensors[down_key]
     pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=False)
     tensors[down_key] = torch.cat([old_w, pad], dim=1)
+
+
+def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_prefix: str,
+                                 head_dim: int, old_kv_heads: int) -> tuple:
+    """Checks whether this checkpoint's full-attention layers actually match the
+    specific MQA layout gqa_expand_kv() assumes ("1 shared KV head, V literally
+    reuses K, no separate v_proj key exists at all"), instead of assuming every
+    input matches it.
+
+    Returns (matches: bool, reason: str). `matches` is True only if EVERY
+    full-attention layer checked has:
+      - no `{prefix}.self_attn.v_proj.weight` key in the loaded tensors, AND
+      - a `{prefix}.self_attn.k_proj.weight` key whose output dim equals
+        old_kv_heads * head_dim (i.e. the config's advertised kv-head count
+        actually matches the tensor's real shape).
+
+    If ANY checked layer has a real v_proj key, or the k_proj shape doesn't
+    match what the config claims, this returns False with a reason string --
+    the caller should skip the fix rather than apply gqa_expand_kv() blindly,
+    since that function unconditionally overwrites v_proj (would silently
+    clobber a real, already-trained V matrix on architectures that have one)
+    and assumes old_kv_heads is the true current shape (would misshape the
+    k_proj concatenation otherwise).
+
+    This is a real safety check, not a formality: it's the difference between
+    "only works on Gemma-4's exact MQA layout" and "auto-detects whether this
+    specific optimization applies, and cleanly skips it otherwise."
+    """
+    if not full_attn_idxs:
+        return False, "no full-attention layers found (layer_types has none marked 'full_attention')"
+
+    for old_idx in full_attn_idxs:
+        prefix = f"{layer_prefix}.{old_idx}"
+        v_key = f"{prefix}.self_attn.v_proj.weight"
+        k_key = f"{prefix}.self_attn.k_proj.weight"
+
+        if v_key in tensors:
+            return False, (f"layer {old_idx}: found a real {v_key!r} tensor -- this checkpoint "
+                            f"already has a separate V projection, it doesn't use the "
+                            f"'V literally reuses K, no v_proj at all' MQA layout this fix targets")
+
+        if k_key not in tensors:
+            return False, (f"layer {old_idx}: expected {k_key!r} not found in loaded tensors -- "
+                            f"can't verify the kv-head layout, --layer-prefix may not match this "
+                            f"checkpoint's actual key naming (see --layer-prefix help)")
+
+        actual_k_out = tensors[k_key].shape[0]
+        expected_k_out = old_kv_heads * head_dim
+        if actual_k_out != expected_k_out:
+            return False, (f"layer {old_idx}: {k_key!r} has output dim {actual_k_out}, but the "
+                            f"config-derived old_kv_heads*head_dim ({old_kv_heads}*{head_dim}="
+                            f"{expected_k_out}) doesn't match -- the config's kv-head count "
+                            f"doesn't agree with the tensor's real shape, refusing to guess")
+
+    return True, (f"confirmed: {len(full_attn_idxs)} full-attention layer(s) have no v_proj key "
+                  f"and k_proj shape matches the config's kv-head count -- matches the assumed "
+                  f"MQA layout")
 
 
 def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads: int,
@@ -277,7 +364,19 @@ def main():
     ap.add_argument("--depth-step", type=int, default=DEFAULT_DEPTH_STEP)
     ap.add_argument("--gqa-kv-heads", type=int, default=DEFAULT_GQA_KV_HEADS,
                     help="Replace full-attention layers' MQA (1 shared kv head, V=K) with "
-                         "real GQA at this many kv heads (0 disables, keeps stock MQA)")
+                         "real GQA at this many kv heads (0 disables, keeps stock MQA). "
+                         "Before applying, this checks whether the checkpoint's tensors "
+                         "actually match the assumed layout (no v_proj key, k_proj shape "
+                         "agrees with the config's kv-head count) and skips cleanly with a "
+                         "warning if they don't -- see --force-gqa-fix to override that check.")
+    ap.add_argument("--force-gqa-fix", action="store_true",
+                    help="Apply the GQA fix even if the layout-detection check fails (i.e. the "
+                         "checkpoint has a real v_proj already, or its k_proj shape doesn't match "
+                         "the config's kv-head count). Only use this if you've independently "
+                         "verified via a safetensors header inspection that the fix is still "
+                         "correct for your checkpoint -- forcing past a failed check is very "
+                         "likely to either crash on a shape mismatch or silently overwrite a real, "
+                         "already-trained v_proj tensor.")
     ap.add_argument("--layer-prefix", type=str, default="model.language_model.layers",
                     help="Safetensors key prefix before the layer index, e.g. "
                          "'model.language_model.layers.0.mlp...'. Different Gemma-4-family "
@@ -286,7 +385,10 @@ def main():
                          "quick safetensors header inspection before running for real. "
                          "Submodule key SUFFIXES (mlp.gate_proj, self_attn.k_proj, etc.) "
                          "are NOT parameterized here -- only the prefix before the layer "
-                         "index is. See module docstring.")
+                         "index is. These suffixes are shared by most Llama-derived "
+                         "decoder architectures (Llama, Mistral, Qwen2/3, Gemma) but NOT "
+                         "by GPT-2/Phi/Phi-3/Falcon/MPT/BLOOM-style fused-QKV models. "
+                         "See module docstring for the verified list.")
     ap.add_argument("--interleave-every", type=int, default=INTERLEAVE_EVERY,
                     help="Insert one duplicated layer after every N original layers "
                          "(subject to --depth-step's total cap). Was a hardcoded module "
@@ -342,17 +444,36 @@ def main():
         tensors.update(loaded)
     log(f"  loaded {len(tensors)} tensors")
 
+    gqa_applied = False
     if args.gqa_kv_heads > 0:
         old_kv_heads = tc.get("num_global_key_value_heads", 1)
         global_head_dim = tc.get("global_head_dim", tc["head_dim"])
         full_attn_idxs = [i for i in range(orig_layers) if layer_types[i] == "full_attention"]
-        log(f"Pass 1/3: GQA fix on {len(full_attn_idxs)} full-attention layers "
-            f"({old_kv_heads} -> {args.gqa_kv_heads} kv heads, V=K -> real V) ...")
-        for old_idx in full_attn_idxs:
-            prefix = f"{args.layer_prefix}.{old_idx}"
-            gqa_expand_kv(tensors, prefix, global_head_dim, old_kv_heads, args.gqa_kv_heads,
-                         hidden, INIT_SCALE)
-        log("  GQA fix done")
+
+        matches, reason = detect_mqa_v_shares_k_layout(tensors, full_attn_idxs, args.layer_prefix,
+                                                       global_head_dim, old_kv_heads)
+        if not matches and not args.force_gqa_fix:
+            log(f"Pass 1/3: SKIPPED -- checkpoint doesn't match the assumed MQA layout ({reason}). "
+                f"This fix is a narrow, Gemma-4-specific optimization for checkpoints that ship "
+                f"with 'V literally reuses K, no v_proj at all' on full-attention layers; your "
+                f"checkpoint doesn't look like that, so applying it blindly could clobber a real "
+                f"v_proj or misshape k_proj. Pass --force-gqa-fix to override this check (only if "
+                f"you've verified the layout yourself), or --gqa-kv-heads 0 to silence this.")
+        else:
+            if not matches:
+                log(f"Pass 1/3: WARNING -- --force-gqa-fix set, applying GQA fix despite a failed "
+                    f"layout check ({reason}). This is very likely to corrupt weights or crash. "
+                    f"Proceeding only because you explicitly forced it.")
+            else:
+                log(f"Pass 1/3: layout check passed ({reason})")
+            log(f"Pass 1/3: GQA fix on {len(full_attn_idxs)} full-attention layers "
+                f"({old_kv_heads} -> {args.gqa_kv_heads} kv heads, V=K -> real V) ...")
+            for old_idx in full_attn_idxs:
+                prefix = f"{args.layer_prefix}.{old_idx}"
+                gqa_expand_kv(tensors, prefix, global_head_dim, old_kv_heads, args.gqa_kv_heads,
+                             hidden, INIT_SCALE)
+            log("  GQA fix done")
+            gqa_applied = True
     else:
         log("Pass 1/3: SKIPPED (--gqa-kv-heads 0, keeping stock MQA)")
 
@@ -392,11 +513,14 @@ def main():
     cfg["text_config"]["num_hidden_layers"] = new_layers
     cfg["text_config"]["layer_types"] = new_layer_types
 
-    if args.gqa_kv_heads > 0:
+    if gqa_applied:
         # attention_k_eq_v=False disables the MQA shortcut for every layer -> KV
         # heads fall back to the real (now-expanded) count, and v_proj is no longer
         # skipped -- exactly matching the fresh v_proj weights gqa_expand_kv() just
         # wrote. One flag flip covers all (now-GQA) full-attention layers uniformly.
+        # Gated on gqa_applied (not args.gqa_kv_heads > 0) -- if the layout-detection
+        # check skipped the fix, this config flag must NOT flip either, or the
+        # written config would claim a GQA layout that the tensors don't actually have.
         cfg["text_config"]["attention_k_eq_v"] = False
         log(f"GQA fix applied: attention_k_eq_v -> False, "
             f"full-attention layers now use {args.gqa_kv_heads} real kv heads (was MQA=1, V=K)")
