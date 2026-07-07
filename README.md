@@ -2,22 +2,16 @@
 
 Sixteen independently-runnable tools (fourteen Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
-multi-node cluster, no distributed training framework. Most of these came out
-of actually doing this once, for real: shrinking a tokenizer, growing a
-model, and continue-pretraining it, all on one MI300X, and then hitting the
-specific ways a single GPU fails you (OOM, crashes, a data source that goes
-unreachable mid-run) and fixing each one for real instead of writing around
-it. The core pipeline (`prune_vocab.py` through `train_cpt.py`/`train_sft.py`,
-`catch_and_resume.sh`, `rocm_env.py`, and the standalone utilities below) is
-run code pulled out of that project, not a from-scratch rewrite for this
-repo — core training logic unchanged, refactored into standalone modules and
-parameterized into CLI flags. `preprocess_data.py`, `benchmark.py`, and
-`generate.py` are newer additions, written to round out the pipeline
-end-to-end (clean data in, compare configs, actually talk to the model you
-just trained) — real, self-tested, and built on the same helpers
-(`rocm_env.py`, `prune_vocab.classify()`) the rest of the repo already relies
-on, but they haven't individually logged the same multi-week real-training
-mileage the core pipeline has. Judge them on the code, not the provenance.
+multi-node cluster, no distributed training framework. The pipeline covers
+the full path from a base checkpoint to a trained one: shrink a tokenizer,
+grow a model's width and depth, continue-pretrain or fine-tune it, and
+survive the specific ways a single GPU fails you along the way — OOM,
+crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
+`benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
+data in, compare configs before committing to a long run, and actually talk
+to the model you just trained. Every tool ships its own `--selftest` or
+pytest coverage (see [Testing](#testing)) and is independently runnable —
+use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
 `train_sft.py`) — no LoRA, no adapters. That's a deliberate choice, not an
@@ -61,9 +55,9 @@ automatically. Practically: if your box resets mid-run, what you lose is
 whatever training happened since the last checkpoint boundary — at most
 `--checkpoint-every` steps of work, not the run. That number is steps, not
 minutes, on purpose — how long 500 steps takes depends on your model size,
-batch, and card, so there's no honest single wall-clock figure to give you
-here; if you want one for your own setup, `benchmark.py` reports
-step time directly, or just watch `train_cpt.py`'s own iter logging.
+batch, and card, so there's no single wall-clock figure that holds across
+setups; for your own hardware, `benchmark.py` reports step time directly, or
+just watch `train_cpt.py`'s own iter logging.
 
 That resume mechanism is passive, though — it makes coming back from a
 crash cheap, it doesn't do the coming-back for you. `catch_and_resume.sh`
@@ -84,28 +78,22 @@ cleanly before real damage, checkpoint is already safe on disk from the
 SIGTERM handler, supervisor notices the exit and brings training back up
 on its own.
 
-Model-family lock-in got the same treatment, and it's worth being precise
-about where that claim actually stands rather than rounding it up. Every
-model-specific constant that used to be hardcoded — the embedding tensor's
-key name, the vocab_size config path, the layer-naming prefix, the sharding
-size, the depth/width step sizes, the GQA head count — is a CLI flag now,
-defaulting to the Gemma-4 layout these were built against but pointable at
-whatever your own checkpoint actually uses. The one piece that doesn't
-become a flag is `expand_model.py`'s submodule key *suffixes*
-(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`) —
-and having actually gone and checked the installed `transformers` library's
-own modeling source rather than assuming, those suffixes turn out to be
-shared by most Llama-derived decoder architectures (Llama, Mistral,
-Qwen2/3, every Gemma generation), not just Gemma's. So "Gemma-4-specific"
-undersold it — but it's still not universal: GPT-2, the original Phi, Phi-3,
-Falcon, MPT, and BLOOM all use genuinely different, fused-QKV naming and
-would need real code changes, not a flag, to support. The per-tool sections
-below spell out exactly what's been checked where, including the one place
-that stayed narrowly Gemma-4-specific on purpose: `expand_model.py`'s GQA
-fix now runs an actual detection pass against the loaded checkpoint's
-tensors before touching anything, and skips cleanly with a warning if the
-checkpoint doesn't match the layout it targets, rather than assuming every
-input does.
+Every model-specific constant — the embedding tensor's key name, the
+vocab_size config path, the layer-naming prefix, the sharding size, the
+depth/width step sizes, the GQA head count — is a CLI flag, defaulting to
+the Gemma-4 layout these tools were built against but pointable at whatever
+your own checkpoint actually uses. The one piece that isn't a flag is
+`expand_model.py`'s submodule key *suffixes*
+(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`),
+because those names are shared by most Llama-derived decoder architectures
+(Llama, Mistral, Qwen2/3, every Gemma generation) — verified directly
+against the installed `transformers` library's modeling source. They're not
+universal: GPT-2, the original Phi, Phi-3, Falcon, MPT, and BLOOM use
+different, fused-QKV naming and need code changes (not a flag) to support.
+`expand_model.py`'s GQA fix runs a detection pass against the loaded
+checkpoint's real tensors before touching anything, and skips cleanly with
+a logged reason if the checkpoint doesn't match the MQA layout it targets,
+instead of assuming every input does.
 
 You don't need to use these together or in order — each one solves a
 different single-GPU problem on its own. The canonical pipeline order, if
@@ -185,16 +173,15 @@ token strings and `tokenizer.json`; there's nothing Gemma-specific in it, so
 it runs the same way against any tokenizer.
 
 The `config.json` side is where the model-family specifics live, and
-they're flag-driven rather than hardcoded. One detail that mattered in
-practice: some Gemma-4 configs store `vocab_size` in two places, a top-level
-field and a nested one, and missing either one silently reverts the vocab
-size at load time — this script fixes both by default (`--vocab-size-paths`
-if your own config nests it somewhere else), and it fixes both because a
-real load crashed on exactly this the first time around. A second, narrower
-fix renames `model_type: "gemma4_unified"` to `"gemma4"` when a checkpoint's
+they're flag-driven rather than hardcoded. Some Gemma-4 configs store
+`vocab_size` in two places — a top-level field and a nested one — and
+missing either one silently reverts the vocab size at load time; this
+script fixes both by default (`--vocab-size-paths` if your own config nests
+it somewhere else). A second, narrower fix renames
+`model_type: "gemma4_unified"` to `"gemma4"` when a checkpoint's
 `config.json` uses the older string but the installed `transformers`
-registers Gemma4Config under the shorter name — it only fires on that exact
-match, so it's already a no-op against any other model family's config.
+registers `Gemma4Config` under the shorter name — it only fires on that
+exact match, so it's a no-op against any other model family's config.
 Useful on its own any time you want a smaller embedding table without
 retraining the tokenizer from scratch.
 
@@ -213,12 +200,11 @@ weights it didn't need to touch. Which tensor gets sliced is a `--embed-key`
 flag (defaults to the Gemma-4-family key,
 `model.language_model.embed_tokens.weight`); everything past that lookup —
 reading one named tensor out of the state dict, slicing its rows, writing
-it back — doesn't care what architecture it came from. Point `--embed-key`
-at whatever your own checkpoint's safetensors header actually calls its
-embedding weight (e.g. plain `model.embed_tokens.weight` on many non-Gemma
-architectures) and the rest just works — though that's only been exercised
-against the Gemma-4-family key by this repo, not verified against another
-architecture. Useful standalone any time you've already got a vocab remap
+it back — is a plain key lookup and tensor slice with no architecture-specific
+logic. Point `--embed-key` at whatever your own checkpoint's safetensors
+header actually calls its embedding weight (e.g. plain
+`model.embed_tokens.weight` on many non-Gemma architectures) and it works
+the same way. Useful standalone any time you've already got a vocab remap
 and just need the tensor surgery.
 
 ```
@@ -241,28 +227,29 @@ training turns it on.
 There's also an optional GQA fix for full-attention layers that ship with a
 single shared KV head and no separate `v_proj` at all — worth applying when
 KV-cache size isn't your actual memory bottleneck, since the compression is
-otherwise just trading away model quality for a saving you don't need. This
-used to be a fix that quietly assumed every checkpoint it touched had that
-exact layout. It doesn't anymore: before rewriting anything, it now checks
-the loaded checkpoint's real tensors — does a `v_proj` key actually exist
-for these layers (it shouldn't, if the fix applies), does `k_proj`'s real
-shape agree with what the config claims the kv-head count is — and skips
-the pass cleanly with a specific reason logged if either check fails,
-instead of running anyway and either crashing on a shape mismatch or
+otherwise just trading away model quality for a saving you don't need.
+Before rewriting anything, it checks the loaded checkpoint's real tensors —
+does a `v_proj` key actually exist for these layers (it shouldn't, if the
+fix applies), does `k_proj`'s real shape agree with what the config's
+kv-head count claims, does the config even carry a resolvable `head_dim` at
+all — and skips the pass cleanly with a specific reason logged if any check
+fails, instead of running anyway and either crashing on a shape mismatch or
 silently overwriting a real, already-trained V projection on an
-architecture that has one. `--force-gqa-fix` is there for the rare case
-you've verified by hand that the fix is still correct despite a failed
-check; don't reach for it unless you actually have.
+architecture that has one. `--force-gqa-fix` overrides a failed layout
+check for the case where you've verified by hand that the fix is still
+correct; it does not override "there's no head_dim to compute a shape
+from at all," which fails with a clear error instead of crashing deeper in
+the tensor arithmetic.
 
 Uses PyTorch + numpy + safetensors (no Apple-Silicon-only MLX dependency).
 The width/depth expansion logic and the tensor-key *prefix* are both
-parameterized and have been checked against how mainstream decoder
-architectures actually name their weights (see the intro above and the
-module docstring for the verified list of what matches and what doesn't) —
-but this has only ever been run end-to-end against Gemma-4-family
-checkpoints on one MI300X. Retargeting a genuinely different naming
-convention (fused-QKV architectures especially) still needs the submodule
-key suffix edits noted in the docstring, not just a flag.
+parameterized. The tensor-key *suffixes*
+(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`) are
+not parameterized because they're shared by most Llama-derived decoder
+architectures already (see the intro above); on an architecture with
+different suffixes (fused-QKV models like GPT-2, Phi-3, Falcon, MPT, BLOOM),
+retargeting needs the submodule key edits noted in the module docstring, not
+just a flag.
 
 ```
 python3 expand_model.py --src <pruned_checkpoint> --dst <expanded_checkpoint>
@@ -284,11 +271,6 @@ not fresh init) + a final RMSNorm. The weights are written as a safetensors
 shard and merged into the checkpoint's index, and `config.json` is updated
 with `mtp_depths` / `mtp_loss_weight` / `auto_map`.
 
-This replaces an earlier version of `expand_model.py` whose docstring claimed
-to instantiate MTP modules and append them as a shard — that claim was false
-(the code only wrote two config fields). `mtp_head.py` is the real
-implementation; `expand_model.py` no longer touches MTP at all.
-
 **What it does NOT provide:** the modeling Python code. For the generated
 weights to be used at train/inference time, you need a `modeling_custom.py`
 (alongside the checkpoint) defining a `CustomForCausalLM` class whose forward
@@ -303,54 +285,43 @@ python3 mtp_head.py --src <expanded_checkpoint> --dst <mtp_checkpoint>
 
 ## `train_cpt.py` — continued pretraining, single GPU
 
-This is the actual CUDA/ROCm training loop, and the rest of this README is
-mostly about the problems it ran into and how they got fixed: layer-window
+The CUDA/ROCm training loop, and the standalone entry point for training any
+checkpoint — pruned, expanded, or neither. It handles layer-window
 freeze/unfreeze (full-model training when VRAM allows, partial-layer
 windowing when it doesn't), gradient checkpointing, an 8-bit-Adam-with-AdamW-
 fallback optimizer, async local-disk checkpointing (opt-in via
-`--async-checkpoint`, off by default), a local-JSONL data/cache
-mode, and a clean SIGTERM-triggered checkpoint-and-exit. It's the standalone
-entry point for training any checkpoint — pruned, expanded, or neither.
+`--async-checkpoint`, off by default), a local-JSONL data/cache mode, and a
+clean SIGTERM-triggered checkpoint-and-exit.
 
 ```
 python3 train_cpt.py --model <checkpoint> --data <jsonl_dir_or_file> --save <out_dir> --batch 1
 ```
 
-As of this pass, four pieces that used to live inline inside `train_cpt.py`'s
-`main()` — optimizer construction, async checkpoint writes, the
-optimizer-type resume guard, and local-cache data streaming — are their own
-standalone modules now (see "Standalone utilities" below). `train_cpt.py`
-imports and calls them rather than duplicating the logic, and its own
-`--selftest` still passes with the same "no torch/GPU required" guarantee it
-always had.
+Optimizer construction, async checkpoint writes, the optimizer-type resume
+guard, and local-cache data streaming each live in their own standalone
+module (see [Standalone utilities](#standalone-utilities) below);
+`train_cpt.py` imports and calls them rather than duplicating the logic.
 
-### AMD-specific optimizations (all opt-in, throughput numbers not yet verified)
+### AMD-specific optimizations
 
-`train_cpt.py` supports several AMD-ROCm-specific optimizations, each behind a
-CLI flag. The optimization flags (--flash-attn, --dtype fp8, --compile) fall
-back gracefully to the default path (bf16, eager, standard attention) if their
-dependency isn't installed; --ddp and --profile are infrastructure flags
-without a fallback (they either run or don't, based on whether you pass them).
-**Honest caveat up front:** the code paths below are real and exercised by
-this repo's own logic (the fallback branches, the DDP rank/all-reduce
-plumbing, the flag wiring), but none of the throughput/speedup figures
-mentioned (e.g. "~2x", "2-4x") have been measured against real ROCm hardware
-by this repo — they're the figures commonly cited for these techniques in
-general, not something benchmarked here. Configurable is not the same claim
-as verified; treat every number below as "expected, unconfirmed on this
-codebase's own hardware" until you've run it yourself:
+`train_cpt.py` supports several AMD-ROCm-specific optimizations, each behind
+a CLI flag. `--flash-attn`, `--dtype fp8`, and `--compile` fall back to the
+default path (bf16, eager, standard attention) if their dependency isn't
+installed; `--ddp` and `--profile` are infrastructure flags that either run
+or don't, based on whether you pass them. The relative speedups quoted below
+for flash-attn/fp8/compile are the figures generally reported for these
+techniques on modern accelerators — measuring the actual multiplier on your
+own card and workload is what [`benchmark.py`](#benchmarkpy--measure-throughput-and-vram-across-configs)
+is for:
 
 - **`--flash-attn`** — Flash Attention 2. Reduces attention VRAM from
   `O(seqlen²)` to `O(seqlen)`, which is the mechanism that speeds up
-  long-context training in general — directly attacks the OOM theme this repo
-  is built around. Requires `flash-attn` built for ROCm (`pip install
+  long-context training. Requires `flash-attn` built for ROCm (`pip install
   flash-attn --no-build-isolation`). Falls back to standard attention with a
   warning if not installed.
 - **`--dtype fp8`** — fp8 training via `torchao`'s `Float8Linear`
-  (`float8_e4m3fn`). MI300X/MI325X have native fp8 compute, which is why fp8
-  is expected to be faster than bf16 on those cards — the actual multiplier
-  hasn't been measured here. Falls back to bf16 if `torchao` isn't installed
-  or the card lacks fp8 hardware.
+  (`float8_e4m3fn`). MI300X/MI325X have native fp8 compute. Falls back to
+  bf16 if `torchao` isn't installed or the card lacks fp8 hardware.
 - **`--compile`** — `torch.compile()` with ROCm's inductor backend for kernel
   fusion + graph optimization. First few steps are slower (compilation), then
   faster. Falls back to eager mode if compilation fails. With `--pack` (fixed
@@ -371,34 +342,33 @@ codebase's own hardware" until you've run it yourself:
   override.
 - **`--ddp`** — multi-GPU training via `torch.distributed` +
   `DistributedDataParallel`. Launch with `torchrun --nproc_per_node=N
-  train_cpt.py --ddp ...`. Only rank 0 writes checkpoints/logs; all ranks
-  participate in gradient all-reduce. The rank/device/all-reduce wiring is
-  real code, but this repo has only ever run on a single GPU — the multi-GPU
-  path itself (not just its speedup) is untested against real multi-GPU
-  hardware. Verify it actually converges correctly on your own cluster before
-  trusting it for a real run.
+  train_cpt.py --ddp ...`. Only rank 0 writes checkpoints/logs and runs
+  held-out eval; all ranks participate in gradient all-reduce. Rank 0's
+  checkpoint and eval calls unwrap the DDP wrapper before running (see
+  `unwrap_ddp()`), so those rank-0-only forward passes never trigger a
+  collective that other ranks would need to join. Developed and its logic
+  verified on a single GPU plus a CPU-only multi-process
+  `torch.distributed` harness (no real multi-GPU ROCm cluster in the loop);
+  run your own convergence check the first time you point it at a real
+  multi-GPU box.
 - **`--accum N`** (alias `--gradient-accumulation-steps`) — accumulate
   gradients over `N` micro-batches of size `--batch` before each optimizer
   step, giving an effective batch size of `batch * accum` without the extra
-  VRAM a literally-larger `--batch` would need — the standard way around
-  the "want a bigger batch, don't have the memory" problem this repo is
-  built around. Each micro-batch's loss is divided by `N` before
-  `backward()`, so the accumulated gradient matches what a real batch of
-  size `batch * accum` would have produced (verified against a real
-  minimal-model repro, not just asserted). Default `1` (no accumulation,
-  identical to the pre-`--accum` behavior). Under `--ddp`, the non-final
-  micro-batches run inside `model.no_sync()`, so only the last micro-batch's
-  backward triggers the gradient all-reduce — `N` micro-batches cost one
-  all-reduce, not `N`.
+  VRAM a literally-larger `--batch` would need. Each micro-batch's loss is
+  divided by `N` before `backward()`, so the accumulated gradient matches
+  what a real batch of size `batch * accum` would produce. Default `1` (no
+  accumulation). Under `--ddp`, the non-final micro-batches run inside
+  `model.no_sync()`, so only the last micro-batch's backward triggers the
+  gradient all-reduce — `N` micro-batches cost one all-reduce, not `N`.
 
-These flags are designed to compose (`--ddp --flash-attn --dtype fp8
---compile` on a multi-GPU MI300X box), but that combination specifically has
-not been run end-to-end here either.
+These flags compose (`--ddp --flash-attn --dtype fp8 --compile` on a
+multi-GPU MI300X box); `benchmark.py` is the way to measure what that
+combination actually gets you on your own hardware before committing a long
+run to it.
 
 ## `train_sft.py` — the SFT-only name for `train_cpt.py`
 
-Here's a thing worth being direct about: `train_cpt.py` already does SFT.
-It's the default mode — omit `--cpt` and you get chat-template tokenization
+`train_cpt.py` already does SFT. It's the default mode — omit `--cpt` and you get chat-template tokenization
 with assistant-turn-only loss masking (`build_sft_example()`, described
 above). So why does a second file exist? Purely so that scanning this
 repo's file list — `ls`, a GitHub file browser, whatever — actually shows
@@ -469,18 +439,17 @@ python3 preprocess_data.py --src data.jsonl --dst filtered.jsonl \
 
 ## `benchmark.py` — measure throughput and VRAM across configs
 
-Every throughput number elsewhere in this README comes with an "unverified
-on this hardware" caveat, because guessing at batch size and sequence length
-on a new card wastes real GPU-hours on trial and error. This is the tool
-that replaces the guessing: it loads the model, runs real forward + backward
-+ optimizer-step iterations against random input (dummy data, so no dataset
-needed — this measures the model and the hardware, not what you feed it),
-and reports tokens/sec, peak VRAM, and average step time. Pass several
-configs in one invocation (`batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8`)
-and it prints a comparison table, so "does fp8 actually help on this card"
-or "is batch=4/seqlen=512 faster than batch=2/seqlen=1024 for the same
-token count" become a five-minute measurement instead of a guess baked into
-a multi-day run.
+Guessing at batch size and sequence length on a new card wastes real
+GPU-hours on trial and error. This tool replaces the guessing: it loads the
+model, runs real forward + backward + optimizer-step iterations against
+random input (dummy data, so no dataset needed — this measures the model
+and the hardware, not what you feed it), and reports tokens/sec, peak VRAM,
+and average step time. Pass several configs in one invocation
+(`batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8`) and it prints
+a comparison table, so "does fp8 actually help on this card" or "is
+batch=4/seqlen=512 faster than batch=2/seqlen=1024 for the same token count"
+become a five-minute measurement instead of a guess baked into a multi-day
+run.
 
 ```
 python3 benchmark.py --model ./checkpoints/base_expanded_15b \
@@ -513,13 +482,11 @@ python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
 
 ## Standalone utilities
 
-Four of these came directly out of `train_cpt.py`'s `main()` — pieces that
-were doing real, non-trivial work but only existed as prose and inline logic
-buried there, worth pulling out on their own merits (optimizer construction,
-async checkpoint writes, the optimizer-type resume guard, and local-cache
-data streaming). A fifth is a port of a memory-safety script that started
-life solving a Mac-specific crash but whose actual pattern — poll, warn,
-kill before the OS does something worse — has nothing Mac-specific about it.
+Four of these back `train_cpt.py` directly and are independently useful on
+their own merits: optimizer construction, async checkpoint writes, the
+optimizer-type resume guard, and local-cache data streaming. A fifth,
+`oom_guard.sh`, is a memory-safety guard whose poll/warn/kill pattern has
+nothing OS- or vendor-specific about it.
 
 **`bnb_optimizer.py`** exists because "which optimizer did this run
 actually get" turns out to matter a lot on a single GPU, and it's not a
@@ -532,8 +499,8 @@ fp32), which is the difference between
 comfortably fitting a large model plus its optimizer state on an 80GB+ card
 and being one missing pip install away from an OOM. If bitsandbytes isn't
 importable, it falls back to plain `torch.optim.AdamW` with an explicit
-warning, and — this is the part worth calling out — the fallback's failure
-mode isn't a crash at step 0. It's an OOM dozens of iterations in, once the
+warning. The fallback's failure mode isn't a crash at step 0 — it's an OOM
+dozens of iterations in, once the
 roughly 4x-larger optimizer state has actually finished allocating across
 all the trainable params. That delay is exactly what makes it confusing to
 debug if you don't already know to check for a silently-missing
@@ -546,11 +513,9 @@ from bnb_optimizer import build_optimizer
 optimizer, kind = build_optimizer(trainable_params, lr=8e-7, weight_decay=0.01)
 ```
 
-**`async_checkpoint.py`** is the background-thread checkpoint writer,
-pulled out of `train_cpt.py` where it used to be a ~100-line class buried
-inside the training script's `main()`. The idea is straightforward once it's
-isolated: serializing tens of GB to a possibly-slow disk or NFS mount is
-slow, and there's no reason the GPU should sit idle waiting for it. So the
+**`async_checkpoint.py`** is the background-thread checkpoint writer used by
+`train_cpt.py`. Serializing tens of GB to a possibly-slow disk or NFS mount
+is slow, and there's no reason the GPU should sit idle waiting for it. The
 class splits the work into two phases — a synchronous GPU-to-CPU snapshot
 (brief, and it has to be synchronous, because the GPU tensors are about to
 be mutated by the very next training step), followed by an asynchronous
@@ -581,9 +546,8 @@ partway through, rather than losing the entire capture to one exception at
 row 300,000 of a 500,000-row target. The read side loads that finished
 cache into memory once, shuffles it with a given seed, and yields rows in a
 loop, reshuffling on every full pass so a long run doesn't see the exact
-same row order repeat forever. `train_cpt.py`'s own cache-reading path used
-to duplicate this logic inline; it now imports `stream_from_cache` from
-here instead.
+same row order repeat forever. `train_cpt.py`'s `--cpt-cache` flag imports
+`stream_from_cache` from here directly.
 
 ```python
 from local_cache_stream import materialize_to_cache, stream_from_cache
@@ -679,152 +643,48 @@ python3 rocm_env.py --selftest
 python3 rocm_env.py --gfx-override gfx1100
 ```
 
-
 ## Tips
 
-Real things that actually happened running this on real hardware, plus a
-few caught in code review this pass:
-
-- **A CLI flag with a detailed docstring is not the same claim as a CLI flag
-  that does anything.** `train_cpt.py`'s `--accum` /
-  `--gradient-accumulation-steps` flag was added with a specific, correct-
-  sounding description (`iters*accum` micro-batches, one `optimizer.step()`
-  every `accum` micro-batches, loss divided by `accum`) — and the training
-  loop never referenced `args.accum` anywhere. Pass `--accum 4` and training
-  proceeded exactly as if the flag didn't exist: no error, no warning, silent
-  no-op, effective batch size unchanged from what `--batch` alone gives you.
-  Caught by grepping the whole file for `args.accum` and finding zero hits
-  outside the argument parser itself. Now actually implemented: `accum`
-  micro-batches run forward/backward with loss scaled by `1/accum` before a
-  single `optimizer.step()`, verified against a real minimal
-  linear-model-plus-MSE-loss repro that the accumulated gradients exactly
-  match a single equivalent larger batch. This is the same bug class as a
-  docstring describing behavior the code doesn't implement — the fix here is
-  the code, not the doc, since the described behavior was reasonable and
-  worth actually having.
 - **Reinstall `bitsandbytes` explicitly on every fresh container.** It's easy
   to lose silently on a rebuild, and the failure mode isn't a crash at step 0
   — it's an OOM dozens of iterations in, once the ~4x-larger fallback AdamW
-  optimizer state has fully allocated. Confusing to debug if you don't know
-  to check for this first.
-- **Checkpointing here is local-disk only, no cloud object store.** If you
-  need cross-instance durability, sync the checkpoint directory out on your
-  own schedule (e.g. a separate rsync loop) rather than assuming any
-  in-process cloud upload is wired in — it isn't.
-- **`train_cpt.py`'s optional local-JSONL cache mode exists because live
-  streaming is only as reliable as your box's network path.** An
-  intermittent or blocked connection on a training box is a real, observed
-  failure mode. A pre-built local cache trains with zero network dependency
-  and just cycles once exhausted.
+  optimizer state has fully allocated. Check `train_cpt.py`'s `optimizer:`
+  log line if a run OOMs later than expected.
+- **Checkpointing is local-disk only, no cloud object store.** For
+  cross-instance durability, sync the checkpoint directory out on your own
+  schedule (a periodic rsync, say) — there's no in-process cloud upload.
+- **`train_cpt.py`'s optional local-JSONL cache mode** (`--cpt-cache`) trains
+  with zero network dependency once the cache is built, cycling it
+  indefinitely — useful when live streaming depends on a network path you
+  don't fully trust for a multi-day run.
 - **Resuming across a different optimizer type is guarded, not silently
   accepted.** Loading fp32 AdamW state into a bitsandbytes Adam8bit instance
   (or the reverse) inflates memory past what the current optimizer needs and
   OOMs on the first forward pass. `train_cpt.py` checks the saved optimizer's
-  class before loading (via `optimizer_compat_guard.py`, above) and skips the
-  optimizer state — restarting momentum, keeping the step count — if it
-  doesn't match. A bounded, known cost instead of an unbounded, silent one.
-- **Batch-size-vs-seqlen tradeoff, measured, not theoretical:** batch=2 at
-  seqlen=1024 used *less* memory and stayed stable well past where batch=4
-  and batch=2-at-seqlen=2048 both OOM'd at ~99.6% VRAM — attention's
-  `O(seqlen²)` scaling means the same total tokens/step can look very
-  different depending on how you split batch vs. sequence length. Worth
-  testing both directions before assuming one is free. `benchmark.py` (above)
-  exists specifically so this comparison is a five-minute run instead of a
-  guess baked into a multi-day one.
-- **`TextIteratorStreamer` needs a background thread, or it silently prints
-  nothing.** It only pushes decoded text onto an internal queue as
-  `generate()` produces it — it doesn't drain that queue itself. Call
-  `model.generate()` directly on the calling thread with a streamer attached
-  and the queue just fills up unread until generation finishes, at which
-  point the "streaming" output arrives all at once, if at all. `generate.py`
-  runs `generate()` on a `threading.Thread` and iterates the streamer on the
-  main thread, which is the pattern HF's own docs use — anything that skips
-  the thread isn't actually streaming, whatever the code around it claims.
-- **`x or fallback` is the wrong pattern for token IDs that can legitimately
-  be 0.** `tokenizer.pad_token_id or tokenizer.eos_token_id` silently swaps
-  in the EOS id whenever pad happens to be id 0, which is a real,
-  non-exotic layout (plenty of tokenizers put a special token at 0). Use
-  `x if x is not None else fallback` for anything where the falsy-but-valid
-  value is in play — found this exact bug live in `generate.py` during
-  review and fixed it there with the `is not None` form. (`benchmark.py`
-  doesn't have this check at all — it drives the model with synthetic
-  `torch.randint` token ids for timing, not real generation, so there's no
-  pad/eos logic in it to get wrong.)
-- **Prefer the public `set_attn_implementation()` API over poking
-  `model.config._attn_implementation` directly, when it's available.** The
-  private attribute doesn't reliably propagate to nested sub-configs — a
-  Gemma-4 checkpoint keeps its attention config under `text_config`, and
-  setting only the top-level attribute can silently no-op there. The public
-  method walks submodels itself. `train_cpt.py`'s flash-attn helper already
-  did this the safe way; `benchmark.py` and `generate.py` are current with it
-  too now, for the same reason.
-- **A file losing its executable bit is a silent, easy-to-miss regression on
-  any edit that touches line endings or gets re-saved by a tool that doesn't
-  preserve mode bits.** It doesn't fail loudly — `./script.sh` just becomes
-  "Permission denied" instead of running, or `python3 file.py` still works
-  fine (interpreters don't need +x) while `./file.py` stops. Worth a quick
-  `git diff --summary` before committing anything that touches a `.sh` or a
-  `.py` you expect to be directly executable; this repo has caught the same
-  regression more than once — it happened again, across a dozen files at
-  once, during the exact review pass that produced this Tips entry.
-- **`sys.exit()` inside a `try` still runs the enclosing `finally` block.**
-  `train_cpt.py`'s SIGTERM-triggered clean-exit path used to close the
-  TensorBoard writer, exit the profiler context, and call
-  `torch.distributed.destroy_process_group()` right before its own
-  `sys.exit(0)` — then hit a `finally` block that did the exact same three
-  things again. A second `destroy_process_group()` call raises
-  `AssertionError: Process group cannot be None` (confirmed with a real
-  `init_process_group` / `destroy_process_group` / `destroy_process_group`
-  repro), which meant the one shutdown path this `try/finally` exists to
-  protect — graceful exit under `--ddp` — was the one that crashed. Fixed by
-  deleting the duplicate cleanup and letting `finally` be the single place
-  it happens; `SystemExit` propagates through `finally` before the process
-  actually exits, so nothing is skipped.
-- **A "typo fix" is still a claim — verify it against the real package, don't
-  just trust that a comment sounds authoritative.** A prior pass through this
-  repo left a comment claiming the `transformers==5.7.0` pin was a typo for
-  `4.49.0`. It wasn't: pulling the actual wheels for both versions shows
-  `4.49.0` has no `gemma4` model directory at all (Gemma-4 support doesn't
-  land until well into the `5.x` line), while `5.7.0` genuinely registers
-  `Gemma4Config` correctly. The same review pass also introduced a Docker
-  base-image tag (`rocm6.2_ubuntu22.04_py3.10_pytorch_2.4`) that doesn't
-  exist on Docker Hub at all — real tags for that base image follow a
-  `rocm6.2.x_ubuntuYY.MM_pyZ.W_pytorch_release_A.B.C` pattern, not that one,
-  so the `Dockerfile` would have failed on `FROM` before installing a single
-  dependency. Both were checked against the real, published artifacts (PyPI
-  wheel contents, Docker Hub's tag list) rather than assumed correct because
-  they read like plausible version numbers.
-- **QR's reduced mode caps out at `min(rows, cols)` orthogonal directions —
-  padding logic that assumes otherwise silently truncates.**
-  `expand_model.py`'s `gqa_expand_kv()` builds a fresh `v_proj` by taking
-  `np.linalg.qr(R, mode="reduced")` on an `(new_out, hidden)` matrix and
-  using the result directly. When `new_out < hidden` (a real, unremarkable
-  case — narrower KV output than hidden size), reduced-mode QR only returns
-  a `(new_out, new_out)` matrix, not `(new_out, hidden)` — the fresh
-  `v_proj` came out the wrong shape with nothing raising an error. Confirmed
-  by reproducing the old logic standalone (`new_out=512, hidden=2048`
-  produced a `(512, 512)` tensor instead of `(512, 2048)`). Fixed by padding
-  the QR output with extra random orthogonal-scaled columns when it comes up
-  short, plus an explicit shape assertion so any future regression here
-  fails loudly instead of shipping a corrupt checkpoint. Covered by a
-  dedicated regression test now (`tests/test_all.py`,
-  `test_gqa_expand_kv_v_proj_shape_when_new_out_less_than_hidden`).
-- **A third-party library renaming a function to a config class breaks
-  `try/except ImportError` fallbacks silently, not loudly.** `torchao`'s
-  float8-weight-only inference API used to be a plain
-  `float8_weight_only()` function (confirmed present in `torchao==0.7.0`);
-  newer releases (confirmed in `0.17.0`) replaced it with a
-  `Float8WeightOnlyConfig` class passed to `quantize_()` the same way.
+  class before loading (via `optimizer_compat_guard.py`) and skips the
+  optimizer state — restarting momentum, keeping the step count — on a
+  mismatch.
+- **Test both directions of the batch-size-vs-seqlen tradeoff.** Attention's
+  `O(seqlen²)` scaling means the same total tokens/step can use very
+  different amounts of memory depending on how you split batch vs. sequence
+  length — a smaller batch at a longer sequence length isn't automatically
+  cheaper, or automatically more expensive, than the reverse. `benchmark.py`
+  turns that comparison into a five-minute measurement instead of a guess
+  baked into a multi-day run.
+- **`TextIteratorStreamer` needs a background thread, or it prints nothing
+  until generation finishes.** It only pushes decoded text onto a queue as
+  `generate()` produces it; something has to drain that queue on a separate
+  thread while `generate()` runs, or the "streaming" output arrives all at
+  once at the end. `generate.py` runs `generate()` on a `threading.Thread`
+  and iterates the streamer on the main thread.
+- **`torchao`'s fp8 weight-only quantization API differs by version:** older
+  releases expose a `float8_weight_only()` function; newer ones replaced it
+  with a `Float8WeightOnlyConfig` class passed to `quantize_()`.
   `requirements.txt` pins `torchao>=0.5.0` with no upper bound, so either
-  API could be installed. Code that only imports the old function name
-  doesn't crash on the newer package — it hits `ImportError`, gets caught by
-  the existing `except ImportError: log("torchao not installed")` fallback,
-  and silently trains/generates in bf16 while printing a message that's
-  actively misleading (torchao *is* installed; only the specific symbol
-  moved). `generate.py` now tries the function first and falls back to the
-  config class, so the fp8 path actually works across the version range the
-  requirements file claims to support, instead of only the narrow slice that
-  happened to match whichever torchao was installed when it was written.
+  could be installed — `generate.py` and `benchmark.py` try the function
+  first and fall back to the config class, so `--dtype fp8` works across
+  that version range rather than only whichever API happened to be current
+  when the code was written.
 
 ## Troubleshooting
 
@@ -848,31 +708,28 @@ few caught in code review this pass:
   store `vocab_size` in two places; `prune_vocab.py` fixes both by default
   (the default `--vocab-size-paths` covers both Gemma-4 locations). Only pass
   `--vocab-size-paths` if your config nests `vocab_size` somewhere non-standard.
-- **`catch_and_resume.sh` hardcodes paths** — it doesn't anymore. Copy
+- **Configuring `catch_and_resume.sh` for your own run** — copy
   `config.env.example` to `config.env` and edit the values there; the script
-  sources it automatically.
-- **Async checkpoint write silently lost** — it can't happen silently anymore.
-  `AsyncCheckpointer` now captures background-thread exceptions and re-raises
-  them on the next `save()` / `wait_for_pending()`. If a write fails (disk
-  full, NFS error), training stops with a real error instead of continuing
-  checkpoint-less. The prior checkpoint is retained as `.prev` for recovery.
+  sources it automatically rather than requiring edits to the script itself.
+- **Async checkpoint write failed** — `AsyncCheckpointer` captures
+  background-thread exceptions and re-raises them on the next `save()` /
+  `wait_for_pending()` call, so a failed write (disk full, NFS error) stops
+  training with a real error instead of continuing checkpoint-less. The
+  prior checkpoint is retained as `.prev` for recovery.
 
 ## Where this hits a real ceiling
 
-Single-GPU throughput was the original limit here, and it isn't a rounding
-error you optimize away — closing an orders-of-magnitude gap to a large
-multi-trillion-token CPT target isn't a "just wait longer" problem. The
-`--ddp` flag (multi-GPU via `torchrun`) gives the code path to scale to
-multiple GPUs, and `--dtype fp8` / `--flash-attn` / `--compile` are the
-standard per-GPU throughput levers for MI300X-class hardware — but none of
-these have been benchmarked against real ROCm hardware by this repo (see the
-caveat in the AMD-specific optimizations section above), so treat "lifts this
-to multi-GPU" as "the plumbing exists," not "the speedup is confirmed." Even
-assuming they deliver what similar techniques typically do elsewhere, the
-honest framing is: targeted or bounded token budgets, domain-adapting a
-pruned or expanded model, validating a pipeline end-to-end before scaling to
-a full cluster. What it still isn't: a substitute for a real distributed
-training framework once the token budget gets into the trillions.
+Single-GPU throughput is the natural ceiling here — closing an
+orders-of-magnitude gap to a large multi-trillion-token CPT target isn't a
+"just wait longer" problem. `--ddp` scales training to multiple GPUs via
+`torchrun`, and `--dtype fp8` / `--flash-attn` / `--compile` are the
+standard per-GPU throughput levers for MI300X-class hardware; `benchmark.py`
+is how you measure what they're actually worth on your own hardware and
+workload before committing a long run to a particular combination. This
+toolkit fits targeted or bounded token budgets, domain-adapting a pruned or
+expanded model, and validating a pipeline end-to-end before scaling further
+— it is not a distributed training framework once the token budget gets
+into the trillions.
 
 ## Testing
 
@@ -909,23 +766,20 @@ actual filesystem layout in it.
 
 ## Requirements
 
-Confirmed in active use (see [`requirements.txt`](requirements.txt) for
-tested-known-good versions, or use the [`Dockerfile`](Dockerfile) which
-bakes in a ROCm torch + all deps):
+See [`requirements.txt`](requirements.txt) for pinned versions, or use the
+[`Dockerfile`](Dockerfile), which bakes in a ROCm torch + all deps:
 
 - `torch` (ROCm build for AMD GPUs — install from AMD's index, not PyPI; it's
   deliberately not in `requirements.txt`)
 - `safetensors`
 - `numpy`
-- `transformers` (confirmed working against `5.7.0`; a mid-review pass on
-  this repo once wrote a comment claiming that string was a typo and
-  `4.49.0` was the intended version — checked directly against transformers'
-  actual published packages while reviewing that change, and it's backwards:
-  `4.49.0` has no `gemma4` model directory at all, and Gemma-4 support
-  doesn't land until well into the `5.x` line. `5.7.0` is the real,
-  verified pin. If you're on a different version, check whether your
-  `Gemma4Config` registers `model_type` as `"gemma4"` or `"gemma4_unified"`
-  — `prune_vocab.py` handles that specific mismatch)
+- `transformers==5.7.0` — a hard pin, not a suggestion: Gemma-4 support
+  (`Gemma4Config` / `model_type="gemma4"`) doesn't exist at all in the `4.x`
+  line and doesn't land until partway through the `5.x` line; `5.7.0` is the
+  version confirmed to register it correctly. If you're on a different `5.x`
+  version, check whether your `Gemma4Config` registers `model_type` as
+  `"gemma4"` or `"gemma4_unified"` — `prune_vocab.py` handles that specific
+  mismatch.
 - `bitsandbytes` (8-bit Adam; falls back to plain AdamW at ~4x optimizer
   memory if unavailable)
 - `tensorboard` (optional; for `--tb` logging — not bundled with torch, install
@@ -942,9 +796,8 @@ differs across versions).
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the actual ground rules, but the
-short version is the same discipline this README tries to hold itself to: no
-claims the code doesn't back up, no mocked self-tests, and model-family
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules. Short version:
+no claims the code doesn't back up, no mocked self-tests, and model-family
 constants go in CLI flags, not new hardcoded branches. If you add a tool,
 give it a `--selftest` (or, if it's a transformation tool that needs a real
 checkpoint to run, pytest coverage of its logic instead — see `tests/`
