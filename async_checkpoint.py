@@ -4,7 +4,7 @@
 Extracted from train_cpt.py's AsyncCheckpointer class (and its module-level
 _move_to_cpu helper) into its own file so the pattern is importable/reusable
 without the whole training script, and so its two-phase design is documented
-in one place instead of buried inside a ~27KB training script's main().
+in one place instead of buried inside the training script's main().
 
 The pattern (same as train_cpt.py's synchronous atomic_save_checkpoint, but
 split into a sync phase and an async phase):

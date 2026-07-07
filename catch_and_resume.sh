@@ -60,6 +60,7 @@ else
     CHECKPOINT_EVERY=500
     BATCH=4
     LR=5e-7
+    WARMUP_STEPS=50
     MAX_SEQ_LEN=2048
     STOP_FILE=.stop_autoresume
     LOG_PREFIX=./logs/cpt_1_autoresume
@@ -157,7 +158,7 @@ while true; do
         --iters "$TOTAL_ITERS" \
         --batch "$BATCH" \
         --lr "$LR" \
-        --warmup-steps 50 \
+        --warmup-steps "${WARMUP_STEPS:-50}" \
         --max-seq-len "$MAX_SEQ_LEN" \
         --checkpoint-every "$CHECKPOINT_EVERY" \
         --async-checkpoint \

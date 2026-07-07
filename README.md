@@ -1,15 +1,23 @@
 # gemma-mi300x-prune-cpt
 
-Thirteen real, independently-runnable tools (eleven Python + two shell) for
+Sixteen independently-runnable tools (fourteen Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
-multi-node cluster, no distributed training framework. They came out of
-actually doing this once, for real: shrinking a tokenizer, growing a model,
-and continue-pretraining it, all on one MI300X, and then hitting the
+multi-node cluster, no distributed training framework. Most of these came out
+of actually doing this once, for real: shrinking a tokenizer, growing a
+model, and continue-pretraining it, all on one MI300X, and then hitting the
 specific ways a single GPU fails you (OOM, crashes, a data source that goes
 unreachable mid-run) and fixing each one for real instead of writing around
-it. Every script here is real, run code, not a from-scratch rewrite for this
-repo — core training logic unchanged; refactored into standalone modules
-and parameterized into CLI flags.
+it. The core pipeline (`prune_vocab.py` through `train_cpt.py`/`train_sft.py`,
+`catch_and_resume.sh`, `rocm_env.py`, and the standalone utilities below) is
+run code pulled out of that project, not a from-scratch rewrite for this
+repo — core training logic unchanged, refactored into standalone modules and
+parameterized into CLI flags. `preprocess_data.py`, `benchmark.py`, and
+`generate.py` are newer additions, written to round out the pipeline
+end-to-end (clean data in, compare configs, actually talk to the model you
+just trained) — real, self-tested, and built on the same helpers
+(`rocm_env.py`, `prune_vocab.classify()`) the rest of the repo already relies
+on, but they haven't individually logged the same multi-week real-training
+mileage the core pipeline has. Judge them on the code, not the provenance.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
 `train_sft.py`) — no LoRA, no adapters. That's a deliberate choice, not an
@@ -53,13 +61,16 @@ different single-GPU problem on its own. The canonical pipeline order, if
 you use them together, is:
 
 ```
-prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py / train_sft.py
+[preprocess_data.py] → prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py / train_sft.py → [generate.py]
 ```
 
-Skip whichever steps you don't need — pruning, expansion, and MTP are all
-independently optional, and training directly against an unmodified base
-checkpoint is a completely normal way to use `train_cpt.py` (or
-`train_sft.py`, its SFT-only alias — see below) on its own.
+Skip whichever steps you don't need — data preprocessing, pruning, expansion,
+and MTP are all independently optional, and training directly against an
+unmodified base checkpoint with raw JSONL is a completely normal way to use
+`train_cpt.py` (or `train_sft.py`, its SFT-only alias — see below) on its
+own. `benchmark.py` sits outside this chain entirely — run it against any
+checkpoint, at any point, to measure a config rather than train or generate
+from it.
 
 ## Table of Contents
 
@@ -72,9 +83,13 @@ checkpoint is a completely normal way to use `train_cpt.py` (or
   - [`train_cpt.py`](#train_cptpy--continued-pretraining-single-gpu)
   - [`train_sft.py`](#train_sftpy--the-sft-only-name-for-train_cptpy)
   - [`catch_and_resume.sh`](#catch_and_resumesh--keep-a-single-gpu-run-alive-across-crashes)
+  - [`preprocess_data.py`](#preprocess_datapy--dedup-filter-and-pack-training-data)
+  - [`benchmark.py`](#benchmarkpy--measure-throughput-and-vram-across-configs)
+  - [`generate.py`](#generatepy--streaming-inference-from-a-trained-checkpoint)
   - [Standalone utilities](#standalone-utilities)
   - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
-- [Tips / Troubleshooting](#tips--troubleshooting)
+- [Tips](#tips)
+- [Troubleshooting](#troubleshooting)
 - [Where this hits a real ceiling](#where-this-hits-a-real-ceiling)
 - [Testing](#testing)
 - [Requirements](#requirements)
@@ -355,6 +370,76 @@ between attempts instead of having to reach for `kill -9`.
 ./catch_and_resume.sh
 ```
 
+## `preprocess_data.py` — dedup, filter, and pack training data
+
+The rest of this pipeline assumes your JSONL is already reasonably clean, and
+that assumption doesn't hold for most real data sources. This is the tool
+that gets it there before it ever reaches `train_cpt.py`: exact dedup (drops
+rows whose text field is identical to one already seen — no fuzzy/minhash
+dedup, on purpose. Approximate dedup quality varies wildly by dataset, and a
+false-positive drop silently throws away real training data with no way to
+notice; if you need fuzzy dedup, run a dedicated tool like `datasketch`
+upstream of this one), length filtering (`--min-chars`/`--max-chars` for a
+fast tokenizer-free pass, or `--min-tokens`/`--max-tokens` if you'd rather
+pay for exactness with a real `--tokenizer`), script filtering
+(`--drop-scripts cjk,arabic,...`, reusing `prune_vocab.py`'s `classify()` —
+the same character heuristic, not real language ID, so it catches distinctive
+non-Latin script characters and nothing more subtle than that), and sequence
+packing (combines short rows into sequences up to `--pack-seqlen` chars,
+cutting the padding waste that `train_cpt.py`'s own `--pack` flag then
+compresses further at collation time). `--dry-run` prints the stats — rows
+in, dropped by reason, sequences packed — without writing anything, which is
+worth doing once on new data before trusting the real run.
+
+```
+python3 preprocess_data.py --src data.jsonl --dst filtered.jsonl \
+    --min-chars 50 --max-chars 10000 --drop-scripts cjk,arabic --pack-seqlen 2048
+```
+
+## `benchmark.py` — measure throughput and VRAM across configs
+
+Every throughput number elsewhere in this README comes with an "unverified
+on this hardware" caveat, because guessing at batch size and sequence length
+on a new card wastes real GPU-hours on trial and error. This is the tool
+that replaces the guessing: it loads the model, runs real forward + backward
++ optimizer-step iterations against random input (dummy data, so no dataset
+needed — this measures the model and the hardware, not what you feed it),
+and reports tokens/sec, peak VRAM, and average step time. Pass several
+configs in one invocation (`batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8`)
+and it prints a comparison table, so "does fp8 actually help on this card"
+or "is batch=4/seqlen=512 faster than batch=2/seqlen=1024 for the same
+token count" become a five-minute measurement instead of a guess baked into
+a multi-day run.
+
+```
+python3 benchmark.py --model ./checkpoints/base_expanded_15b \
+    --configs "batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8"
+```
+
+## `generate.py` — streaming inference from a trained checkpoint
+
+Training produces a checkpoint; this is what actually talks to it. It loads
+a checkpoint the same way `train_cpt.py` does, then generates with a real
+`TextIteratorStreamer` so tokens print as they're produced instead of all at
+once at the end of a potentially long generation — worth calling out because
+`TextIteratorStreamer` doesn't stream on its own; it just pushes decoded text
+onto a queue as `generate()` produces it, and something still has to run
+`generate()` on a background thread while the main thread drains that queue,
+or nothing prints until generation is already finished and the streamer's
+already seen the whole response go by unread. This runs the same
+AMD-specific flags as `train_cpt.py` (`--flash-attn`, `--dtype fp8`,
+`--compile`, `--gfx-override`, `--hip-alloc-conf`), so the "runs on any
+ROCm-capable AMD GPU" claim carries over to inference, not just training.
+KV-cache is on by default here — the opposite of training's
+`use_cache=False` — because generation without a cache is the one case where
+that would actually cost you real wall-clock time, recomputing every prior
+token's attention on every new token. Interactive mode (type prompts,
+Ctrl+D to exit) or batch mode (`--input prompts.txt`, one prompt per line).
+
+```
+python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
+```
+
 ## Standalone utilities
 
 Four of these came directly out of `train_cpt.py`'s `main()` — pieces that
@@ -524,7 +609,10 @@ python3 rocm_env.py --gfx-override gfx1100
 ```
 
 
-## Tips, all from things that actually happened running this on real hardware
+## Tips
+
+Real things that actually happened running this on real hardware, plus a
+few caught in code review this pass:
 
 - **Reinstall `bitsandbytes` explicitly on every fresh container.** It's easy
   to lose silently on a rebuild, and the failure mode isn't a crash at step 0
@@ -552,7 +640,42 @@ python3 rocm_env.py --gfx-override gfx1100
   and batch=2-at-seqlen=2048 both OOM'd at ~99.6% VRAM — attention's
   `O(seqlen²)` scaling means the same total tokens/step can look very
   different depending on how you split batch vs. sequence length. Worth
-  testing both directions before assuming one is free.
+  testing both directions before assuming one is free. `benchmark.py` (above)
+  exists specifically so this comparison is a five-minute run instead of a
+  guess baked into a multi-day one.
+- **`TextIteratorStreamer` needs a background thread, or it silently prints
+  nothing.** It only pushes decoded text onto an internal queue as
+  `generate()` produces it — it doesn't drain that queue itself. Call
+  `model.generate()` directly on the calling thread with a streamer attached
+  and the queue just fills up unread until generation finishes, at which
+  point the "streaming" output arrives all at once, if at all. `generate.py`
+  runs `generate()` on a `threading.Thread` and iterates the streamer on the
+  main thread, which is the pattern HF's own docs use — anything that skips
+  the thread isn't actually streaming, whatever the code around it claims.
+- **`x or fallback` is the wrong pattern for token IDs that can legitimately
+  be 0.** `tokenizer.pad_token_id or tokenizer.eos_token_id` silently swaps
+  in the EOS id whenever pad happens to be id 0, which is a real,
+  non-exotic layout (plenty of tokenizers put a special token at 0). Use
+  `x if x is not None else fallback` for anything where the falsy-but-valid
+  value is in play — found this exact bug live in `generate.py` during
+  review, sitting right next to the correct `is not None` version of the
+  same check in `benchmark.py`.
+- **Prefer the public `set_attn_implementation()` API over poking
+  `model.config._attn_implementation` directly, when it's available.** The
+  private attribute doesn't reliably propagate to nested sub-configs — a
+  Gemma-4 checkpoint keeps its attention config under `text_config`, and
+  setting only the top-level attribute can silently no-op there. The public
+  method walks submodels itself. `train_cpt.py`'s flash-attn helper already
+  did this the safe way; `benchmark.py` and `generate.py` are current with it
+  too now, for the same reason.
+- **A file losing its executable bit is a silent, easy-to-miss regression on
+  any edit that touches line endings or gets re-saved by a tool that doesn't
+  preserve mode bits.** It doesn't fail loudly — `./script.sh` just becomes
+  "Permission denied" instead of running, or `python3 file.py` still works
+  fine (interpreters don't need +x) while `./file.py` stops. Worth a quick
+  `git diff --summary` before committing anything that touches a `.sh` or a
+  `.py` you expect to be directly executable; this repo has caught the same
+  regression more than once.
 
 ## Troubleshooting
 
@@ -616,7 +739,8 @@ push/PR.
 # Run all self-tests + pytest locally (CPU-only):
 for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          local_cache_stream.py optimizer_compat_guard.py \
-         rocm_env.py mtp_head.py train_sft.py; do
+         rocm_env.py mtp_head.py train_sft.py \
+         preprocess_data.py benchmark.py generate.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v
