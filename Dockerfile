@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir \
         bitsandbytes \
         tensorboard \
         torchao \
-        && pip install --no-cache-dir --no-build-isolation flash-attn || \
-           echo "WARNING: flash-attn build failed — --flash-attn will fall back to standard attention"
+ && (pip install --no-cache-dir --no-build-isolation flash-attn || \
+     echo "WARNING: flash-attn build failed — --flash-attn will fall back to standard attention")
 
 WORKDIR /work

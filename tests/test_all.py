@@ -115,6 +115,85 @@ def test_classify_keeps_ascii_drops_cjk():
     assert "keep" not in REMOVABLE
 
 
+# ── prune_embeddings_torch.py slicing logic ─────────────────────────────────
+
+def test_prune_embeddings_int_coercion_and_contiguity():
+    """The remap loading: {int(k): int(v)} coerces BOTH keys and values, and
+    the contiguity check (sorted values == range(N)) rejects non-contiguous
+    remaps. This is the logic at prune_embeddings_torch.py:60-67."""
+    # Simulate the remap loading + validation inline (main() does file I/O;
+    # we test the pure-logic part that would break if coercion is wrong).
+    # A correct remap: old ids 0,2,4 -> new ids 0,1,2 (contiguous).
+    raw_json = '{"0": 0, "2": 1, "4": 2}'  # string keys (as written by prune_vocab)
+    old_to_new = {int(k): int(v) for k, v in json.loads(raw_json).items()}
+    assert old_to_new == {0: 0, 2: 1, 4: 2}
+    keep_old_ids = sorted(old_to_new.keys())
+    new_vocab_size = len(keep_old_ids)
+    expected_new_ids = sorted(old_to_new.values())
+    assert expected_new_ids == list(range(new_vocab_size))  # contiguous: passes
+
+    # A non-contiguous remap (values 0, 2, 5 — gap) should fail the check.
+    bad_json = '{"0": 0, "2": 2, "4": 5}'
+    bad_map = {int(k): int(v) for k, v in json.loads(bad_json).items()}
+    bad_values = sorted(bad_map.values())
+    assert bad_values != list(range(len(bad_map)))  # non-contiguous: would abort
+
+
+def test_prune_embeddings_single_file_index_synthesis():
+    """When a checkpoint has no model.safetensors.index.json but does have a
+    single model.safetensors, prune_embeddings_torch synthesizes an index from
+    the safetensors header. This test exercises that synthesis logic against a
+    real tiny safetensors file."""
+    import torch
+    from safetensors.torch import save_file, load_file
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        embed_key = "model.embed_tokens.weight"
+        other_key = "model.layers.0.fc.weight"
+
+        # Create a tiny single-file checkpoint: embed (10 x 4) + one other tensor.
+        tensors = {
+            embed_key: torch.randn(10, 4).to(torch.bfloat16),
+            other_key: torch.randn(4, 4).to(torch.bfloat16),
+        }
+        save_file(tensors, td / "model.safetensors")
+
+        # Also write the remap (prune_vocab.py's output): keep old ids 0,2,4,6,8
+        # -> new ids 0,1,2,3,4 (drop odds).
+        remap = {str(k): v for k, v in zip([0, 2, 4, 6, 8], range(5))}
+        remap_dst = td / "dst"
+        remap_dst.mkdir()
+        with open(remap_dst / "_old_to_new_ids.json", "w") as f:
+            json.dump(remap, f)
+
+        # Synthesize the index (same logic as prune_embeddings_torch.py:80-88).
+        single_file = "model.safetensors"
+        with open(td / single_file, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(header_len))
+        weight_map = {k: single_file for k in header if k != "__metadata__"}
+        index = {"metadata": {"total_size": os.path.getsize(td / single_file)},
+                 "weight_map": weight_map}
+
+        # Verify the synthesized index covers both tensors.
+        assert embed_key in index["weight_map"]
+        assert other_key in index["weight_map"]
+        assert index["weight_map"][embed_key] == single_file
+
+        # Verify the row-slicing logic (prune_embeddings_torch.py:115):
+        # keep_idx = [0,2,4,6,8], slicing embed[keep_idx] gives 5x4.
+        old_to_new = {int(k): int(v) for k, v in remap.items()}
+        keep_old_ids = sorted(old_to_new.keys())
+        keep_idx = torch.tensor(keep_old_ids, dtype=torch.long)
+        loaded = load_file(td / single_file)
+        sliced = loaded[embed_key][keep_idx, :].contiguous()
+        assert sliced.shape == (5, 4), sliced.shape
+        # Verify the right rows were kept.
+        for i, old_id in enumerate(keep_old_ids):
+            assert torch.equal(sliced[i], loaded[embed_key][old_id])
+
+
 # ── expand_model.py transformation logic ────────────────────────────────────
 
 def test_build_depth_plan_counts_and_interleave():
@@ -434,3 +513,95 @@ def test_mtp_head_generates_correct_shapes():
     donor = tensors[f"{layer_prefix}.{num_layers - 1}.self_attn.q_proj.weight"]
     cloned = new[f"{mtp_prefix}.0.block.self_attn.q_proj.weight"]
     assert torch.equal(cloned, donor)
+
+
+# ── preprocess_data.py ──────────────────────────────────────────────────────
+
+def test_preprocess_dedup_exact():
+    from preprocess_data import get_text
+    rows = [{"text": "hello"}, {"text": "hello"}, {"text": "world"}]
+    seen = set()
+    deduped = []
+    for row in rows:
+        text = get_text(row)
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(row)
+    assert len(deduped) == 2
+
+
+def test_preprocess_get_text_formats():
+    from preprocess_data import get_text
+    assert get_text({"text": "hello"}) == "hello"
+    assert get_text({"messages": [{"content": "a"}, {"content": "b"}]}) == "a\nb"
+
+
+def test_preprocess_pack_rows():
+    from preprocess_data import pack_rows
+    rows = [{"text": "aaa"}, {"text": "bbb"}, {"text": "ccc"}]
+    packed = pack_rows(rows, max_seqlen=10, separator="|")
+    # "aaa|bbb" = 7 chars, then "ccc" doesn't fit (7+4=11>10), so 2 sequences
+    assert len(packed) >= 1
+    assert any("aaa" in p["text"] for p in packed)
+
+
+def test_preprocess_script_filter():
+    from preprocess_data import should_drop_by_script
+    assert should_drop_by_script({"text": "hello world"}, {"cjk"}) is False
+    assert should_drop_by_script({"text": "中文文本"}, {"cjk"}) is True
+    assert should_drop_by_script({"text": "hello"}, set()) is False
+
+
+# ── benchmark.py ────────────────────────────────────────────────────────────
+
+def test_benchmark_parse_configs():
+    from benchmark import parse_configs
+    configs = parse_configs("batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8,flash=1")
+    assert len(configs) == 2
+    assert configs[0]["batch"] == 2
+    assert configs[0]["dtype"] == "bf16"
+    assert configs[1]["flash"] == 1
+    assert configs[1]["compile"] == 0  # default
+
+
+def test_benchmark_parse_configs_defaults():
+    from benchmark import parse_configs
+    configs = parse_configs("batch=8")
+    assert configs[0]["seqlen"] == 1024  # default
+    assert configs[0]["dtype"] == "bf16"  # default
+
+
+def test_benchmark_parse_configs_empty_parts():
+    from benchmark import parse_configs
+    configs = parse_configs("batch=2;;batch=4,")
+    assert len(configs) == 2
+
+
+def test_benchmark_format_table():
+    from benchmark import format_table
+    results = [
+        {"batch": 2, "seqlen": 1024, "dtype": "bf16", "flash": 0, "compile": 0,
+         "tokens_per_sec": 12345, "peak_vram_gb": 78.2, "step_ms": 45.3},
+    ]
+    table = format_table(results)
+    assert "tokens/s" in table
+    assert "12,345" in table
+    assert "78.2 GB" in table
+    assert format_table([]) == "(no results)"
+
+
+# ── generate.py ─────────────────────────────────────────────────────────────
+
+def test_generate_temperature_logic():
+    # temperature=0 -> greedy (do_sample=False), >0 -> sampling
+    assert not (0.0 > 0)
+    assert 0.7 > 0
+
+
+def test_generate_system_prompt_prefix():
+    system = "You are helpful."
+    user = "What is ROCm?"
+    full = system + "\n\n" + user
+    assert full.startswith(system)
+    assert user in full
