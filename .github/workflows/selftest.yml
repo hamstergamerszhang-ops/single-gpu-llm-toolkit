@@ -3,8 +3,9 @@ name: self-tests
 # Runs every module's --selftest + the pytest suite on push/PR.
 # All self-tests are CPU-only (no GPU needed) — they exercise the real logic
 # (LR schedule math, atomic checkpoint rename, optimizer compat, cache stream,
-# MTP weight generation, rocm_env family-matching) against tiny in-memory
-# fixtures, not against real hardware.
+# MTP weight generation, rocm_env family-matching, real peft LoRA wiring
+# against a tiny real transformers model) against tiny in-memory fixtures or
+# tiny real models, not against real hardware.
 
 on:
   push:
@@ -22,15 +23,18 @@ jobs:
           python-version: "3.12"
       - name: Install deps
         run: |
-          pip install numpy safetensors torch pytest
+          pip install numpy safetensors torch pytest transformers peft
       - name: Run module self-tests
         run: |
           # Only modules with a --selftest flag (transformation tools like
           # prune_vocab/expand_model need real checkpoints, so they have no
           # self-test — they're covered by the pytest suite's logic tests).
+          # lora_train.py and train_sft.py need transformers (+ peft for
+          # lora_train.py) installed above -- both build a tiny real model
+          # rather than mocking transformers/peft out.
           for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
                    local_cache_stream.py optimizer_compat_guard.py \
-                   rocm_env.py mtp_head.py; do
+                   rocm_env.py mtp_head.py lora_train.py train_sft.py; do
             echo "=== $f --selftest ==="
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done

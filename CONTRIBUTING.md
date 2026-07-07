@@ -31,10 +31,14 @@ real bugs you hit running these on actual hardware.
   ```
   for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
            local_cache_stream.py optimizer_compat_guard.py \
-           rocm_env.py mtp_head.py; do
+           rocm_env.py mtp_head.py lora_train.py train_sft.py; do
     python3 "$f" --selftest || { echo "FAILED: $f"; exit 1; }
   done
   ```
+  `lora_train.py`'s self-test needs `peft` installed (see `requirements.txt`);
+  `train_sft.py`'s delegates straight to `train_cpt.py`'s self-test after
+  checking its own argv-rewrite logic, so it needs whatever `train_cpt.py`
+  needs.
 - Run the pytest suite: `pytest tests/ -v`
 - If you change a docstring, verify the claim against the code it documents.
 

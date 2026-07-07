@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir \
         bitsandbytes \
         tensorboard \
         torchao \
+        "peft==0.19.1" \
         && pip install --no-cache-dir --no-build-isolation flash-attn || \
            echo "WARNING: flash-attn build failed — --flash-attn will fall back to standard attention"
 
