@@ -71,7 +71,7 @@ import os
 import re
 import subprocess
 
-GFX_RE = re.compile(r"gfx(\d{3,4})")
+GFX_RE = re.compile(r"gfx(\d{2,4}[a-z]?)")  # matches gfx90a, gfx942, gfx803, gfx1100
 
 
 def detect_gfx_arch():
@@ -145,6 +145,11 @@ def find_override_target(detected_arch, torch_arch_list):
     the list, returns None (no override needed — the caller checks this first,
     but this is defensive).
 
+    Handles all arch formats: 4-digit (gfx1100), 3-digit (gfx942, gfx803),
+    and letter-suffix (gfx90a — MI250). The numeric comparison uses the
+    digits AFTER the 2-digit major prefix; for letter-suffix archs like
+    gfx90a, the letter is treated as 0 for numeric comparison.
+
     Returns the override arch string (e.g. 'gfx1030') or None.
     """
     if not torch_arch_list or not detected_arch:
@@ -160,21 +165,34 @@ def find_override_target(detected_arch, torch_arch_list):
     if not detected_major:
         return None
 
-    # Filter torch's list to ROCm gfx archs (skip CUDA 'sm_XX' entries) sharing
-    # the same major prefix.
-    m = re.match(r"gfx(\d{2})(\d{2})", detected_arch)
-    if not m:
+    # Extract the minor part (everything after the 2-digit major prefix).
+    # For gfx1100 -> minor="00" -> 0; gfx1030 -> "30" -> 30; gfx942 -> "2" -> 2;
+    # gfx90a -> "a" -> treated as 0 for numeric comparison.
+    def extract_minor(arch):
+        m = re.match(r"gfx\d{2}(.+)", arch)
+        if not m:
+            return None
+        suffix = m.group(1)
+        # Try to parse as int; if it's a letter (gfx90a), treat as 0.
+        try:
+            return int(suffix)
+        except ValueError:
+            return 0
+
+    detected_num = extract_minor(detected_arch)
+    if detected_num is None:
         return None
-    detected_num = int(m.group(2))
 
     candidates = []
     for a in torch_arch_list:
-        am = re.match(r"gfx(\d{2})(\d{2})", a)
-        if not am:
+        if not GFX_RE.search(a):
             continue
-        if f"gfx{am.group(1)}" != detected_major:
+        if _gfx_major(a) != detected_major:
             continue
-        candidates.append((a, int(am.group(2))))
+        minor = extract_minor(a)
+        if minor is None:
+            continue
+        candidates.append((a, minor))
 
     if not candidates:
         return None
@@ -393,8 +411,20 @@ def _self_test():
     # Empty / None lists return None.
     assert find_override_target("gfx1100", None) is None
     assert find_override_target("gfx1100", []) is None
-    print("  OK (find_override_target picks closest same-family arch, "
-          "returns None when no family match or already supported)")
+
+    # Letter-suffix arch (gfx90a — MI250) and 3-digit archs (gfx942) are now
+    # handled: they match same-gfx90-family candidates in the list.
+    # gfx90c (not real, but tests letter-suffix override) -> closest gfx90 family.
+    target = find_override_target("gfx90c", torch_list)
+    assert target is not None, f"gfx90c should find a gfx90 family member, got {target}"
+    assert _gfx_major(target) == "gfx90", f"override should be gfx90 family, got {_gfx_major(target)}"
+    # gfx942 is already in the list -> returns None (already supported).
+    target = find_override_target("gfx942", torch_list)
+    assert target is None, f"gfx942 is in the list, expected None, got {target}"
+    # A 3-digit arch NOT in the list but with a family member -> override.
+    target = find_override_target("gfx903", ["gfx906", "gfx1100"])
+    assert target == "gfx906", f"gfx903 should override to gfx906, got {target}"
+    print("  OK (find_override_target handles 4-digit, 3-digit, and letter-suffix archs)")
 
     # setup_rocm_env with explicit override sets the env var directly.
     os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Width + depth model expansion for a Gemma-4-family checkpoint — pipeline
-step 3 of 4 (runs on the output of prune_embeddings_torch.py, before
-train_cpt.py). PyTorch-native, runs on any CUDA/ROCm box without needing an
+"""Width + depth model expansion for a Gemma-4-family checkpoint — runs on the
+output of prune_embeddings_torch.py, before optional mtp_head.py and
+train_cpt.py. PyTorch-native, runs on any CUDA/ROCm box without needing an
 Apple-Silicon-only ML framework.
 
 Grows a checkpoint's parameter count by widening the MLP intermediate
@@ -165,7 +165,18 @@ def build_depth_plan(orig_layers: int, depth_step: int, interleave_every: int):
 
 def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows: bool):
     """Returns a torch.bfloat16 tensor of `n_new` new orthogonal directions,
-    built via numpy QR (see module docstring for why numpy, not torch, here)."""
+    built via numpy QR (see module docstring for why numpy, not torch, here).
+
+    QR on an (m, n) matrix with m <= n can only produce at most m orthogonal
+    columns; requesting more than that silently truncated the pad before. We
+    guard against that explicitly.
+    """
+    if n_new > n_existing:
+        raise ValueError(
+            f"orthogonal_pad cannot produce {n_new} orthogonal directions from a "
+            f"{n_existing}-dimensional space (n_new must be <= n_existing). "
+            f"transpose_for_rows={transpose_for_rows}"
+        )
     if transpose_for_rows:
         R = np.random.randn(n_new, n_existing).astype(np.float32)
         Q, _ = np.linalg.qr(R.T, mode="reduced")
@@ -276,18 +287,28 @@ def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads:
     pad = orthogonal_pad(n_new, hidden, init_scale, transpose_for_rows=True)
     tensors[k_key] = torch.cat([old_k, pad], dim=0)
 
-    # v_proj is a genuinely fresh matrix (no existing V data to pad from), and it's
-    # "tall" (new_out > hidden in the common case) so it can have at most `hidden`
-    # mutually orthogonal rows anyway — np.linalg.qr's reduced mode on a tall matrix
-    # gives orthonormal COLUMNS directly, which is exactly what's achievable here.
+    # v_proj is a genuinely fresh matrix (no existing V data to pad from).
+    # We need shape (new_out, hidden) for Linear(hidden -> new_out).
+    # QR of (new_out, hidden) in reduced mode gives Q of shape
+    # (new_out, min(new_out, hidden)). When new_out >= hidden this is
+    # (new_out, hidden) — correct. When new_out < hidden, Q is (new_out, new_out)
+    # and we must pad with random columns to reach (new_out, hidden).
     # Uses numpy (not torch.nn.init.orthogonal_) because this ROCm PyTorch build's
     # CPU tensors lack LAPACK support — confirmed by a real crash ("Calling
     # torch.geqrf on a CPU tensor requires compiling PyTorch with LAPACK"). numpy's
     # QR (via its own LAPACK bindings) is what orthogonal_pad() above already relies on.
     R = np.random.randn(new_out, hidden).astype(np.float32)
     Q, _ = np.linalg.qr(R, mode="reduced")
-    v_fresh = torch.from_numpy(np.ascontiguousarray(Q * init_scale))
+    if Q.shape[1] < hidden:
+        # new_out < hidden: pad with random columns to reach (new_out, hidden).
+        pad = np.random.randn(new_out, hidden - Q.shape[1]).astype(np.float32) * init_scale
+        Q = np.concatenate([Q * init_scale, pad], axis=1)
+    else:
+        Q = Q * init_scale
+    v_fresh = torch.from_numpy(np.ascontiguousarray(Q))
     tensors[v_key] = v_fresh.to(old_k.dtype)
+    assert tensors[v_key].shape == (new_out, hidden), \
+        f"v_proj shape {tensors[v_key].shape} != expected ({new_out}, {hidden})"
 
 
 def clone_layer_tensors(tensors: dict, src_prefix: str, dst_prefix: str,
@@ -522,6 +543,14 @@ def main():
         # check skipped the fix, this config flag must NOT flip either, or the
         # written config would claim a GQA layout that the tensors don't actually have.
         cfg["text_config"]["attention_k_eq_v"] = False
+        # Write the new kv-head count so a downstream loader knows how many
+        # KV heads the (now-expanded) full-attention layers have. Without this,
+        # the config still says num_global_key_value_heads=1 (the MQA value)
+        # while the tensors have args.gqa_kv_heads heads -> shape mismatch on load.
+        if "num_global_key_value_heads" in tc:
+            cfg["text_config"]["num_global_key_value_heads"] = args.gqa_kv_heads
+        if "num_key_value_heads" in tc:
+            cfg["text_config"]["num_key_value_heads"] = args.gqa_kv_heads
         log(f"GQA fix applied: attention_k_eq_v -> False, "
             f"full-attention layers now use {args.gqa_kv_heads} real kv heads (was MQA=1, V=K)")
 

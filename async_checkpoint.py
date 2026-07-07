@@ -40,7 +40,7 @@ Usage as a library:
     ...
     ckpt.save(model, optimizer, step, save_dir, tokenizer=tokenizer)
     ...
-    ckpt.wait()   # call before process exit (SIGTERM handler, final checkpoint)
+    ckpt.wait_for_pending()   # call before process exit (SIGTERM handler, final checkpoint)
 
 Self-test (no GPU/model required -- uses a tiny torch.nn.Module + real
 threads + a tmp dir, exercises the full snapshot -> background-write ->
@@ -49,6 +49,7 @@ atomic-rename path end to end):
 """
 
 import argparse
+import atexit
 import os
 import shutil
 import threading
@@ -56,19 +57,25 @@ from pathlib import Path
 
 
 def _move_to_cpu(obj):
-    """Recursively moves tensors in a nested dict/list to CPU. Used to snapshot
-    optimizer.state_dict() (a dict of dicts of tensors, e.g. Adam's per-param
-    moment buffers) before handing it to a background thread -- the
+    """Recursively moves tensors in a nested dict/list/tuple to CPU. Used to
+    snapshot optimizer.state_dict() (a dict of dicts of tensors, e.g. Adam's
+    per-param moment buffers) before handing it to a background thread -- the
     GPU-resident originals keep getting mutated by the next training step the
     moment this snapshot is taken, so nothing downstream may still reference
-    the live GPU tensors."""
+    the live GPU tensors.
+
+    Tuples are preserved because some optimizer states store shape tuples or
+    small namedtuples. Objects with a .cpu() method (e.g. bitsandbytes custom
+    state containers) are moved via that method as a fallback."""
     import torch
     if torch.is_tensor(obj):
         return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
         return {k: _move_to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_move_to_cpu(v) for v in obj]
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_move_to_cpu(v) for v in obj)
+    if hasattr(obj, "cpu") and callable(obj.cpu):
+        return obj.cpu()
     return obj
 
 
@@ -88,6 +95,9 @@ class AsyncCheckpointer:
         # silently inside the thread — the training loop would keep running in
         # the belief that it has checkpoints it does not have.
         self._last_error = None
+        # If the process exits via an unhandled exception (or any non-SIGTERM
+        # path), wait for the final checkpoint to finish so it isn't truncated.
+        atexit.register(self.wait_for_pending)
 
     def is_write_in_flight(self) -> bool:
         """True if a background write is currently running. save() will
@@ -118,6 +128,11 @@ class AsyncCheckpointer:
                   "before starting a new snapshot (checkpoint interval may be too tight "
                   "relative to write speed on this disk)")
             self._thread.join()
+            # Re-check after join: the thread may have failed during join and
+            # set _last_error, which check_error() above (called before join)
+            # would have missed. Without this, the error is silently overwritten
+            # when the next write starts.
+            self.check_error()
 
         # Phase 1 (synchronous, blocks briefly): snapshot to CPU.
         # Drop tied-weight duplicates BEFORE copying (e.g. tie_word_embeddings=True
@@ -302,12 +317,15 @@ def _self_test():
 
 
 
-    print("[selftest] _move_to_cpu recurses through nested dict/list of tensors")
-    nested = {"a": torch.randn(2, 2), "b": [torch.randn(1), {"c": torch.randn(3)}]}
+    print("[selftest] _move_to_cpu recurses through nested dict/list/tuple of tensors")
+    nested = {"a": torch.randn(2, 2), "b": [torch.randn(1), {"c": torch.randn(3)}],
+              "d": (torch.randn(2), torch.randn(1))}
     moved = _move_to_cpu(nested)
     assert moved["a"].device.type == "cpu"
     assert moved["b"][0].device.type == "cpu"
     assert moved["b"][1]["c"].device.type == "cpu"
+    assert moved["d"][0].device.type == "cpu"
+    assert isinstance(moved["d"], tuple), "tuple type should be preserved"
     print("  OK")
 
     print("\n[selftest] All checks passed (no GPU required -- run a real checkpoint "

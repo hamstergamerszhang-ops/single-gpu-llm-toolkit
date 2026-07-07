@@ -50,7 +50,7 @@
 #                                   > oom_guard.log 2>&1 &
 # Stop:  kill the guard's own PID (printed at start), or pkill -f oom_guard.sh
 
-set -u
+set -uo pipefail
 TRAIN_PID="${1:?usage: oom_guard.sh <training_pid> [warn_free_mb] [emergency_free_mb] [poll_sec] [vram_warn_mb] [vram_emergency_mb]}"
 WARN_FREE_MB="${2:-4000}"
 EMERGENCY_FREE_MB="${3:-1500}"
@@ -100,7 +100,7 @@ read_vram_free_mb() {
 
     # Try JSON first.
     local json_bytes
-    json_bytes=$(rocm-smi --showmeminfo vram --json 2>/dev/null \
+    json_bytes=$(timeout 10 rocm-smi --showmeminfo vram --json 2>/dev/null \
         | grep -oE '"VRAM Free Memory \(B\)": *[0-9]+' | grep -oE '[0-9]+$' | head -1)
     if [ -n "$json_bytes" ]; then
         echo $((json_bytes / 1024 / 1024))
@@ -113,7 +113,7 @@ read_vram_free_mb() {
     # head -1 / first-digit would grab the "0" from "GPU[0]" -> 0 MB -> false
     # emergency SIGTERM.
     local text_bytes
-    text_bytes=$(rocm-smi --showmeminfo vram 2>/dev/null \
+    text_bytes=$(timeout 10 rocm-smi --showmeminfo vram 2>/dev/null \
         | grep -E "VRAM Free Memory" | grep -oE '[0-9]+$' | head -1)
     if [ -n "$text_bytes" ]; then
         echo $((text_bytes / 1024 / 1024))

@@ -28,7 +28,6 @@ Self-test (no GPU/model required — exercises arg parser + stream formatter):
 """
 
 import argparse
-import sys
 
 
 def log(msg: str):
@@ -91,11 +90,23 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     # on a background thread — otherwise we can't drain the streamer queue
     # until generation is already finished, which defeats the point of a
     # streamer. The main thread iterates `streamer` and prints as tokens land.
-    thread = Thread(target=model.generate, kwargs=gen_kwargs)
+    # Capture exceptions from the thread so a failure in generate() surfaces
+    # instead of being silently swallowed by Thread.
+    thread_exc = []
+
+    def _generate_with_exc():
+        try:
+            model.generate(**gen_kwargs)
+        except Exception as e:
+            thread_exc.append(e)
+
+    thread = Thread(target=_generate_with_exc)
     thread.start()
     for new_text in streamer:
         print(new_text, end="", flush=True)
     thread.join()
+    if thread_exc:
+        raise thread_exc[0]
 
 
 def main():
@@ -140,12 +151,32 @@ def main():
     ).to("cuda")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # Apply optimizations (same helpers/logic as train_cpt.py).
+    # Apply optimizations. Note: for inference we use a weight-only float8
+    # quantizer (not convert_to_float8_training, which train_cpt.py uses)
+    # because there's no backward pass here — the training converter sets up
+    # AMAX/dynamic-scaling machinery that's dead weight for inference.
+    #
+    # torchao renamed this API between versions: older releases (confirmed
+    # present in 0.7.0) expose a plain `float8_weight_only()` function; newer
+    # releases (confirmed in 0.17.0) replaced it with a `Float8WeightOnlyConfig`
+    # class passed the same way to `quantize_()`. requirements.txt pins
+    # `torchao>=0.5.0` with no upper bound, so either could be installed --
+    # try the function first, fall back to the config class, and only warn if
+    # neither exists. (An earlier version of this code imported only the old
+    # function name; on any torchao new enough to have dropped it, that import
+    # raises ImportError and silently degrades to bf16 while logging a
+    # misleading "torchao not installed" message even though torchao IS
+    # installed — just with a renamed API. Confirmed by inspecting both
+    # torchao 0.7.0 and 0.17.0's actual quant_api.py source.)
     if args.dtype == "fp8":
         try:
-            from torchao.float8 import convert_to_float8_training
-            convert_to_float8_training(model)
-            log("fp8 enabled (torchao)")
+            from torchao.quantization import quantize_
+            try:
+                from torchao.quantization.quant_api import float8_weight_only as _f8
+            except ImportError:
+                from torchao.quantization import Float8WeightOnlyConfig as _f8
+            quantize_(model, _f8())
+            log("fp8 inference enabled (torchao float8 weight-only quantization)")
         except ImportError:
             log("WARNING: torchao not installed, using bf16")
     if args.flash_attn:
@@ -207,9 +238,12 @@ def main():
                 break
             full_prompt = prefix + prompt
             print("[response] ", end="", flush=True)
-            stream_generate(model, tokenizer, full_prompt, args.max_new_tokens,
-                            args.temperature, args.top_p, args.repetition_penalty,
-                            "cuda")
+            try:
+                stream_generate(model, tokenizer, full_prompt, args.max_new_tokens,
+                                args.temperature, args.top_p, args.repetition_penalty,
+                                "cuda")
+            except KeyboardInterrupt:
+                print("\n[generate] interrupted, back to prompt.")
             print()
 
 

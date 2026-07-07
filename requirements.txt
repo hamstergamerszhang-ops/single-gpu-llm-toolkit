@@ -12,8 +12,18 @@
 
 safetensors>=0.4.0
 numpy>=1.24.0
+# Gemma-4 support (Gemma4Config / model_type="gemma4") is NOT in transformers
+# 4.x at all -- verified directly against the real published wheels: no
+# "gemma4" model directory exists as of 4.49.0 through 5.4.0. It first
+# appears somewhere in the 5.4.0 -> 5.5.0 range and is confirmed present and
+# correctly registered in 5.7.0, which is the version this repo's tools were
+# actually run and tested against. A prior pass in this repo's history wrote
+# a comment claiming "5.7.0 was a typo, 4.49.0 is correct" -- that claim was
+# checked against the real PyPI packages while reviewing this file and found
+# to be false (4.49.0 has no gemma4 support whatsoever); do not reintroduce it.
 transformers==5.7.0
 bitsandbytes>=0.43.0  # optional: 8-bit Adam optimizer (falls back to AdamW if absent)
 tensorboard>=2.14.0   # optional: --tb logging (not bundled with torch; warns + stdout-only if absent)
 flash-attn>=2.5.0     # optional: --flash-attn (build from source on ROCm: pip install flash-attn --no-build-isolation)
 torchao>=0.5.0        # optional: --dtype fp8 (fp8 training on MI300X/MI325X; falls back to bf16 if absent)
+pytest>=8.0.0         # optional: for running the test suite (tests/test_all.py)

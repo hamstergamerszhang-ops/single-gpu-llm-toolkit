@@ -17,7 +17,7 @@ or {"messages": [...]} for SFT) and applies a configurable pipeline:
     characters, not plain-Latin text from those languages. Same caveat as
     prune_vocab.py: "configurable is not the same claim as verified" against
     any specific language-detection quality bar.
-  - **Sequence packing**: packs short {"text": "..."}` rows into sequences up
+  - **Sequence packing**: packs short {"text": "..."} rows into sequences up
     to --pack-seqlen (separated by a configurable --pack-separator, default
     newline), reducing the padding waste that train_cpt.py's --pack flag then
     further compresses at collation time.
@@ -39,7 +39,6 @@ filter, and packing against tiny in-memory data):
 
 import argparse
 import json
-import sys
 
 
 def log(msg: str):
@@ -53,9 +52,12 @@ def read_jsonl(path: str):
             line = line.strip()
             if line:
                 try:
-                    yield json.loads(line)
+                    row = json.loads(line)
                 except json.JSONDecodeError:
-                    continue  # skip malformed lines (same as train_cpt's load_jsonl)
+                    continue  # skip malformed lines (train_cpt's load_jsonl would crash here)
+                if not isinstance(row, dict):
+                    continue  # skip non-dict JSON (bare scalars/arrays)
+                yield row
 
 
 def get_text(row: dict) -> str:

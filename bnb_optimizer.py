@@ -53,13 +53,19 @@ def build_optimizer(trainable_params, lr: float, weight_decay: float = 0.01):
         import bitsandbytes as bnb
         optimizer = bnb.optim.Adam8bit(trainable_params, lr=lr, weight_decay=weight_decay)
         return optimizer, "bnb_adam8bit"
-    except ImportError:
+    except Exception as e:
+        # On ROCm, bitsandbytes can import successfully but fail at construction
+        # time if the installed wheel lacks HIP kernels. Catch any construction
+        # error, not just ImportError, and fall back cleanly.
         import torch
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
-        print("[bnb_optimizer] WARNING: bitsandbytes not installed -- falling back to "
-              "torch.optim.AdamW (~4x more optimizer-state memory). This is a real, "
-              "observed OOM source on large models, not a hypothetical one -- reinstall "
-              "bitsandbytes on every fresh container. See this repo's README.md.")
+        optimizer = torch.optim.AdamW(
+            trainable_params, lr=lr, weight_decay=weight_decay, foreach=True
+        )
+        print(f"[bnb_optimizer] WARNING: bitsandbytes 8-bit Adam unavailable "
+              f"({type(e).__name__}: {e}) -- falling back to torch.optim.AdamW "
+              f"(~4x more optimizer-state memory). This is a real, observed OOM "
+              f"source on large models. Reinstall bitsandbytes on every fresh "
+              f"container (ROCm builds must be HIP-aware). See README.md.")
         return optimizer, "torch_adamw"
 
 

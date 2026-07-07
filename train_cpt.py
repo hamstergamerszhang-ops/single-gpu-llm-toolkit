@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CUDA/ROCm continued-pretraining (CPT) / SFT trainer for a Gemma-4-family
-model — pipeline step 4 of 4 (runs against the output of expand_model.py, or
-directly against a pruned checkpoint if you skip expansion).
+model — runs against the output of expand_model.py (or mtp_head.py), or
+directly against a pruned checkpoint if you skip expansion.
 
 Ported from an MLX/Metal original written for a 48GB unified-memory Mac (that
 version trains a windowed SLICE of layers because 48GB can't hold optimizer
@@ -70,7 +70,7 @@ network path):
         --save ./checkpoints/model_cpt_1 \\
         --iters 2000000 --batch 8 --lr 5e-7
 
-Self-test (no model/GPU required -- checks schedule math, masking, and the
+Self-test (no model/GPU required -- checks schedule math and the
 atomic checkpoint rename logic against a tmp dir):
     python3 train_cpt.py --selftest
 
@@ -298,9 +298,15 @@ def collate(batch: list[dict], pad_token_id: int):
 
 
 def pack_examples(examples: list[dict], max_seq_len: int):
-    """Pack short examples into sequences up to max_seq_len, with attention_mask
-    blocking cross-contamination between packed examples. Reduces padding waste
-    vs. naive batch-max padding. Returns a list of packed example dicts."""
+    """Pack short examples into sequences up to max_seq_len, reducing padding
+    waste vs. naive batch-max padding. Returns a list of packed example dicts.
+
+    NOTE: packed examples are concatenated with NO separator token and NO
+    block-diagonal attention mask — a token in packed example B will causally
+    attend to tokens in packed example A. This is acceptable for CPT (where all
+    text is training data anyway) but is a data-quality concern for SFT (where
+    distinct conversations bleed into each other). For SFT, prefer not using
+    --pack unless you've verified the cross-contamination is acceptable."""
     import torch
     packed = []
     current_ids = []
@@ -422,17 +428,22 @@ def _apply_flash_attn(model):
               "--no-build-isolation' on a ROCm box.", file=sys.stderr)
 
 
-def _apply_compile(model):
+def _apply_compile(model, mode: str = "max-autotune", dynamic: bool = False):
     """Wrap the model in torch.compile() for kernel fusion + graph optimization.
     ROCm's inductor backend supports this. The first few steps are slower
-    (compilation overhead); subsequent steps get the speedup. Falls back to
-    eager mode with a warning if compilation fails."""
+    (compilation overhead); subsequent steps get the speedup. Falls back to eager
+    mode with a warning if compilation fails.
+
+    `dynamic=False` avoids recompilations when sequence lengths vary (use with
+    --pack for best results); `dynamic=True` lets the graph adapt but may
+    recompile frequently on variable-length inputs."""
     import torch
     try:
-        compiled = torch.compile(model)
-        print("[cpt] torch.compile() enabled (ROCm inductor backend) — first "
-              "steps will be slower (compilation), then faster (kernel fusion). "
-              "If you see errors from inductor, remove the --compile flag.")
+        compiled = torch.compile(model, mode=mode, dynamic=dynamic, fullgraph=False)
+        print(f"[cpt] torch.compile() enabled (mode={mode}, dynamic={dynamic}, "
+              f"ROCm inductor backend) — first steps will be slower (compilation), "
+              f"then faster (kernel fusion). If you see errors from inductor, "
+              f"remove the --compile flag.")
         return compiled
     except Exception as e:
         print(f"[cpt] WARNING: torch.compile() failed ({e}) — using eager mode. "
@@ -611,8 +622,22 @@ def main():
     ap.add_argument("--end", type=int, default=None,
                     help="Last layer index (exclusive). Default: all layers (full-model "
                          "training -- the point of having 80GB+ instead of 48GB).")
-    ap.add_argument("--iters", type=int, default=3000)
-    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--iters", type=int, default=3000,
+                    help="Number of optimizer update steps. When --accum > 1, the "
+                         "training loop performs iters*accum micro-batches and calls "
+                         "optimizer.step() once every --accum micro-batches.")
+    ap.add_argument("--batch", type=int, default=2,
+                    help="Micro-batch size per GPU. Effective batch size is "
+                         "batch * accum * world_size.")
+    ap.add_argument("--accum", "--gradient-accumulation-steps", type=int, default=1,
+                    dest="accum",
+                    help="Gradient accumulation steps. Default 1 (no accumulation). "
+                         "Loss is divided by this value so gradients average over the "
+                         "accumulated micro-batches. Under --ddp, every micro-batch still "
+                         "triggers its own gradient all-reduce (no DDP no_sync() "
+                         "optimization on the non-final micro-batches) -- correct, but "
+                         "not the fastest possible implementation; fine for the "
+                         "single-GPU case this repo targets.")
     ap.add_argument("--lr", type=float, default=8e-7)
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--max-seq-len", type=int, default=2048)
@@ -679,6 +704,12 @@ def main():
                          "First few steps will be slower (compilation); subsequent "
                          "steps get the speedup. Falls back to eager mode with a "
                          "warning if compilation fails.")
+    ap.add_argument("--compile-mode", type=str, default="max-autotune",
+                    choices=["default", "reduce-overhead", "max-autotune"],
+                    help="torch.compile mode. 'max-autotune' (default) spends more "
+                         "time upfront autotuning but yields the best ROCm throughput "
+                         "for steady-state training. 'reduce-overhead' is better for "
+                         "small models or short runs. Ignored unless --compile is set.")
     ap.add_argument("--dtype", type=str, default="bf16",
                     choices=["bf16", "fp8"],
                     help="Training dtype. 'bf16' (default) works on all ROCm cards. "
@@ -727,7 +758,7 @@ def main():
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed)  # per-rank seeding added below after ddp_rank is set
     if not torch.cuda.is_available():
         print("[cpt] WARNING: no CUDA/ROCm device visible -- this script is built for "
               "single-GPU hardware (e.g. an AMD MI300X under ROCm, or an NVIDIA "
@@ -765,9 +796,14 @@ def main():
         if is_main:
             print(f"[cpt] DDP enabled: rank {ddp_rank}/{ddp_world_size}, "
                   f"local_rank={local_rank}, device={device}")
+        # Per-rank torch seeding: without this, dropout/RNG-based ops produce
+        # identical masks on every rank (correlated noise), which is wasteful.
+        torch.manual_seed(args.seed + ddp_rank)
 
     save_dir = Path(args.save)
     resume_tag = args.resume_tag or save_dir.name
+    if is_main:
+        print(f"[cpt] resume_tag: {resume_tag}")
     resumed = False
     if save_dir.exists() and (save_dir / "training_state.pt").exists():
         # Local-only resume: re-running the SAME command after a crash or a
@@ -803,9 +839,15 @@ def main():
     # transformers would have loaded anyway). Only matters if your model ships a
     # custom modeling_*.py file (e.g. one adding multi-token prediction) -- see
     # expand_model.py's docstring for that case.
-    model = AutoModelForCausalLM.from_pretrained(
-        load_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-    ).to(device)
+    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
+    if args.flash_attn:
+        try:
+            import flash_attn  # noqa: F401 — if installed, load with FA2 from the start
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+        except ImportError:
+            # _apply_flash_attn() below will print the fallback warning.
+            pass
+    model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs).to(device)
     if not args.no_grad_checkpoint:
         model.config.use_cache = False  # incompatible with checkpointing/training either way
         model.gradient_checkpointing_enable()
@@ -833,13 +875,31 @@ def main():
     if args.flash_attn:
         _apply_flash_attn(model)
     if args.compile:
-        model = _apply_compile(model)
+        # dynamic=False avoids recompilation thrash when --pack gives fixed-length
+        # sequences; leave it dynamic only if the user is not packing (variable
+        # length inputs will still work, just with more compile overhead).
+        compile_dynamic = not args.pack
+        model = _apply_compile(model, mode=args.compile_mode, dynamic=compile_dynamic)
 
     # Wrap in DistributedDataParallel after all model modifications (fp8,
     # flash-attn, compile) but before apply_window_freeze, so DDP sees the
     # final parameter set for gradient sync. DDP syncs gradients via all-reduce
     # during backward — the optimizer step then operates on synced grads.
+    windowed_freeze = args.start != 0 or args.end is not None
     if args.ddp and ddp_world_size > 1:
+        if windowed_freeze:
+            # PyTorch warns that find_unused_parameters=True combined with
+            # gradient checkpointing can be unsafe in some versions because DDP
+            # cannot always trace which checkpointed segments produce gradients
+            # for which parameters. Windowed freezing also disables DDP gradient
+            # bucketing optimizations, which can materially hurt throughput on
+            # AMD/ROCm. We still allow it for small-GPU compatibility, but warn.
+            print("[cpt] WARNING: --ddp with windowed --start/--end + gradient "
+                  "checkpointing is supported for compatibility, but it is slower "
+                  "and can be correctness-sensitive on some PyTorch/ROCm builds. "
+                  "For best throughput and safety on MI300X-class hardware, use "
+                  "full-model training (--start 0 with no --end) or wait for FSDP.",
+                  file=sys.stderr)
         # find_unused_parameters=True handles the windowed-freeze case where only
         # a subset of params have requires_grad=True — DDP needs to know which
         # params participate in backward to all-reduce correctly (without this,
@@ -956,7 +1016,7 @@ def main():
     # is set but tensorboard isn't installed, warn and continue stdout-only
     # rather than crashing.
     tb_writer = None
-    if args.tb:
+    if args.tb and is_main:  # only rank 0 writes TB events
         try:
             from torch.utils.tensorboard import SummaryWriter
             tb_writer = SummaryWriter(args.tb)
@@ -993,98 +1053,134 @@ def main():
         print(f"[cpt] profiling enabled — trace artifacts -> {args.profile} "
               f"(viewable in chrome://tracing or Perfetto)")
 
-    for it in range(start_step + 1, args.iters + 1):
-        if stream_gen is not None:
-            batch_rows = [next(stream_gen) for _ in range(args.batch)]
-        else:
-            batch_rows = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
-        examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
-        if args.pack:
-            examples = pack_examples(examples, args.max_seq_len)
-        batch = collate(examples, tokenizer.pad_token_id)
-        batch = {k: v.to(device) for k, v in batch.items()}
+    # Wrap the training loop in try/finally so cleanup (profiler, tb_writer,
+    # DDP process group) runs even on exception (OOM, CUDA error, etc.).
+    # Without this, an exception mid-loop leaks the profiler context, leaves
+    # TB events unflushed, and leaves NCCL in a dirty state.
+    try:
+        for it in range(start_step + 1, args.iters + 1):
+            lr = lr_at_step(it, args.iters, args.lr, args.warmup_steps)
+            for g in optimizer.param_groups:
+                g["lr"] = lr
 
-        lr = lr_at_step(it, args.iters, args.lr, args.warmup_steps)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+            # Gradient accumulation: run args.accum micro-batches, each scaled by
+            # 1/accum so their summed gradients equal the average over all
+            # accum*batch examples, then step the optimizer once. With
+            # args.accum == 1 (the default) this is exactly one micro-batch and
+            # behaves identically to no accumulation. last_loss is the LAST
+            # micro-batch's (unscaled) loss, purely for logging -- it is not
+            # itself the quantity being optimized (the accumulated, scaled sum
+            # is), but it's a reasonable per-iter progress signal and avoids
+            # holding accum separate loss tensors alive for an "average" that
+            # would need its own explicit accumulation anyway.
+            last_loss = None
+            for _ in range(args.accum):
+                if stream_gen is not None:
+                    batch_rows = [next(stream_gen) for _ in range(args.batch)]
+                else:
+                    batch_rows = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
+                examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
+                if args.pack:
+                    examples = pack_examples(examples, args.max_seq_len)
+                batch = collate(examples, tokenizer.pad_token_id)
+                batch = {k: v.to(device) for k, v in batch.items()}
 
-        outputs = model(**batch)
-        loss = outputs.loss
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-        optimizer.step()
+                outputs = model(**batch)
+                loss = outputs.loss
+                last_loss = loss
+                (loss / args.accum).backward()
 
-        if profiler is not None:
-            profiler.step()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            loss = last_loss  # for the logging/eval code below, unchanged from pre-accum shape
 
-        # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
-        if it % 10 == 0 or it == args.iters:
-            if is_main:
-                print(f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}")
-        if tb_writer is not None and is_main and it % 10 == 0:
-            tb_writer.add_scalar("train/loss", loss.item(), it)
-            tb_writer.add_scalar("train/lr", lr, it)
-
-        # Held-out eval at eval_every intervals (rank 0 only — the eval forward
-        # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
-        if valid_rows is not None and is_main and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
-            vloss = run_eval(model, valid_rows, builder, tokenizer, args.max_seq_len,
-                             args.batch, device, args.pack, tokenizer.pad_token_id)
-            last_valid_loss = vloss
-            print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
-            if tb_writer is not None:
-                tb_writer.add_scalar("eval/valid_loss", vloss, it)
-
-        # DDP barrier: ensure all ranks are at the same step before checkpointing,
-        # so rank 0 doesn't write a checkpoint from a step where other ranks are
-        # still mid-backward (which would save unsynced gradients on resume).
-        if args.ddp and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
-            torch.distributed.barrier()
-
-        # Only rank 0 writes checkpoints — DDP syncs gradients, so the model
-        # state is identical across ranks; writing from one is sufficient and
-        # avoids N copies of a multi-GB checkpoint hitting disk simultaneously.
-        if is_main and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
-            ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
-            # Unwrap DDP for checkpointing: save_pretrained / state_dict need the
-            # underlying model, not the DDP wrapper (which prefixes keys with
-            # "module." and has no save_pretrained).
-            save_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            if args.async_checkpoint:
-                async_ckpt.save(save_model, optimizer, it, save_dir, tokenizer,
-                                extra_state=ckpt_extra,
-                                custom_code_src=Path(args.model))
-                # On exit (SIGTERM or final iter) the write MUST finish before the
-                # process dies, or this defeats the whole point of atomic checkpointing.
-                # For a regular mid-run checkpoint, deliberately NOT waiting here -- the
-                # background thread keeps writing while training continues; save()
-                # itself waits on any still-in-flight write before starting the next one.
-                if _SHOULD_STOP or it == args.iters:
-                    async_ckpt.wait_for_pending()
-            else:
-                atomic_save_checkpoint(save_model, optimizer, it, save_dir, tokenizer,
-                                       extra_state=ckpt_extra,
-                                       custom_code_src=Path(args.model))
-
-        if _SHOULD_STOP:
-            print(f"[cpt] Exiting cleanly after checkpoint at step {it} (SIGTERM)")
-            if tb_writer is not None:
-                tb_writer.close()
             if profiler is not None:
-                profiler.__exit__(None, None, None)
-            if args.ddp:
-                torch.distributed.destroy_process_group()
-            sys.exit(0)
+                profiler.step()
+    
+            # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
+            if it % 10 == 0 or it == args.iters:
+                if is_main:
+                    print(f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}")
+            if tb_writer is not None and is_main and it % 10 == 0:
+                tb_writer.add_scalar("train/loss", loss.item(), it)
+                tb_writer.add_scalar("train/lr", lr, it)
+    
+            # Held-out eval at eval_every intervals (rank 0 only — the eval forward
+            # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
+            if valid_rows is not None and is_main and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
+                vloss = run_eval(model, valid_rows, builder, tokenizer, args.max_seq_len,
+                                 args.batch, device, args.pack, tokenizer.pad_token_id)
+                last_valid_loss = vloss
+                print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
+                if tb_writer is not None:
+                    tb_writer.add_scalar("eval/valid_loss", vloss, it)
+    
+            # DDP barrier: ensure all ranks are at the same step before checkpointing.
+            # NOTE: _SHOULD_STOP is intentionally NOT in this condition. The flag is
+            # set per-rank by an async signal handler, so including it in a collective
+            # barrier would deadlock if ranks set the flag at different steps (some
+            # enter barrier() while others proceed to the next step's all-reduce).
+            # Instead, ranks only barrier on scheduled checkpoint/final-iter steps,
+            # where they already synchronize via the backward all-reduce. A SIGTERM
+            # on a non-checkpoint step sets _SHOULD_STOP, which triggers checkpoint +
+            # exit on the NEXT checkpoint-boundary step (when the barrier fires).
+            if args.ddp and (it % args.checkpoint_every == 0 or it == args.iters):
+                torch.distributed.barrier()
+    
+            # Only rank 0 writes checkpoints — DDP syncs gradients, so the model
+            # state is identical across ranks; writing from one is sufficient and
+            # avoids N copies of a multi-GB checkpoint hitting disk simultaneously.
+            if is_main and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
+                ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
+                # Unwrap DDP for checkpointing: save_pretrained / state_dict need the
+                # underlying model, not the DDP wrapper (which prefixes keys with
+                # "module." and has no save_pretrained).
+                save_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                # When resuming, the latest modeling_custom.py lives in the checkpoint
+                # dir (the user may have updated it there). For a fresh run, copy it
+                # from the original --model path.
+                custom_code_src = save_dir if resumed else Path(args.model)
+                if args.async_checkpoint:
+                    async_ckpt.save(save_model, optimizer, it, save_dir, tokenizer,
+                                    extra_state=ckpt_extra,
+                                    custom_code_src=custom_code_src)
+                    # On exit (SIGTERM or final iter) the write MUST finish before the
+                    # process dies, or this defeats the whole point of atomic checkpointing.
+                    # For a regular mid-run checkpoint, deliberately NOT waiting here -- the
+                    # background thread keeps writing while training continues; save()
+                    # itself waits on any still-in-flight write before starting the next one.
+                    if _SHOULD_STOP or it == args.iters:
+                        async_ckpt.wait_for_pending()
+                else:
+                    atomic_save_checkpoint(save_model, optimizer, it, save_dir, tokenizer,
+                                           extra_state=ckpt_extra,
+                                           custom_code_src=custom_code_src)
+    
+            if _SHOULD_STOP:
+                # Cleanup (tb_writer/profiler/process-group) is intentionally
+                # NOT duplicated here -- sys.exit(0) raises SystemExit, which
+                # still runs the enclosing `finally` block below on its way out.
+                # An earlier version of this branch closed tb_writer, exited the
+                # profiler, and called torch.distributed.destroy_process_group()
+                # here AND let `finally` run the same calls again -- a second
+                # destroy_process_group() call raises
+                # "AssertionError: Process group cannot be None" (confirmed with
+                # a real torch.distributed init/destroy/destroy repro), which
+                # meant the one path this whole try/finally exists to make safe
+                # (graceful SIGTERM shutdown under --ddp) was the one path that
+                # crashed. Let `finally` do the one and only cleanup pass.
+                print(f"[cpt] Exiting cleanly after checkpoint at step {it} (SIGTERM)")
+                sys.exit(0)
 
-    if is_main:
-        print(f"\n[cpt] Done. Final checkpoint at step {args.iters} -> {save_dir}")
-    if tb_writer is not None:
-        tb_writer.close()
-    if profiler is not None:
-        profiler.__exit__(None, None, None)
-    if args.ddp:
-        torch.distributed.destroy_process_group()
+    finally:
+        if tb_writer is not None:
+            tb_writer.close()
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+        if args.ddp:
+            torch.distributed.destroy_process_group()
+
 
 
 if __name__ == "__main__":

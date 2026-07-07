@@ -32,11 +32,10 @@ Usage (identical to train_cpt.py, minus --cpt which doesn't exist here):
 Self-test (no GPU required): runs two things back to back --
   1. this wrapper's OWN logic (the argv rewrite, and the --cpt refusal --
      the only things actually unique to this file), and
-  2. train_cpt.py's real self_test() (LR schedule, SFT/CPT masking
-     construction, atomic checkpoint rename), delegated to verbatim, not
-     reimplemented -- so there's still exactly one place the underlying
-     SFT logic itself is tested, matching this file's whole "no duplicated
-     logic" premise.
+  2. train_cpt.py's real self_test() (LR schedule, atomic checkpoint
+     rename), delegated to verbatim, not reimplemented -- so there's still
+     exactly one place the underlying logic itself is tested, matching this
+     file's whole "no duplicated logic" premise.
     python3 train_sft.py --selftest
 """
 

@@ -1,4 +1,4 @@
-"""Pytest tests for the gemma-prune-cpt tools.
+"""Pytest tests for the single-gpu-llm-toolkit tools.
 
 All tests are CPU-only (no GPU/torch-CUDA needed). They cover the same
 invariants the per-module --selftest scripts check, but factored into pytest so
@@ -61,6 +61,52 @@ def test_resume_does_not_restart_warmup():
         relative_lr = lr_at_step(k, total, base_lr, warmup)
         assert absolute_lr != relative_lr, \
             f"k={k}: absolute {absolute_lr} should differ from relative {relative_lr}"
+
+
+def test_gradient_accumulation_matches_single_larger_batch():
+    """Regression test for a real bug: train_cpt.py's --accum /
+    --gradient-accumulation-steps flag was added with a docstring describing
+    exact behavior (loss divided by accum before backward, one optimizer.step()
+    per accum micro-batches) but the training loop never referenced
+    args.accum anywhere -- passing --accum 4 silently trained as if the flag
+    didn't exist. This test doesn't import train_cpt's main() (that needs a
+    real model/GPU/checkpoint), but verifies the actual accumulation math the
+    fixed loop uses: N micro-batches, each with mean-reduced loss divided by N
+    before backward(), one optimizer step after all N -- using real torch
+    tensors and a real backward pass, not a mock. The accumulated gradient
+    must equal the gradient from a single larger batch covering the same
+    examples, since mean(mean(chunk_1), mean(chunk_2)) == mean(chunk_1+chunk_2)
+    for equal-sized chunks."""
+    import torch
+
+    torch.manual_seed(0)
+    model_single = torch.nn.Linear(4, 1)
+    model_accum = torch.nn.Linear(4, 1)
+    model_accum.load_state_dict(model_single.state_dict())
+
+    x = torch.randn(8, 4)
+    y = torch.randn(8, 1)
+
+    # Single larger batch, mean-reduced loss (mirrors HF's mean cross-entropy).
+    model_single.zero_grad()
+    loss_single = torch.nn.functional.mse_loss(model_single(x), y)
+    loss_single.backward()
+    grad_single = model_single.weight.grad.clone()
+
+    # Accumulated: accum=2 micro-batches of 4, loss/accum before backward,
+    # one optimizer step after both -- the exact pattern train_cpt.py's loop uses.
+    accum = 2
+    model_accum.zero_grad()
+    for i in range(accum):
+        xb, yb = x[i * 4:(i + 1) * 4], y[i * 4:(i + 1) * 4]
+        loss_micro = torch.nn.functional.mse_loss(model_accum(xb), yb)
+        (loss_micro / accum).backward()
+    grad_accum = model_accum.weight.grad.clone()
+
+    assert torch.allclose(grad_single, grad_accum, atol=1e-6), (
+        f"accumulated gradient {grad_accum} should match single-batch gradient "
+        f"{grad_single} -- if these differ, --accum is scaling incorrectly"
+    )
 
 
 # ── BPE merges parsing (prune_vocab.py) ─────────────────────────────────────
@@ -232,6 +278,85 @@ def test_orthogonal_pad_shapes():
     # transpose_for_rows=False: returns (n_existing, n_new)
     pad2 = orthogonal_pad(8, 16, INIT_SCALE, transpose_for_rows=False)
     assert pad2.shape == (16, 8), pad2.shape
+
+
+def test_orthogonal_pad_rejects_n_new_greater_than_n_existing():
+    """np.linalg.qr's reduced mode on an (m, n) matrix with m <= n can only
+    produce at most m orthogonal columns -- requesting more silently
+    truncated the pad before this guard was added. It must now raise instead
+    of returning a wrong-shaped tensor."""
+    from expand_model import orthogonal_pad, INIT_SCALE
+    with pytest.raises(ValueError):
+        orthogonal_pad(32, 16, INIT_SCALE, transpose_for_rows=True)
+
+
+def test_gqa_expand_kv_v_proj_shape_when_new_out_less_than_hidden():
+    """Regression test for a real shape bug: gqa_expand_kv's v_proj
+    construction did `np.linalg.qr(R, mode="reduced")` on an (new_out, hidden)
+    matrix and used the result directly. When new_out < hidden, reduced-mode
+    QR returns Q of shape (new_out, new_out), not (new_out, hidden) -- the
+    fresh v_proj silently came out the wrong shape (confirmed by reproducing
+    the old logic standalone: for new_out=512, hidden=2048 it produced
+    (512, 512) instead of (512, 2048)). This would either crash at
+    torch.cat/model load or corrupt the checkpoint depending on what caught
+    it. The fix pads the QR output with extra random columns to reach the
+    required width; this test exercises exactly that path with new_out well
+    below hidden."""
+    import torch
+    from expand_model import gqa_expand_kv
+
+    head_dim = 128
+    hidden = 2048
+    old_kv_heads = 1
+    new_kv_heads = 4  # new_out = 512, which is < hidden = 2048
+    layer_prefix = "layer"
+    k_key = f"{layer_prefix}.self_attn.k_proj.weight"
+    v_key = f"{layer_prefix}.self_attn.v_proj.weight"
+
+    tensors = {k_key: torch.randn(old_kv_heads * head_dim, hidden, dtype=torch.bfloat16)}
+    gqa_expand_kv(tensors, layer_prefix, head_dim, old_kv_heads, new_kv_heads,
+                  hidden, init_scale=0.02)
+
+    new_out = new_kv_heads * head_dim
+    assert tensors[k_key].shape == (new_out, hidden)
+    assert tensors[v_key].shape == (new_out, hidden), (
+        f"v_proj shape {tensors[v_key].shape} != expected {(new_out, hidden)} -- "
+        "this is the exact shape truncation the fix addresses"
+    )
+    assert torch.isfinite(tensors[v_key]).all()
+
+
+def test_gqa_expand_kv_v_proj_shape_when_new_out_at_least_hidden():
+    """Same construction, but with new_out >= hidden (the case reduced-mode QR
+    already handled correctly without padding) -- verifies the fix's branch
+    for the pre-existing working path didn't regress it.
+
+    k_proj's row-pad goes through orthogonal_pad(n_new, hidden, ...), which
+    (correctly) requires n_new <= hidden -- a separate, independent
+    constraint from v_proj's new_out-vs-hidden shape logic being tested here.
+    old_kv_heads is chosen large enough that n_new = new_out - old_out stays
+    within that limit while new_out itself is still >= hidden.
+    """
+    import torch
+    from expand_model import gqa_expand_kv
+
+    head_dim = 64
+    hidden = 512
+    old_kv_heads = 6   # old_out = 384
+    new_kv_heads = 8   # new_out = 512 (>= hidden); n_new = 512-384 = 128 (<= hidden)
+    layer_prefix = "layer"
+    k_key = f"{layer_prefix}.self_attn.k_proj.weight"
+    v_key = f"{layer_prefix}.self_attn.v_proj.weight"
+
+    tensors = {k_key: torch.randn(old_kv_heads * head_dim, hidden, dtype=torch.bfloat16)}
+    gqa_expand_kv(tensors, layer_prefix, head_dim, old_kv_heads, new_kv_heads,
+                  hidden, init_scale=0.02)
+
+    new_out = new_kv_heads * head_dim
+    assert new_out >= hidden, "test setup check: this test is meant to cover new_out >= hidden"
+    assert tensors[k_key].shape == (new_out, hidden)
+    assert tensors[v_key].shape == (new_out, hidden)
+    assert torch.isfinite(tensors[v_key]).all()
 
 
 def test_detect_mqa_layout_matches_when_no_v_proj_and_shape_agrees():
@@ -446,6 +571,28 @@ def test_rocm_env_already_supported_no_override():
     assert find_override_target("gfx1100", torch_list) is None
 
 
+def test_rocm_env_letter_suffix_arch():
+    """Letter-suffix archs (gfx90a — MI250) and 3-digit archs (gfx942, gfx803)
+    must be detectable and matchable, not silently skipped by the regex."""
+    from rocm_env import find_override_target, _gfx_major, GFX_RE
+    # GFX_RE matches letter-suffix and 3-digit archs.
+    assert GFX_RE.search("gfx90a") is not None
+    assert GFX_RE.search("gfx942") is not None
+    assert GFX_RE.search("gfx803") is not None
+    # _gfx_major handles them: gfx90a -> gfx90, gfx942 -> gfx94, gfx803 -> gfx80
+    assert _gfx_major("gfx90a") == "gfx90"
+    assert _gfx_major("gfx942") == "gfx94"
+    assert _gfx_major("gfx803") == "gfx80"
+
+
+def test_rocm_env_3digit_override():
+    """3-digit archs can find same-family overrides."""
+    from rocm_env import find_override_target
+    # gfx903 (not in list) -> gfx906 (same gfx90 family)
+    target = find_override_target("gfx903", ["gfx906", "gfx1100"])
+    assert target == "gfx906"
+
+
 def test_rocm_env_force_override_sets_env():
     from rocm_env import setup_rocm_env
     os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
@@ -593,15 +740,34 @@ def test_benchmark_format_table():
 
 # ── generate.py ─────────────────────────────────────────────────────────────
 
-def test_generate_temperature_logic():
-    # temperature=0 -> greedy (do_sample=False), >0 -> sampling
-    assert not (0.0 > 0)
-    assert 0.7 > 0
+def test_generate_build_gen_kwargs_greedy():
+    """Call the REAL build_gen_kwargs and verify greedy mode logic."""
+    from generate import build_gen_kwargs
+
+    class FakeStreamer:
+        pass
+    kwargs = build_gen_kwargs(
+        input_ids="IDS", attention_mask="MASK", max_new_tokens=100,
+        temperature=0.0, top_p=0.9, repetition_penalty=1.1,
+        pad_token_id=0, eos_token_id=1, streamer=FakeStreamer(),
+    )
+    assert kwargs["do_sample"] is False, "temperature=0 should give do_sample=False"
+    assert kwargs["temperature"] == 1e-6, "temperature should be floored to 1e-6"
+    assert kwargs["use_cache"] is True, "KV-cache must be enabled for generation"
+    assert kwargs["pad_token_id"] == 0, "pad_token_id=0 is valid, must not be swapped"
 
 
-def test_generate_system_prompt_prefix():
-    system = "You are helpful."
-    user = "What is ROCm?"
-    full = system + "\n\n" + user
-    assert full.startswith(system)
-    assert user in full
+def test_generate_build_gen_kwargs_sampling():
+    """Call the REAL build_gen_kwargs and verify sampling mode + None pad fallback."""
+    from generate import build_gen_kwargs
+
+    class FakeStreamer:
+        pass
+    kwargs = build_gen_kwargs(
+        input_ids="IDS", attention_mask="MASK", max_new_tokens=50,
+        temperature=0.8, top_p=0.9, repetition_penalty=1.1,
+        pad_token_id=None, eos_token_id=2, streamer=FakeStreamer(),
+    )
+    assert kwargs["do_sample"] is True
+    assert kwargs["temperature"] == 0.8
+    assert kwargs["pad_token_id"] == 2, "pad_token_id=None should fall back to eos_token_id"

@@ -20,7 +20,6 @@ Self-test (no GPU/model required — exercises config parser + table formatter):
 """
 
 import argparse
-import sys
 import time
 
 
@@ -139,7 +138,6 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
 
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
         # Warmup.
         for _ in range(warmup):
@@ -181,8 +179,9 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         log(f"  tokens/s: {tps:,.0f}  peak_VRAM: {peak_vram:.1f}GB  "
             f"step: {step_ms:.1f}ms")
 
-        # Free model before next config.
-        del model, optimizer
+        # Free model + orphaned logits before next config (outputs.logits can
+        # be ~1GB on a 15B model and isn't freed by empty_cache while referenced).
+        del outputs, input_ids, labels, attn, model, optimizer
         torch.cuda.empty_cache()
 
     return results

@@ -92,12 +92,18 @@ state_path = save_dir / "training_state.pt"
 if not state_path.exists():
     print(0)
 else:
-    # weights_only=False matches train_cpt.py's resume path: training_state.pt
-    # holds an optimizer state_dict with non-allowlisted pickle objects, which
-    # torch >= 2.6's default weights_only=True would reject. PyTorch 2.6+
-    # defaults to weights_only=True, breaking resume without this.
-    state = torch.load(state_path, map_location="cpu", weights_only=False)
-    print(state.get("step", 0))
+    try:
+        # weights_only=False matches train_cpt.py's resume path: training_state.pt
+        # holds an optimizer state_dict with non-allowlisted pickle objects, which
+        # torch >= 2.6's default weights_only=True would reject. PyTorch 2.6+
+        # defaults to weights_only=True, breaking resume without this.
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        print(state.get("step", 0))
+    except Exception:
+        # Corrupt/partial checkpoint: print 0 so the supervisor treats it as
+        # "no progress" rather than crashing with a traceback that leaves
+        # current_step empty and causes an "integer expression expected" cascade.
+        print(0)
 PYEOF
 }
 
@@ -253,7 +259,10 @@ while true; do
 "more than ${LOSS_REGRESSION_FACTOR}x the best kept loss $best_loss ($best_dir) -- "\
 "rolling back to the better checkpoint instead of compounding a bad patch."
             rm -rf "$SAVE"
-            cp -r "$best_dir" "$SAVE"
+            if ! cp -r "$best_dir" "$SAVE"; then
+                echo "[autoresume] ERROR: rollback copy failed — $SAVE is now empty/missing. " \
+"Next launch will restart from --model (step 0). Check disk space."
+            fi
         fi
     fi
 

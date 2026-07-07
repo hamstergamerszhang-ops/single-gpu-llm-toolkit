@@ -1,4 +1,4 @@
-# gemma-mi300x-prune-cpt
+# single-gpu-llm-toolkit
 
 Sixteen independently-runnable tools (fourteen Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
@@ -101,9 +101,9 @@ from it.
 **Option 1: Docker (recommended — bakes in all deps including ROCm torch):**
 
 ```bash
-docker build -t gemma-prune-cpt .
+docker build -t single-gpu-llm-toolkit .
 docker run --device /dev/kfd --device /dev/dri --group-add video \
-           --shm-size 64G -v $(pwd):/work -w /work -it gemma-prune-cpt \
+           --shm-size 64G -v $(pwd):/work -w /work -it single-gpu-llm-toolkit \
            python3 train_cpt.py --model ... --save ...
 ```
 
@@ -319,6 +319,20 @@ codebase's own hardware" until you've run it yourself:
   path itself (not just its speedup) is untested against real multi-GPU
   hardware. Verify it actually converges correctly on your own cluster before
   trusting it for a real run.
+- **`--accum N`** (alias `--gradient-accumulation-steps`) — accumulate
+  gradients over `N` micro-batches of size `--batch` before each optimizer
+  step, giving an effective batch size of `batch * accum` without the extra
+  VRAM a literally-larger `--batch` would need — the standard way around
+  the "want a bigger batch, don't have the memory" problem this repo is
+  built around. Each micro-batch's loss is divided by `N` before
+  `backward()`, so the accumulated gradient matches what a real batch of
+  size `batch * accum` would have produced (verified against a real
+  minimal-model repro, not just asserted). Default `1` (no accumulation,
+  identical to the pre-`--accum` behavior). Under `--ddp`, every micro-batch
+  still triggers its own gradient all-reduce — correct, but not the
+  `no_sync()`-optimized version; fine for the single-GPU case this repo
+  targets, worth revisiting if you're actually running this across multiple
+  GPUs.
 
 These flags are designed to compose (`--ddp --flash-attn --dtype fp8
 --compile` on a multi-GPU MI300X box), but that combination specifically has
@@ -574,7 +588,7 @@ before exiting, so the two together behave as a real clean-save-then-exit
 rather than a hard kill.
 
 ```
-nohup bash oom_guard.sh <training_pid> [warn_mb] [emergency_mb] [poll_sec] [vram_warn_mb] [vram_emergency_mb] > oom_guard.log 2>&1 &
+nohup bash oom_guard.sh <training_pid> [warn_free_mb] [emergency_free_mb] [poll_sec] [vram_warn_mb] [vram_emergency_mb] > oom_guard.log 2>&1 &
 ```
 
 ## `rocm_env.py` — AMD GPU arch detection + override
@@ -614,6 +628,23 @@ python3 rocm_env.py --gfx-override gfx1100
 Real things that actually happened running this on real hardware, plus a
 few caught in code review this pass:
 
+- **A CLI flag with a detailed docstring is not the same claim as a CLI flag
+  that does anything.** `train_cpt.py`'s `--accum` /
+  `--gradient-accumulation-steps` flag was added with a specific, correct-
+  sounding description (`iters*accum` micro-batches, one `optimizer.step()`
+  every `accum` micro-batches, loss divided by `accum`) — and the training
+  loop never referenced `args.accum` anywhere. Pass `--accum 4` and training
+  proceeded exactly as if the flag didn't exist: no error, no warning, silent
+  no-op, effective batch size unchanged from what `--batch` alone gives you.
+  Caught by grepping the whole file for `args.accum` and finding zero hits
+  outside the argument parser itself. Now actually implemented: `accum`
+  micro-batches run forward/backward with loss scaled by `1/accum` before a
+  single `optimizer.step()`, verified against a real minimal
+  linear-model-plus-MSE-loss repro that the accumulated gradients exactly
+  match a single equivalent larger batch. This is the same bug class as a
+  docstring describing behavior the code doesn't implement — the fix here is
+  the code, not the doc, since the described behavior was reasonable and
+  worth actually having.
 - **Reinstall `bitsandbytes` explicitly on every fresh container.** It's easy
   to lose silently on a rebuild, and the failure mode isn't a crash at step 0
   — it's an OOM dozens of iterations in, once the ~4x-larger fallback AdamW
@@ -675,7 +706,66 @@ few caught in code review this pass:
   fine (interpreters don't need +x) while `./file.py` stops. Worth a quick
   `git diff --summary` before committing anything that touches a `.sh` or a
   `.py` you expect to be directly executable; this repo has caught the same
-  regression more than once.
+  regression more than once — it happened again, across a dozen files at
+  once, during the exact review pass that produced this Tips entry.
+- **`sys.exit()` inside a `try` still runs the enclosing `finally` block.**
+  `train_cpt.py`'s SIGTERM-triggered clean-exit path used to close the
+  TensorBoard writer, exit the profiler context, and call
+  `torch.distributed.destroy_process_group()` right before its own
+  `sys.exit(0)` — then hit a `finally` block that did the exact same three
+  things again. A second `destroy_process_group()` call raises
+  `AssertionError: Process group cannot be None` (confirmed with a real
+  `init_process_group` / `destroy_process_group` / `destroy_process_group`
+  repro), which meant the one shutdown path this `try/finally` exists to
+  protect — graceful exit under `--ddp` — was the one that crashed. Fixed by
+  deleting the duplicate cleanup and letting `finally` be the single place
+  it happens; `SystemExit` propagates through `finally` before the process
+  actually exits, so nothing is skipped.
+- **A "typo fix" is still a claim — verify it against the real package, don't
+  just trust that a comment sounds authoritative.** A prior pass through this
+  repo left a comment claiming the `transformers==5.7.0` pin was a typo for
+  `4.49.0`. It wasn't: pulling the actual wheels for both versions shows
+  `4.49.0` has no `gemma4` model directory at all (Gemma-4 support doesn't
+  land until well into the `5.x` line), while `5.7.0` genuinely registers
+  `Gemma4Config` correctly. The same review pass also introduced a Docker
+  base-image tag (`rocm6.2_ubuntu22.04_py3.10_pytorch_2.4`) that doesn't
+  exist on Docker Hub at all — real tags for that base image follow a
+  `rocm6.2.x_ubuntuYY.MM_pyZ.W_pytorch_release_A.B.C` pattern, not that one,
+  so the `Dockerfile` would have failed on `FROM` before installing a single
+  dependency. Both were checked against the real, published artifacts (PyPI
+  wheel contents, Docker Hub's tag list) rather than assumed correct because
+  they read like plausible version numbers.
+- **QR's reduced mode caps out at `min(rows, cols)` orthogonal directions —
+  padding logic that assumes otherwise silently truncates.**
+  `expand_model.py`'s `gqa_expand_kv()` builds a fresh `v_proj` by taking
+  `np.linalg.qr(R, mode="reduced")` on an `(new_out, hidden)` matrix and
+  using the result directly. When `new_out < hidden` (a real, unremarkable
+  case — narrower KV output than hidden size), reduced-mode QR only returns
+  a `(new_out, new_out)` matrix, not `(new_out, hidden)` — the fresh
+  `v_proj` came out the wrong shape with nothing raising an error. Confirmed
+  by reproducing the old logic standalone (`new_out=512, hidden=2048`
+  produced a `(512, 512)` tensor instead of `(512, 2048)`). Fixed by padding
+  the QR output with extra random orthogonal-scaled columns when it comes up
+  short, plus an explicit shape assertion so any future regression here
+  fails loudly instead of shipping a corrupt checkpoint. Covered by a
+  dedicated regression test now (`tests/test_all.py`,
+  `test_gqa_expand_kv_v_proj_shape_when_new_out_less_than_hidden`).
+- **A third-party library renaming a function to a config class breaks
+  `try/except ImportError` fallbacks silently, not loudly.** `torchao`'s
+  float8-weight-only inference API used to be a plain
+  `float8_weight_only()` function (confirmed present in `torchao==0.7.0`);
+  newer releases (confirmed in `0.17.0`) replaced it with a
+  `Float8WeightOnlyConfig` class passed to `quantize_()` the same way.
+  `requirements.txt` pins `torchao>=0.5.0` with no upper bound, so either
+  API could be installed. Code that only imports the old function name
+  doesn't crash on the newer package — it hits `ImportError`, gets caught by
+  the existing `except ImportError: log("torchao not installed")` fallback,
+  and silently trains/generates in bf16 while printing a message that's
+  actively misleading (torchao *is* installed; only the specific symbol
+  moved). `generate.py` now tries the function first and falls back to the
+  config class, so the fp8 path actually works across the version range the
+  requirements file claims to support, instead of only the narrow slice that
+  happened to match whichever torchao was installed when it was written.
 
 ## Troubleshooting
 
@@ -696,8 +786,9 @@ few caught in code review this pass:
   Momentum restarts fresh; the step count is preserved. This is intentional
   (see `optimizer_compat_guard.py`), not a bug.
 - **Vocab size silently reverts to 262144 on load** — some Gemma-4 configs
-  store `vocab_size` in two places; `prune_vocab.py` fixes both by default,
-  but only if you pass `--vocab-size-paths` matching your config layout.
+  store `vocab_size` in two places; `prune_vocab.py` fixes both by default
+  (the default `--vocab-size-paths` covers both Gemma-4 locations). Only pass
+  `--vocab-size-paths` if your config nests `vocab_size` somewhere non-standard.
 - **`catch_and_resume.sh` hardcodes paths** — it doesn't anymore. Copy
   `config.env.example` to `config.env` and edit the values there; the script
   sources it automatically.
@@ -767,10 +858,15 @@ bakes in a ROCm torch + all deps):
   deliberately not in `requirements.txt`)
 - `safetensors`
 - `numpy`
-- `transformers` (confirmed working against `5.7.0`; if you're on a
-  different version, check whether your `Gemma4Config` registers
-  `model_type` as `"gemma4"` or `"gemma4_unified"` — `prune_vocab.py`
-  handles that specific mismatch)
+- `transformers` (confirmed working against `5.7.0`; a mid-review pass on
+  this repo once wrote a comment claiming that string was a typo and
+  `4.49.0` was the intended version — checked directly against transformers'
+  actual published packages while reviewing that change, and it's backwards:
+  `4.49.0` has no `gemma4` model directory at all, and Gemma-4 support
+  doesn't land until well into the `5.x` line. `5.7.0` is the real,
+  verified pin. If you're on a different version, check whether your
+  `Gemma4Config` registers `model_type` as `"gemma4"` or `"gemma4_unified"`
+  — `prune_vocab.py` handles that specific mismatch)
 - `bitsandbytes` (8-bit Adam; falls back to plain AdamW at ~4x optimizer
   memory if unavailable)
 - `tensorboard` (optional; for `--tb` logging — not bundled with torch, install
