@@ -34,13 +34,27 @@ WHAT THIS DOES
   5. Always log what it did (or didn't do).
 
 ORDERING NOTE: HSA_OVERRIDE_GFX_VERSION must be set before the ROCm device
-runtime initializes. In the auto-detect path, this module imports torch (to
-read get_arch_list) BEFORE setting the env var. This works in practice because
-torch's device init is LAZY — `import torch` and `get_arch_list()` read
-compiled metadata without initializing the device; the actual device init
-happens later at the first real CUDA/ROCm call (e.g. torch.cuda.is_available()
-or a tensor op on GPU), which runs after the env var is set. If you want a
-fully-robust path that sets the env var with ZERO torch import first, use
+runtime initializes. `import torch` alone does NOT initialize the device --
+but torch.cuda.is_available() does (its own docstring says it calls
+cudaGetDeviceCount(), "which in turn initializes the CUDA Driver API via
+cuInit()"), and ROCm's HSA runtime reads HSA_OVERRIDE_GFX_VERSION during that
+same device/topology discovery step (confirmed against the real ROCR-Runtime
+source: libhsakmt/src/topology.c reads the env var while building each GPU
+node's properties). A previous version of this docstring claimed
+get_arch_list() was side-effect-free "compiled metadata only" -- that was
+wrong: torch.cuda.get_arch_list() calls is_available() internally as a gate,
+so calling it BEFORE setting the env var can genuinely cause the override to
+be read too late and silently not take effect on real hardware.
+
+Fixed by having get_torch_arch_list() (below) call
+torch._C._cuda_getArchFlags() directly instead of the public
+get_arch_list() wrapper. That private call really is side-effect-free: the
+arch list is compile-time metadata baked into the wheel, with no device or
+driver interaction, so reading it doesn't trigger cuInit()/hipInit() and the
+auto-detect path's ordering (detect arch -> read torch's compiled list ->
+set HSA_OVERRIDE_GFX_VERSION, all before anything the trainer does actually
+touches the device) is now genuinely safe, not just lazy-by-luck. If you want
+a path that avoids importing torch at all before the env var is set, use
 --gfx-override (the force-override path imports no torch at all).
 
 WHAT THIS DOES NOT DO
@@ -97,11 +111,13 @@ def detect_gfx_arch():
     except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         pass
 
-    # 2. /sys/class/kfd/*/name
-    kfd_dir = "/sys/class/kfd"
-    if os.path.isdir(kfd_dir):
-        for entry in sorted(os.listdir(kfd_dir)):
-            name_path = os.path.join(kfd_dir, entry, "name")
+    # 2. /sys/class/kfd/topology/nodes/*/name — the amdkfd driver exposes
+    # per-node name files here (NOT /sys/class/kfd/<entry>/name, which are
+    # just "version" and "topology" — a common mistake).
+    kfd_nodes = "/sys/class/kfd/topology/nodes"
+    if os.path.isdir(kfd_nodes):
+        for entry in sorted(os.listdir(kfd_nodes)):
+            name_path = os.path.join(kfd_nodes, entry, "name")
             try:
                 with open(name_path) as f:
                     name = f.read().strip()
@@ -117,9 +133,34 @@ def detect_gfx_arch():
 def get_torch_arch_list():
     """Import torch and return its compiled-in arch list (e.g.
     ['sm_90', 'gfx900', 'gfx1100', ...]). Returns None if torch can't import
-    or has no CUDA/ROCm build."""
+    or has no CUDA/ROCm build.
+
+    Deliberately calls torch._C._cuda_getArchFlags() directly instead of the
+    public torch.cuda.get_arch_list() wrapper -- this is a real correctness
+    fix, not a style choice. get_arch_list() internally gates on
+    is_available(), and is_available()'s own docstring says it calls
+    cudaGetDeviceCount(), "which in turn initializes the CUDA Driver API via
+    cuInit()" (same mechanism under ROCm's HIP/HSA translation). Checked
+    against the real ROCR-Runtime source (libhsakmt/src/topology.c): HSA
+    reads HSA_OVERRIDE_GFX_VERSION during topology/device discovery, which
+    happens at that same driver-init step -- so calling get_arch_list() (and
+    therefore is_available()) BEFORE HSA_OVERRIDE_GFX_VERSION is set can
+    genuinely cause the override to be read too late and silently not take
+    effect, not just "technically imprecise but harmless in practice."
+    _cuda_getArchFlags() is compile-time metadata (the arch list baked into
+    the wheel at build time) with no device/driver interaction at all -- it's
+    the actually side-effect-free call this module needs. Falls back to the
+    public get_arch_list() if the private attribute isn't there (e.g. a torch
+    build where it's been renamed/removed) -- that fallback is a best-effort
+    path that reintroduces the early-init risk, so it's not the primary path
+    and is only reached on a torch internals change worth knowing about
+    anyway (the fallback still returns valid data, it just loses the ordering
+    guarantee on that one build)."""
     try:
         import torch
+        if hasattr(torch, "_C") and hasattr(torch._C, "_cuda_getArchFlags"):
+            arch_flags = torch._C._cuda_getArchFlags()
+            return arch_flags.split() if arch_flags else []
         if hasattr(torch.cuda, "get_arch_list"):
             return torch.cuda.get_arch_list()
     except Exception:

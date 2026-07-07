@@ -76,10 +76,22 @@ import shutil
 from expand_model import (
     INIT_SCALE,
     clone_layer_tensors,
-    log,
+    log as _expand_model_log,
     orthogonal_pad,
     write_sharded,
 )
+
+
+def log(msg: str):
+    """Thin wrapper around expand_model.log() with this file's OWN prefix.
+    Fix for a real bug: mtp_head.py used to import expand_model.log()
+    directly and call it unmodified, so every mtp_head.py --selftest / CLI
+    run printed "[expand_model] ..." lines -- confusing when debugging
+    mtp_head.py specifically, since the two are independently-runnable tools.
+    Deliberately NOT a second copy of the print/flush logic -- just supplies
+    the one thing that needs to differ (the prefix) to the shared helper."""
+    _expand_model_log(msg, prefix="mtp_head")
+
 
 DEFAULT_MTP_DEPTHS = 2
 DEFAULT_MTP_LOSS_WEIGHT = 0.3
@@ -288,12 +300,24 @@ def main():
     log("copied source checkpoint files (weights + index rewritten below)")
 
     # Overwrite weights + index with the merged (base + MTP) set.
-    write_sharded(merged, args.dst, args.max_shard_bytes)
+    write_sharded(merged, args.dst, args.max_shard_bytes, log_prefix="mtp_head")
 
-    # Update config.json.
-    cfg.setdefault("text_config", {})
-    cfg["text_config"]["mtp_depths"] = args.mtp_depths
-    cfg["text_config"]["mtp_loss_weight"] = args.mtp_loss_weight
+    # Update config.json. Write through `tc` -- the SAME nested-or-flat
+    # reference the read side already resolved above (`tc = cfg.get("text_config",
+    # cfg)`) -- not cfg["text_config"] unconditionally. Regression fix: the old
+    # code always did cfg.setdefault("text_config", {}) here regardless of
+    # whether the source config was nested (Gemma-4) or flat (Llama/Mistral/
+    # Qwen). On a flat config that meant `tc IS cfg` on the read side, but the
+    # write side still created a brand-new, disconnected `text_config` dict
+    # containing ONLY mtp_depths/mtp_loss_weight -- reproduced end-to-end in
+    # review with a synthetic flat Llama-style checkpoint: hidden_size/
+    # num_hidden_layers/etc. stayed at the top level while mtp_depths ended up
+    # isolated one level down, a structurally inconsistent config.json that
+    # doesn't crash but is silently wrong. Writing through `tc` keeps the
+    # output in the same single namespace the rest of the config already
+    # lives in, on both nested and flat inputs.
+    tc["mtp_depths"] = args.mtp_depths
+    tc["mtp_loss_weight"] = args.mtp_loss_weight
     # auto_map wires AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)
     # to a custom modeling class. REQUIRES modeling_custom.py (defining
     # CustomForCausalLM with MTP modules consuming the keys above) to exist

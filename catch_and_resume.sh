@@ -260,8 +260,21 @@ while true; do
 "rolling back to the better checkpoint instead of compounding a bad patch."
             rm -rf "$SAVE"
             if ! cp -r "$best_dir" "$SAVE"; then
-                echo "[autoresume] ERROR: rollback copy failed — $SAVE is now empty/missing. " \
-"Next launch will restart from --model (step 0). Check disk space."
+                # Hard-stop, don't limp on: $SAVE is now empty/missing (the rm -rf
+                # above already ran), and letting the loop continue to the next
+                # relaunch would mean train_cpt.py finds no training_state.pt and
+                # silently restarts from --model at step 0 -- discarding the ENTIRE
+                # loss-tagged history this rollback exists to protect, not just the
+                # one bad checkpoint it was trying to roll back from. That's a much
+                # worse outcome than stopping and making the disk-space (or
+                # permissions) problem visible immediately.
+                echo "[autoresume] FATAL: rollback copy failed — $SAVE is now empty/missing " \
+"after rm -rf (best_dir=$best_dir). Refusing to continue: the next relaunch would " \
+"silently restart from --model (step 0), discarding all training progress instead of " \
+"just the regressed checkpoint. Check disk space / permissions on $(dirname "$SAVE") " \
+"and $HISTORY_DIR, then restore a checkpoint into $SAVE manually (e.g. 'cp -r " \
+"$best_dir $SAVE') before re-running this script." >&2
+                exit 1
             fi
         fi
     fi

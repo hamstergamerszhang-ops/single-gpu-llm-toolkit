@@ -179,6 +179,8 @@ def main():
             log("fp8 inference enabled (torchao float8 weight-only quantization)")
         except ImportError:
             log("WARNING: torchao not installed, using bf16")
+        except Exception as e:
+            log(f"WARNING: fp8 inference failed ({e}) — using bf16")
     if args.flash_attn:
         try:
             import flash_attn  # noqa: F401 — just checking it's importable

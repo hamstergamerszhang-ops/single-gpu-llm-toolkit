@@ -84,6 +84,7 @@ utilities" section for what each one solves on its own.
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -112,6 +113,22 @@ def lr_at_step(step: int, total_steps: int, base_lr: float,
     cosine = 0.5 * (1 + math.cos(math.pi * progress))
     floor = base_lr * min_lr_ratio
     return floor + (base_lr - floor) * cosine
+
+
+# ── throughput / MFU estimation ─────────────────────────────────────────────
+
+def estimate_step_tflops(n_trainable_params: int, n_tokens: int, step_time_s: float) -> float:
+    """Rough achieved TFLOPs/s for one optimizer step.
+
+    Uses the standard ~6*N*T heuristic (2 FLOPs/param/token forward + 4 backward)
+    for a causal LM. `n_tokens` should be the total tokens processed across all
+    micro-batches in the step (including padding — exact for packed sequences).
+    Returns achieved TFLOPs/s; divide by your GPU's bf16 peak to get MFU.
+    """
+    if step_time_s <= 0:
+        return 0.0
+    # 6 FLOPs per parameter per token; /1e12 -> TFLOPs/s.
+    return (6.0 * n_trainable_params * n_tokens) / step_time_s / 1e12
 
 
 # ── checkpoint I/O (atomic local write, no cloud dependency) ─────────────────
@@ -373,14 +390,18 @@ def _apply_fp8(model):
     """Convert linear layers to float8_e4m3fn via torchao's Float8Linear.
     MI300X/MI325X have native fp8 compute — this roughly 2x throughput vs bf16
     on those cards. Falls back to bf16 (no-op) with a warning if torchao isn't
-    installed or the conversion fails, so --dtype fp8 never crashes a run that
-    would otherwise work."""
+    installed or the conversion fails. NOTE: the fallback covers conversion-time
+    errors only — if the conversion succeeds but the card lacks fp8 hardware,
+    the failure surfaces at the first forward pass (torch._scaled_mm), not here.
+    Only use --dtype fp8 on MI300X/MI325X (gfx942) or cards with confirmed fp8
+    support."""
     try:
         from torchao.float8 import convert_to_float8_training
         convert_to_float8_training(model)
         print("[cpt] fp8 training enabled (torchao Float8Linear, float8_e4m3fn) — "
-              "~2x throughput expected on MI300X/MI325X (native fp8 compute). "
-              "Falls back to bf16 matmul internally on cards without fp8 hardware.")
+              "use only on MI300X/MI325X (gfx942) or cards with confirmed fp8 "
+              "support. If the card lacks fp8 hardware, the first forward pass "
+              "will crash (torch._scaled_mm has no kernel).")
         return model
     except ImportError:
         print("[cpt] WARNING: --dtype fp8 but torchao not installed — falling back "
@@ -426,6 +447,10 @@ def _apply_flash_attn(model):
         print("[cpt] WARNING: --flash-attn but flash-attn not installed — using "
               "standard attention. Install with 'pip install flash-attn "
               "--no-build-isolation' on a ROCm box.", file=sys.stderr)
+    except Exception as e:
+        print(f"[cpt] WARNING: --flash-attn failed ({e}) — using standard "
+              f"attention. This can happen if the architecture doesn't support "
+              f"FA2, or if flash-attn was built for the wrong gfx arch.", file=sys.stderr)
 
 
 def _apply_compile(model, mode: str = "max-autotune", dynamic: bool = False):
@@ -453,6 +478,36 @@ def _apply_compile(model, mode: str = "max-autotune", dynamic: bool = False):
 
 
 
+
+
+def unwrap_ddp(model):
+    """Returns the underlying model if `model` is DDP-wrapped, else `model`
+    itself unchanged. Duck-typed on the class name (not isinstance) so this
+    stays importable/testable without a torch.distributed process group --
+    same convention find_decoder_layers below already uses.
+
+    Why this matters (regression test for a real deadlock found in review):
+    calling the DDP wrapper's own forward() -- i.e. `model(**batch)` where
+    `model` is still the DistributedDataParallel instance -- runs
+    _pre_forward()/_post_forward(), which broadcast-syncs the module's
+    buffers (RoPE's non-persistent inv_freq, among others) as a COLLECTIVE
+    operation whenever require_forward_param_sync is True (true right after
+    any training-step forward, independent of grad mode). If only rank 0
+    ever makes that forward call -- e.g. a held-out eval loop gated on
+    `is_main` -- every other rank never joins that collective, and the
+    process group hangs (or, as reproduced with a real 2-process gloo job in
+    review, crashes with a protocol desync error instead). Calling
+    `unwrap_ddp(model)(**batch)` -- the raw nn.Module, not the DDP wrapper --
+    triggers none of DDP's hooks and therefore no collective at all, so a
+    rank-0-only forward call (checkpointing, eval) is always safe. Confirmed
+    against torch's own DistributedDataParallel source that no_sync() does
+    NOT help here: it only flips require_backward_grad_sync (gradient
+    all-reduce on backward()), and buffer sync is gated on a separate flag
+    checked in the forward pre-hook, unaffected by no_sync().
+    """
+    if type(model).__name__ == "DistributedDataParallel":
+        return model.module
+    return model
 
 
 def find_decoder_layers(model):
@@ -633,11 +688,10 @@ def main():
                     dest="accum",
                     help="Gradient accumulation steps. Default 1 (no accumulation). "
                          "Loss is divided by this value so gradients average over the "
-                         "accumulated micro-batches. Under --ddp, every micro-batch still "
-                         "triggers its own gradient all-reduce (no DDP no_sync() "
-                         "optimization on the non-final micro-batches) -- correct, but "
-                         "not the fastest possible implementation; fine for the "
-                         "single-GPU case this repo targets.")
+                         "accumulated micro-batches. Under --ddp, the non-final "
+                         "micro-batches use DDP no_sync() to skip redundant gradient "
+                         "all-reduces -- only the last micro-batch's backward syncs, "
+                         "which is the correct and fast implementation.")
     ap.add_argument("--lr", type=float, default=8e-7)
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--max-seq-len", type=int, default=2048)
@@ -741,6 +795,13 @@ def main():
     if not (args.model and args.save and (args.data or args.cpt_cache)):
         ap.error("--model and --save are required, plus one of --data or --cpt-cache, "
                  "unless --selftest is given.")
+
+    # Validate accumulation: range(accum) is empty for accum <= 0, which would
+    # leave `loss` as None and crash at loss.item() in the logging block. Catch
+    # it here with a clear message instead.
+    if args.accum < 1:
+        ap.error("--accum / --gradient-accumulation-steps must be >= 1 "
+                 f"(got {args.accum}).")
 
     # ROCm env bootstrap: MUST run before `import torch`. On AMD consumer/older
     # cards (RDNA1/2, gfx803, etc.) whose arch isn't in the torch wheel's
@@ -1034,6 +1095,13 @@ def main():
               "background thread, training does not wait for them except at exit")
     last_valid_loss = None  # carried into checkpoint extra_state for catch_and_resume rollback
 
+    # Trainable param count for MFU/throughput estimation (computed once; cheap).
+    n_trainable = sum(p.numel() for p in trainable_params)
+    # Reset peak memory so the first reported VRAM number reflects steady-state
+    # allocation, not one-off setup (compile, fp8 conversion, model load).
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     # Profiling: wrap the training loop in torch.profiler if --profile is set.
     # The trace includes ROCm/HIP kernel launches and is viewable in
     # chrome://tracing or Perfetto. For deeper kernel-level profiling, wrap the
@@ -1075,7 +1143,14 @@ def main():
             # holding accum separate loss tensors alive for an "average" that
             # would need its own explicit accumulation anyway.
             last_loss = None
-            for _ in range(args.accum):
+            step_tokens = 0
+            if is_main and torch.cuda.is_available():
+                step_start = time.time()
+            # Hoisted out of the micro-batch loop: the wrapper type doesn't
+            # change between micro-batches, so checking once is correct and
+            # avoids a per-micro-batch isinstance() call.
+            is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+            for micro in range(args.accum):
                 if stream_gen is not None:
                     batch_rows = [next(stream_gen) for _ in range(args.batch)]
                 else:
@@ -1085,11 +1160,27 @@ def main():
                     examples = pack_examples(examples, args.max_seq_len)
                 batch = collate(examples, tokenizer.pad_token_id)
                 batch = {k: v.to(device) for k, v in batch.items()}
+                step_tokens += batch["input_ids"].numel()
 
-                outputs = model(**batch)
-                loss = outputs.loss
-                last_loss = loss
-                (loss / args.accum).backward()
+                # DDP optimization: skip the gradient all-reduce on every
+                # micro-batch except the last. Without this, DDP all-reduces
+                # after EACH backward -- with accumulation that's accum-1
+                # redundant all-reduces per step, a real throughput hit on
+                # MI300X multi-GPU. no_sync() defers the sync to the final
+                # micro-batch's backward. No-op outside DDP.
+                no_sync_ctx = (model.no_sync() if is_ddp and micro < args.accum - 1
+                               else contextlib.nullcontext())
+                with no_sync_ctx:
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    if loss is None:
+                        raise RuntimeError(
+                            "model returned loss=None -- ensure labels are present "
+                            "in the batch (the collator should always pass them)")
+                    last_loss = loss
+                    # Scale by 1/accum so summed micro-batch grads equal the
+                    # average-loss gradient (standard accumulation semantics).
+                    (loss / args.accum).backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -1097,19 +1188,55 @@ def main():
 
             if profiler is not None:
                 profiler.step()
-    
+
+            # Throughput / VRAM logging (rank 0). Computed cheaply every step
+            # but only printed/written at the logging cadence below.
+            step_tps = step_peak_vram_gb = step_tflops = step_ms = None
+            if is_main and torch.cuda.is_available():
+                step_ms = (time.time() - step_start) * 1000
+                step_tps = step_tokens / max(step_ms / 1000, 1e-9)
+                step_peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9
+                step_tflops = estimate_step_tflops(n_trainable, step_tokens, step_ms / 1000)
+
             # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
             if it % 10 == 0 or it == args.iters:
                 if is_main:
-                    print(f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}")
+                    msg = f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}"
+                    if step_tps is not None:
+                        msg += (f"  {step_tps:,.0f} tok/s  step={step_ms:.0f}ms"
+                                f"  vram={step_peak_vram_gb:.1f}GB  {step_tflops:.0f} TFLOPs/s")
+                    print(msg)
             if tb_writer is not None and is_main and it % 10 == 0:
                 tb_writer.add_scalar("train/loss", loss.item(), it)
                 tb_writer.add_scalar("train/lr", lr, it)
+                if step_tps is not None:
+                    tb_writer.add_scalar("train/tokens_per_s", step_tps, it)
+                    tb_writer.add_scalar("train/step_ms", step_ms, it)
+                    tb_writer.add_scalar("train/peak_vram_gb", step_peak_vram_gb, it)
+                    tb_writer.add_scalar("train/achieved_tflops", step_tflops, it)
     
             # Held-out eval at eval_every intervals (rank 0 only — the eval forward
             # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
-            if valid_rows is not None and is_main and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
-                vloss = run_eval(model, valid_rows, builder, tokenizer, args.max_seq_len,
+            # Under --ddp with eval_every != checkpoint_every, rank 0 can be inside
+            # run_eval while other ranks reach the next step's backward all-reduce
+            # and block (or time out). Barrier here on eval steps so all ranks wait
+            # for rank 0's eval to finish. (On non-eval steps this is skipped;
+            # the barrier at the checkpoint step below covers the checkpoint case.)
+            do_eval = (valid_rows is not None and is_main
+                       and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP))
+            if args.ddp and valid_rows is not None and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
+                torch.distributed.barrier()
+            if do_eval:
+                # Unwrap DDP for eval (see unwrap_ddp()'s docstring above for the
+                # full reasoning): calling the DDP wrapper's own forward() here
+                # would trigger a rank-0-only collective buffer broadcast that
+                # the other ranks (which never call run_eval, gated by is_main
+                # above) never join -- a real deadlock, reproduced with a real
+                # 2-process gloo job during review. The barrier above still
+                # matters for the separate rank-lag race it documents;
+                # unwrapping here is what stops the eval forward itself from
+                # being a rank-0-only collective.
+                vloss = run_eval(unwrap_ddp(model), valid_rows, builder, tokenizer, args.max_seq_len,
                                  args.batch, device, args.pack, tokenizer.pad_token_id)
                 last_valid_loss = vloss
                 print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
@@ -1123,8 +1250,9 @@ def main():
             # enter barrier() while others proceed to the next step's all-reduce).
             # Instead, ranks only barrier on scheduled checkpoint/final-iter steps,
             # where they already synchronize via the backward all-reduce. A SIGTERM
-            # on a non-checkpoint step sets _SHOULD_STOP, which triggers checkpoint +
-            # exit on the NEXT checkpoint-boundary step (when the barrier fires).
+            # on ANY step sets _SHOULD_STOP, which triggers checkpoint + exit on
+            # the CURRENT step (the checkpoint condition below includes _SHOULD_STOP
+            # independently of the barrier), so no next-step all-reduce is needed.
             if args.ddp and (it % args.checkpoint_every == 0 or it == args.iters):
                 torch.distributed.barrier()
     
@@ -1136,7 +1264,7 @@ def main():
                 # Unwrap DDP for checkpointing: save_pretrained / state_dict need the
                 # underlying model, not the DDP wrapper (which prefixes keys with
                 # "module." and has no save_pretrained).
-                save_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                save_model = unwrap_ddp(model)
                 # When resuming, the latest modeling_custom.py lives in the checkpoint
                 # dir (the user may have updated it there). For a fresh run, copy it
                 # from the original --model path.

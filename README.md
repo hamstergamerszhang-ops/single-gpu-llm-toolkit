@@ -33,6 +33,57 @@ more and running bigger batches. Standard ROCm/PyTorch throughout — nothing
 here calls out to an MI300X-only code path. It happens to have been built
 and run on one MI300X; there's nothing in it that ties it there.
 
+Here's what that actually buys you, concretely, instead of just abstractly:
+you don't have to choose between "fits in memory" and "actually trains all
+the weights." `--start`/`--end` freeze everything outside a layer window
+(`apply_window_freeze()` in `train_cpt.py`), so a card that can't hold
+gradients + optimizer state for the whole model can still do real,
+full-parameter training on a slice of it — no LoRA, no adapters, no
+low-rank approximation standing in for the actual weights, just less of
+the model unfrozen at once. Combine that with gradient checkpointing (on
+by default) and the 8-bit-Adam-with-AdamW-fallback optimizer
+(`bnb_optimizer.py`) and the same lever works in both directions: freeze
+more and shrink the batch on a smaller card, or unfreeze everything and
+run it wide on an 80GB+ one.
+
+The other half of "actually usable on hardware that isn't a managed
+cluster" is what happens when the run dies. `train_cpt.py` checkpoints
+every `--checkpoint-every` steps (500 by default) to local disk, and the
+write itself is atomic — `async_checkpoint.py` builds the new checkpoint
+in a temp directory, then does two `os.replace()` calls (retire the live
+checkpoint to `.prev`, promote the temp dir to live), so a `kill -9` or a
+host reset mid-write can never leave you with a half-written, unreadable
+checkpoint; worst case it lands you on `.prev`, the last *good* one, not
+a corrupt new one. On restart, `train_cpt.py` doesn't need a `--resume`
+flag or you to remember a step number — it just checks whether
+`<save_dir>/training_state.pt` exists and picks up from there
+automatically. Practically: if your box resets mid-run, what you lose is
+whatever training happened since the last checkpoint boundary — at most
+`--checkpoint-every` steps of work, not the run. That number is steps, not
+minutes, on purpose — how long 500 steps takes depends on your model size,
+batch, and card, so there's no honest single wall-clock figure to give you
+here; if you want one for your own setup, `benchmark.py` reports
+step time directly, or just watch `train_cpt.py`'s own iter logging.
+
+That resume mechanism is passive, though — it makes coming back from a
+crash cheap, it doesn't do the coming-back for you. `catch_and_resume.sh`
+is the part that does: it's a supervisor loop that actually relaunches
+`train_cpt.py` after any exit (crash, OOM-kill, preemption) and keeps
+doing so until the target iteration count is reached, a stop-file shows
+up, or the same-position-retry cap is hit (so a genuinely broken config
+doesn't retry forever, silently burning GPU-hours on a run that was never
+going to succeed). It also keeps a loss-tagged checkpoint history and
+rolls back to the best one on a loss regression, so a bad data patch
+doesn't get compounded checkpoint after checkpoint. `oom_guard.sh` is
+narrower and honest about it: it only watches memory and VRAM and sends a
+clean `SIGTERM` before a hard OOM can take the driver down with it — it
+does not relaunch anything itself. Run it standalone and a killed
+training process just stays dead; pair it with `catch_and_resume.sh` and
+the two together give you the actual unattended story: guard kills
+cleanly before real damage, checkpoint is already safe on disk from the
+SIGTERM handler, supervisor notices the exit and brings training back up
+on its own.
+
 Model-family lock-in got the same treatment, and it's worth being precise
 about where that claim actually stands rather than rounding it up. Every
 model-specific constant that used to be hardcoded — the embedding tensor's
@@ -302,7 +353,14 @@ codebase's own hardware" until you've run it yourself:
   or the card lacks fp8 hardware.
 - **`--compile`** — `torch.compile()` with ROCm's inductor backend for kernel
   fusion + graph optimization. First few steps are slower (compilation), then
-  faster. Falls back to eager mode if compilation fails.
+  faster. Falls back to eager mode if compilation fails. With `--pack` (fixed
+  sequence lengths), `dynamic=False` is used to avoid recompilation thrash;
+  without `--pack`, dynamic shapes are enabled so variable-length inputs work.
+- **`--compile-mode <mode>`** — selects the `torch.compile` mode: `default`,
+  `reduce-overhead`, or `max-autotune` (default). `max-autotune` spends more
+  time upfront autotuning but yields the best steady-state ROCm throughput;
+  `reduce-overhead` is better for small models or short runs. Ignored unless
+  `--compile` is set.
 - **`--profile <dir>`** — `torch.profiler` trace (viewable in
   `chrome://tracing` or Perfetto) including ROCm/HIP kernel launches. For
   kernel-level profiling beyond torch.profiler, wrap the run with
@@ -328,11 +386,10 @@ codebase's own hardware" until you've run it yourself:
   `backward()`, so the accumulated gradient matches what a real batch of
   size `batch * accum` would have produced (verified against a real
   minimal-model repro, not just asserted). Default `1` (no accumulation,
-  identical to the pre-`--accum` behavior). Under `--ddp`, every micro-batch
-  still triggers its own gradient all-reduce — correct, but not the
-  `no_sync()`-optimized version; fine for the single-GPU case this repo
-  targets, worth revisiting if you're actually running this across multiple
-  GPUs.
+  identical to the pre-`--accum` behavior). Under `--ddp`, the non-final
+  micro-batches run inside `model.no_sync()`, so only the last micro-batch's
+  backward triggers the gradient all-reduce — `N` micro-batches cost one
+  all-reduce, not `N`.
 
 These flags are designed to compose (`--ddp --flash-attn --dtype fp8
 --compile` on a multi-GPU MI300X box), but that combination specifically has
@@ -689,8 +746,10 @@ few caught in code review this pass:
   non-exotic layout (plenty of tokenizers put a special token at 0). Use
   `x if x is not None else fallback` for anything where the falsy-but-valid
   value is in play — found this exact bug live in `generate.py` during
-  review, sitting right next to the correct `is not None` version of the
-  same check in `benchmark.py`.
+  review and fixed it there with the `is not None` form. (`benchmark.py`
+  doesn't have this check at all — it drives the model with synthetic
+  `torch.randint` token ids for timing, not real generation, so there's no
+  pad/eos logic in it to get wrong.)
 - **Prefer the public `set_attn_implementation()` API over poking
   `model.config._attn_implementation` directly, when it's available.** The
   private attribute doesn't reliably propagate to nested sub-configs — a

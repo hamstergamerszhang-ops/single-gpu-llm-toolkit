@@ -145,8 +145,16 @@ MAX_SHARD_BYTES = 5 * 1024**3
 DEFAULT_GQA_KV_HEADS = 8  # matches sliding-attention layers' existing kv head count
 
 
-def log(msg: str):
-    print(f"[expand_model] {msg}", flush=True)
+def log(msg: str, prefix: str = "expand_model"):
+    """Prints a `[prefix] msg` line. `prefix` defaults to this module's own
+    name so every existing `log(...)` call in this file is unaffected.
+    mtp_head.py reuses this function (rather than duplicating a second
+    logging helper) but needs its OWN prefix -- it was calling this log()
+    unmodified and every mtp_head.py --selftest / CLI run printed
+    "[expand_model] ..." lines, which is confusing when debugging mtp_head.py
+    specifically. See mtp_head.log() below for the one-line wrapper that
+    supplies prefix="mtp_head"."""
+    print(f"[{prefix}] {msg}", flush=True)
 
 
 def build_depth_plan(orig_layers: int, depth_step: int, interleave_every: int):
@@ -334,7 +342,13 @@ def clone_layer_tensors(tensors: dict, src_prefix: str, dst_prefix: str,
     return new_entries
 
 
-def write_sharded(tensors: dict, dst: str, max_shard_bytes: int):
+def write_sharded(tensors: dict, dst: str, max_shard_bytes: int, log_prefix: str = None):
+    """log_prefix lets a caller from a DIFFERENT tool (mtp_head.py reuses this
+    function rather than duplicating a sharded-writer) get its own log lines
+    instead of every "wrote shard ..." / "wrote index.json ..." line printing
+    "[expand_model]" regardless of who actually called it. Default None means
+    "use log()'s own default prefix" -- expand_model.py's own caller (below)
+    is unaffected."""
     os.makedirs(dst, exist_ok=True)
     items = list(tensors.items())
 
@@ -366,12 +380,14 @@ def write_sharded(tensors: dict, dst: str, max_shard_bytes: int):
         total_size += size
         for key in shard:
             weight_map[key] = fname
-        log(f"wrote shard {fname} ({size/1024**3:.2f}GB, {len(shard)} tensors)")
+        _log_kwargs = {"prefix": log_prefix} if log_prefix else {}
+        log(f"wrote shard {fname} ({size/1024**3:.2f}GB, {len(shard)} tensors)", **_log_kwargs)
 
     index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
     with open(os.path.join(dst, "model.safetensors.index.json"), "w") as f:
         json.dump(index, f, indent=2)
-    log(f"wrote index.json -- {n_shards} shards, {total_size/1024**3:.2f}GB total")
+    _log_kwargs = {"prefix": log_prefix} if log_prefix else {}
+    log(f"wrote index.json -- {n_shards} shards, {total_size/1024**3:.2f}GB total", **_log_kwargs)
 
 
 def main():
@@ -426,12 +442,17 @@ def main():
         raise SystemExit(f"ERROR: {src_cfg_path} not found")
     with open(src_cfg_path) as f:
         cfg = json.load(f)
-    tc = cfg["text_config"]
+    # Support both nested (Gemma-4: text_config) and flat (Llama/Mistral/Qwen)
+    # config layouts. mtp_head.py uses the same .get() fallback pattern.
+    tc = cfg.get("text_config", cfg)
 
     orig_layers = tc["num_hidden_layers"]
     orig_intermediate = tc["intermediate_size"]
     hidden = tc["hidden_size"]
-    layer_types = tc["layer_types"]
+    # layer_types is Gemma-4-specific (full_attention/sliding_attention). Most
+    # architectures don't have it — default to all "full_attention" so the
+    # depth-plan and GQA logic treats every layer uniformly.
+    layer_types = tc.get("layer_types", ["full_attention"] * orig_layers)
 
     width_step = args.width_step
     depth_step = args.depth_step
@@ -468,11 +489,26 @@ def main():
     gqa_applied = False
     if args.gqa_kv_heads > 0:
         old_kv_heads = tc.get("num_global_key_value_heads", 1)
-        global_head_dim = tc.get("global_head_dim", tc["head_dim"])
+        # .get(...) all the way down -- NOT tc["head_dim"] -- because "no
+        # head_dim key at all" must flow into the same safe-skip path as any
+        # other layout mismatch, not raise a raw KeyError before
+        # detect_mqa_v_shares_k_layout() even gets a chance to run. Confirmed
+        # via a real Qwen2Config().to_dict() that head_dim is genuinely absent
+        # on that architecture (it's derived internally, not serialized) --
+        # this is a real, reachable case, not a hypothetical one.
+        global_head_dim = tc.get("global_head_dim", tc.get("head_dim"))
         full_attn_idxs = [i for i in range(orig_layers) if layer_types[i] == "full_attention"]
 
-        matches, reason = detect_mqa_v_shares_k_layout(tensors, full_attn_idxs, args.layer_prefix,
-                                                       global_head_dim, old_kv_heads)
+        if global_head_dim is None:
+            matches, reason = False, (
+                "config has neither 'global_head_dim' nor 'head_dim' -- can't "
+                "compute the expected k_proj/v_proj shape for the MQA layout "
+                "check, so refusing to guess (this is expected on architectures "
+                "like Qwen2, whose config doesn't serialize head_dim at all)"
+            )
+        else:
+            matches, reason = detect_mqa_v_shares_k_layout(tensors, full_attn_idxs, args.layer_prefix,
+                                                           global_head_dim, old_kv_heads)
         if not matches and not args.force_gqa_fix:
             log(f"Pass 1/3: SKIPPED -- checkpoint doesn't match the assumed MQA layout ({reason}). "
                 f"This fix is a narrow, Gemma-4-specific optimization for checkpoints that ship "
@@ -481,6 +517,21 @@ def main():
                 f"v_proj or misshape k_proj. Pass --force-gqa-fix to override this check (only if "
                 f"you've verified the layout yourself), or --gqa-kv-heads 0 to silence this.")
         else:
+            if global_head_dim is None:
+                # --force-gqa-fix was passed but there's still no usable head_dim
+                # to compute shapes from -- gqa_expand_kv() below does
+                # old_kv_heads * head_dim arithmetic and would raise a confusing
+                # TypeError deep inside a tensor-shape computation. Force-fix
+                # means "override the layout check," not "override having a
+                # head_dim at all" -- fail clearly here instead.
+                raise SystemExit(
+                    "ERROR: --force-gqa-fix was set, but the config has neither "
+                    "'global_head_dim' nor 'head_dim' -- there's no way to compute "
+                    "the expected tensor shape at all, forcing past the layout "
+                    "check can't help here. Pass --gqa-kv-heads 0 to skip the GQA "
+                    "fix, or add a 'head_dim' key to the checkpoint's config.json "
+                    "if you know the real value."
+                )
             if not matches:
                 log(f"Pass 1/3: WARNING -- --force-gqa-fix set, applying GQA fix despite a failed "
                     f"layout check ({reason}). This is very likely to corrupt weights or crash. "
@@ -530,29 +581,39 @@ def main():
     actual_total = sum(v.numel() for v in final_tensors.values())
     log(f"actual total params: {actual_total/1e9:.2f}B")
 
-    cfg["text_config"]["intermediate_size"] = new_intermediate
-    cfg["text_config"]["num_hidden_layers"] = new_layers
-    cfg["text_config"]["layer_types"] = new_layer_types
+    # Write through tc (which is either cfg["text_config"] or cfg itself,
+    # depending on whether the config was nested or flat). This avoids creating
+    # a spurious text_config dict on flat configs (Llama/Mistral/Qwen).
+    tc["intermediate_size"] = new_intermediate
+    tc["num_hidden_layers"] = new_layers
+    tc["layer_types"] = new_layer_types
 
     if gqa_applied:
-        # attention_k_eq_v=False disables the MQA shortcut for every layer -> KV
-        # heads fall back to the real (now-expanded) count, and v_proj is no longer
-        # skipped -- exactly matching the fresh v_proj weights gqa_expand_kv() just
-        # wrote. One flag flip covers all (now-GQA) full-attention layers uniformly.
-        # Gated on gqa_applied (not args.gqa_kv_heads > 0) -- if the layout-detection
-        # check skipped the fix, this config flag must NOT flip either, or the
-        # written config would claim a GQA layout that the tensors don't actually have.
-        cfg["text_config"]["attention_k_eq_v"] = False
-        # Write the new kv-head count so a downstream loader knows how many
-        # KV heads the (now-expanded) full-attention layers have. Without this,
-        # the config still says num_global_key_value_heads=1 (the MQA value)
-        # while the tensors have args.gqa_kv_heads heads -> shape mismatch on load.
+        # attention_k_eq_v=False disables the MQA shortcut (V reusing K) for
+        # every layer, so v_proj is materialized independently -- matching the
+        # fresh v_proj weights gqa_expand_kv() wrote for the full-attention
+        # layers. Gated on gqa_applied (not args.gqa_kv_heads > 0) -- if the
+        # layout-detection check skipped the fix, this config flag must NOT
+        # flip either, or the written config would claim a GQA layout the
+        # tensors don't actually have.
+        tc["attention_k_eq_v"] = False
+        # num_global_key_value_heads governs the FULL-attention layers, which
+        # are the only layers gqa_expand_kv() touched -- so updating it to the
+        # new head count is correct.
         if "num_global_key_value_heads" in tc:
-            cfg["text_config"]["num_global_key_value_heads"] = args.gqa_kv_heads
-        if "num_key_value_heads" in tc:
-            cfg["text_config"]["num_key_value_heads"] = args.gqa_kv_heads
+            tc["num_global_key_value_heads"] = args.gqa_kv_heads
+        # DO NOT overwrite num_key_value_heads: that field governs the
+        # SLIDING-attention layers, whose k_proj/v_proj tensors were NOT
+        # expanded (gqa_expand_kv only iterates full_attn_idxs). Overwriting
+        # it with args.gqa_kv_heads would create a config/tensor shape
+        # mismatch for every sliding layer whenever args.gqa_kv_heads differs
+        # from the sliding layers' original head count. The default
+        # --gqa-kv-heads happens to equal the sliding count, which is why this
+        # bug was latent -- but any other value would crash at load.
         log(f"GQA fix applied: attention_k_eq_v -> False, "
-            f"full-attention layers now use {args.gqa_kv_heads} real kv heads (was MQA=1, V=K)")
+            f"full-attention layers now use {args.gqa_kv_heads} real kv heads "
+            f"(was MQA=1, V=K). num_key_value_heads (sliding layers) left "
+            f"unchanged -- sliding layers were not expanded.")
 
     os.makedirs(args.dst, exist_ok=True)
     with open(os.path.join(args.dst, "config.json"), "w") as f:

@@ -66,16 +66,26 @@ def _move_to_cpu(obj):
 
     Tuples are preserved because some optimizer states store shape tuples or
     small namedtuples. Objects with a .cpu() method (e.g. bitsandbytes custom
-    state containers) are moved via that method as a fallback."""
+    state containers) are moved via that method as a fallback -- deepcopy'd
+    after the move so the snapshot is independent of the live state."""
+    import copy
     import torch
     if torch.is_tensor(obj):
         return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
         return {k: _move_to_cpu(v) for k, v in obj.items()}
+    # Namedtuples: __new__ takes one positional arg per field, so type(obj)(gen)
+    # crashes on multi-field namedtuples. Use _make (the documented way to build
+    # a namedtuple from an iterable).
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+        return type(obj)._make(_move_to_cpu(v) for v in obj)
     if isinstance(obj, (list, tuple)):
         return type(obj)(_move_to_cpu(v) for v in obj)
     if hasattr(obj, "cpu") and callable(obj.cpu):
-        return obj.cpu()
+        # .cpu() may return self (no device move needed) or a shallow wrapper
+        # sharing tensor storage -- neither is safe for a snapshot that must
+        # outlive the next optimizer.step(). deepcopy forces independence.
+        return copy.deepcopy(obj.cpu())
     return obj
 
 
@@ -326,6 +336,23 @@ def _self_test():
     assert moved["b"][1]["c"].device.type == "cpu"
     assert moved["d"][0].device.type == "cpu"
     assert isinstance(moved["d"], tuple), "tuple type should be preserved"
+    print("  OK")
+
+    print("[selftest] _move_to_cpu reconstructs namedtuples via _make (not type(gen))")
+    from collections import namedtuple
+    Point = namedtuple("Point", ["x", "y"])
+    nt = Point(torch.randn(2), torch.randn(2))
+    moved_nt = _move_to_cpu(nt)
+    assert isinstance(moved_nt, Point), "namedtuple type should be preserved"
+    assert moved_nt.x.device.type == "cpu"
+    assert moved_nt.y.device.type == "cpu"
+    # The single-field case (which silently stored the generator before the fix):
+    Single = namedtuple("Single", ["v"])
+    st = Single(torch.randn(2))
+    moved_st = _move_to_cpu(st)
+    assert isinstance(moved_st, Single)
+    assert torch.is_tensor(moved_st.v), "single-field namedtuple must not store the generator"
+    assert moved_st.v.device.type == "cpu"
     print("  OK")
 
     print("\n[selftest] All checks passed (no GPU required -- run a real checkpoint "

@@ -58,8 +58,12 @@ def build_optimizer(trainable_params, lr: float, weight_decay: float = 0.01):
         # time if the installed wheel lacks HIP kernels. Catch any construction
         # error, not just ImportError, and fall back cleanly.
         import torch
+        # foreach=None (the default) lets PyTorch auto-select the vectorized
+        # foreach path when the param dtypes support it (bf16 on CUDA/ROCm) and
+        # fall back to the for-loop otherwise. Forcing foreach=True would raise
+        # at step() on unsupported dtypes (e.g. fp8), with no fallback.
         optimizer = torch.optim.AdamW(
-            trainable_params, lr=lr, weight_decay=weight_decay, foreach=True
+            trainable_params, lr=lr, weight_decay=weight_decay, foreach=None
         )
         print(f"[bnb_optimizer] WARNING: bitsandbytes 8-bit Adam unavailable "
               f"({type(e).__name__}: {e}) -- falling back to torch.optim.AdamW "

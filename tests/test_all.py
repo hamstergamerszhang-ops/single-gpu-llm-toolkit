@@ -63,6 +63,45 @@ def test_resume_does_not_restart_warmup():
             f"k={k}: absolute {absolute_lr} should differ from relative {relative_lr}"
 
 
+def test_unwrap_ddp_passes_through_plain_module():
+    """unwrap_ddp() must return non-DDP models unchanged -- the single-GPU
+    (no --ddp) path, which is the default and must be a complete no-op."""
+    import torch
+    from train_cpt import unwrap_ddp
+
+    model = torch.nn.Linear(4, 4)
+    assert unwrap_ddp(model) is model
+
+
+def test_unwrap_ddp_unwraps_ddp_duck_typed():
+    """Regression test for a real DDP deadlock found in review: train_cpt.py's
+    held-out eval loop called run_eval(model, ...) where `model` could still be
+    the DistributedDataParallel wrapper. Calling the wrapper's own forward()
+    from rank 0 only (run_eval is gated on `is_main`) triggers a collective
+    buffer-broadcast in DDP's _pre_forward() that other ranks never join --
+    reproduced with a real 2-process torch.distributed (gloo) job during
+    review: the wrapped-forward version crashed with a gloo protocol desync
+    error, the model.module-unwrapped version completed cleanly on both ranks
+    and didn't break the next real training step's all-reduce either.
+    unwrap_ddp() is duck-typed on the class name (not isinstance), matching
+    find_decoder_layers()'s existing convention, so this test builds a fake
+    class named exactly "DistributedDataParallel" rather than requiring a real
+    torch.distributed process group just to check the unwrap logic."""
+    import torch
+    from train_cpt import unwrap_ddp
+
+    inner = torch.nn.Linear(4, 4)
+
+    class DistributedDataParallel:  # noqa: N801 -- name must match exactly for the duck-type check
+        def __init__(self, module):
+            self.module = module
+
+    wrapped = DistributedDataParallel(inner)
+    assert unwrap_ddp(wrapped) is inner
+    # And a real (non-DDP) module of some OTHER class name must still pass through.
+    assert unwrap_ddp(inner) is inner
+
+
 def test_gradient_accumulation_matches_single_larger_batch():
     """Regression test for a real bug: train_cpt.py's --accum /
     --gradient-accumulation-steps flag was added with a docstring describing
@@ -422,6 +461,146 @@ def test_detect_mqa_layout_no_full_attention_layers():
     assert matches is False
 
 
+def _write_qwen2_style_checkpoint(root: Path, with_head_dim: bool):
+    """Builds a real, on-disk, flat (non-nested) Qwen2-shaped checkpoint:
+    config.json with no 'text_config' key and (optionally) no 'head_dim' key
+    (verified against a real Qwen2Config().to_dict() during the review that
+    Qwen2 configs genuinely omit head_dim -- it's derived internally, not
+    serialized), plus safetensors weights with a REAL v_proj on every layer
+    (Qwen2 always has one -- this is NOT the Gemma-4 MQA 'V reuses K' layout)."""
+    import torch
+    from safetensors.torch import save_file
+
+    hidden, kv_heads, head_dim, n_layers = 64, 2, 8, 2
+    cfg = {
+        "model_type": "qwen2",
+        "hidden_size": hidden,
+        "num_hidden_layers": n_layers,
+        "intermediate_size": 128,
+        "num_attention_heads": 8,
+        "num_key_value_heads": kv_heads,
+    }
+    if with_head_dim:
+        cfg["head_dim"] = head_dim
+    with open(root / "config.json", "w") as f:
+        json.dump(cfg, f)
+
+    tensors = {}
+    for i in range(n_layers):
+        p = f"model.language_model.layers.{i}.self_attn"
+        tensors[f"{p}.q_proj.weight"] = torch.randn(8 * head_dim, hidden)
+        tensors[f"{p}.k_proj.weight"] = torch.randn(kv_heads * head_dim, hidden)
+        tensors[f"{p}.v_proj.weight"] = torch.randn(kv_heads * head_dim, hidden)
+        tensors[f"{p}.o_proj.weight"] = torch.randn(hidden, 8 * head_dim)
+        mp = f"model.language_model.layers.{i}.mlp"
+        tensors[f"{mp}.gate_proj.weight"] = torch.randn(128, hidden)
+        tensors[f"{mp}.up_proj.weight"] = torch.randn(128, hidden)
+        tensors[f"{mp}.down_proj.weight"] = torch.randn(hidden, 128)
+    save_file(tensors, str(root / "model.safetensors"))
+    index = {"metadata": {"total_size": 0},
+             "weight_map": {k: "model.safetensors" for k in tensors}}
+    with open(root / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+
+def test_expand_model_gqa_missing_head_dim_skips_cleanly_not_keyerror():
+    """Regression test for a real bug found reviewing this repo: main()'s GQA
+    branch did `tc["head_dim"]` (no fallback) BEFORE detect_mqa_v_shares_k_layout()
+    got a chance to run its safety check, so any flat config missing head_dim
+    (e.g. a real Qwen2Config, confirmed via Qwen2Config().to_dict() during
+    review) crashed with a raw KeyError -- contradicting this module's own
+    docstring and the README's claim that the GQA fix 'skips cleanly with a
+    warning' on a checkpoint that doesn't match the targeted layout. Fixed by
+    resolving head_dim via .get(...) with no crash, and folding 'no head_dim
+    at all' into the same fail-closed skip path as any other layout mismatch."""
+    import sys
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_qwen2_style_checkpoint(src, with_head_dim=False)
+        dst = Path(td) / "dst"
+
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--gqa-kv-heads", "4", "--width-step", "0", "--depth-step", "0"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()  # must NOT raise KeyError -- must return normally (exit 0)
+        finally:
+            sys.argv = old_argv
+
+        # And it must actually have run to completion (config written), not
+        # silently produced nothing.
+        assert (dst / "config.json").exists()
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        # GQA fix must NOT have been applied (no head_dim -> no usable layout
+        # check -> fail closed) -- config must not claim a kv-head count change
+        # the tensors don't actually have.
+        assert "attention_k_eq_v" not in out_cfg
+        assert out_cfg.get("num_key_value_heads", 2) == 2
+
+
+def test_expand_model_gqa_force_fix_with_no_head_dim_fails_clearly():
+    """--force-gqa-fix can override a failed layout check, but must NOT be
+    able to override 'there's no head_dim to compute shapes from at all' --
+    that would crash inside gqa_expand_kv()'s tensor-shape arithmetic with a
+    confusing TypeError instead of a clear, actionable error."""
+    import sys
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_qwen2_style_checkpoint(src, with_head_dim=False)
+        dst = Path(td) / "dst"
+
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--gqa-kv-heads", "4", "--width-step", "0", "--depth-step", "0",
+                "--force-gqa-fix"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert "head_dim" in str(exc_info.value)
+        finally:
+            sys.argv = old_argv
+
+
+def test_expand_model_gqa_present_head_dim_still_applies_fix():
+    """Sanity check the fix didn't break the working case: a checkpoint that
+    DOES resolve head_dim but has a real v_proj (a genuine GQA layout, not the
+    Gemma-4 MQA-V=K one) must still be correctly detected and skipped -- same
+    outcome as the missing-head_dim case, but via the pre-existing shape/v_proj
+    check rather than the new None-guard."""
+    import sys
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_qwen2_style_checkpoint(src, with_head_dim=True)
+        dst = Path(td) / "dst"
+
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--gqa-kv-heads", "4", "--width-step", "0", "--depth-step", "0"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()  # must not raise
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        # Real v_proj present -> detect_mqa_v_shares_k_layout() correctly
+        # rejects the MQA assumption -> GQA fix skipped, not applied.
+        assert "attention_k_eq_v" not in out_cfg
+
+
 def test_clone_layer_tensors_copies_and_zeros_outputs():
     """clone_layer_tensors copies all suffix keys; zero_output_projections
     zeroes o_proj and down_proj while cloning the rest."""
@@ -660,6 +839,147 @@ def test_mtp_head_generates_correct_shapes():
     donor = tensors[f"{layer_prefix}.{num_layers - 1}.self_attn.q_proj.weight"]
     cloned = new[f"{mtp_prefix}.0.block.self_attn.q_proj.weight"]
     assert torch.equal(cloned, donor)
+
+
+def _write_flat_llama_style_checkpoint_for_mtp(root: Path):
+    """Real, on-disk, flat (no 'text_config' key) Llama-shaped checkpoint --
+    used to check mtp_head.py's config.json write path against a
+    non-Gemma-4 architecture."""
+    import torch
+    from safetensors.torch import save_file
+
+    hidden, n_layers = 64, 2
+    cfg = {
+        "model_type": "llama",
+        "hidden_size": hidden,
+        "num_hidden_layers": n_layers,
+        "intermediate_size": 128,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+    }
+    with open(root / "config.json", "w") as f:
+        json.dump(cfg, f)
+
+    tensors = {}
+    for i in range(n_layers):
+        p = f"model.language_model.layers.{i}"
+        tensors[f"{p}.self_attn.q_proj.weight"] = torch.randn(64, hidden)
+        tensors[f"{p}.self_attn.k_proj.weight"] = torch.randn(16, hidden)
+        tensors[f"{p}.self_attn.v_proj.weight"] = torch.randn(16, hidden)
+        tensors[f"{p}.self_attn.o_proj.weight"] = torch.randn(hidden, 64)
+        tensors[f"{p}.mlp.gate_proj.weight"] = torch.randn(128, hidden)
+        tensors[f"{p}.mlp.up_proj.weight"] = torch.randn(128, hidden)
+        tensors[f"{p}.mlp.down_proj.weight"] = torch.randn(hidden, 128)
+    save_file(tensors, str(root / "model.safetensors"))
+    index = {"metadata": {"total_size": 0},
+             "weight_map": {k: "model.safetensors" for k in tensors}}
+    with open(root / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+
+def test_mtp_head_flat_config_writes_single_consistent_namespace():
+    """Regression test for a real bug found reviewing this repo: mtp_head.py's
+    read side was already correctly generalized (`tc = cfg.get("text_config",
+    cfg)`), but the write side did `cfg.setdefault("text_config", {})`
+    unconditionally -- so on a flat (non-Gemma-4) config, mtp_depths/
+    mtp_loss_weight landed in a brand-new, disconnected `text_config` dict
+    while hidden_size/num_hidden_layers/etc. stayed at the top level. Fixed by
+    writing through `tc` (the same nested-or-flat reference the read side
+    already resolved) instead of cfg["text_config"] unconditionally. This test
+    asserts the output config.json for a flat input has NO text_config key at
+    all, and that mtp_depths sits in the SAME namespace as hidden_size."""
+    import sys
+    from mtp_head import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_flat_llama_style_checkpoint_for_mtp(src)
+        dst = Path(td) / "dst"
+
+        argv = ["mtp_head.py", "--src", str(src), "--dst", str(dst),
+                "--layer-prefix", "model.language_model.layers",
+                "--mtp-prefix", "model.mtp_layers", "--mtp-depths", "1"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+
+        assert "text_config" not in out_cfg, (
+            "flat input must not gain a text_config split -- got: " + str(out_cfg))
+        assert out_cfg["mtp_depths"] == 1
+        assert out_cfg["mtp_loss_weight"] == pytest.approx(0.3)
+        # The rest of the flat config must be untouched and in the same namespace.
+        assert out_cfg["hidden_size"] == 64
+        assert out_cfg["num_hidden_layers"] == 2
+
+
+def test_mtp_head_nested_config_still_nests_correctly():
+    """Sanity check the flat-config fix didn't regress the primary
+    (Gemma-4, nested text_config) target: mtp_depths/mtp_loss_weight must
+    still land INSIDE the existing text_config dict, alongside the rest of
+    the model's real config, not at the top level."""
+    import sys
+    import torch
+    from safetensors.torch import save_file
+    from mtp_head import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        hidden = 64
+        cfg = {
+            "model_type": "gemma4",
+            "text_config": {
+                "hidden_size": hidden,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_global_key_value_heads": 1,
+                "head_dim": 8,
+                "layer_types": ["full_attention", "sliding_attention"],
+            },
+        }
+        with open(src / "config.json", "w") as f:
+            json.dump(cfg, f)
+        tensors = {}
+        for i in range(2):
+            p = f"model.language_model.layers.{i}"
+            tensors[f"{p}.self_attn.q_proj.weight"] = torch.randn(64, hidden)
+            tensors[f"{p}.self_attn.k_proj.weight"] = torch.randn(8, hidden)
+            tensors[f"{p}.self_attn.o_proj.weight"] = torch.randn(hidden, 64)
+            tensors[f"{p}.mlp.gate_proj.weight"] = torch.randn(128, hidden)
+            tensors[f"{p}.mlp.up_proj.weight"] = torch.randn(128, hidden)
+            tensors[f"{p}.mlp.down_proj.weight"] = torch.randn(hidden, 128)
+        save_file(tensors, str(src / "model.safetensors"))
+        index = {"metadata": {"total_size": 0},
+                 "weight_map": {k: "model.safetensors" for k in tensors}}
+        with open(src / "model.safetensors.index.json", "w") as f:
+            json.dump(index, f)
+
+        dst = Path(td) / "dst"
+        argv = ["mtp_head.py", "--src", str(src), "--dst", str(dst),
+                "--layer-prefix", "model.language_model.layers",
+                "--mtp-prefix", "model.mtp_layers", "--mtp-depths", "1"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+
+        assert "mtp_depths" not in out_cfg, "must NOT leak to the top level on a nested config"
+        assert out_cfg["text_config"]["mtp_depths"] == 1
+        assert out_cfg["text_config"]["hidden_size"] == hidden
 
 
 # ── preprocess_data.py ──────────────────────────────────────────────────────
