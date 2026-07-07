@@ -1,6 +1,6 @@
 # gemma-mi300x-prune-cpt
 
-Twelve real, independently-runnable tools (ten Python + two shell) for
+Fourteen real, independently-runnable tools (twelve Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
 multi-node cluster, no distributed training framework. They came out of
 actually doing this once, for real: shrinking a tokenizer, growing a model,
@@ -10,6 +10,14 @@ unreachable mid-run) and fixing each one for real instead of writing around
 it. Every script here is real, run code, not a from-scratch rewrite for this
 repo — core training logic unchanged; refactored into standalone modules
 and parameterized into CLI flags.
+
+**A note before you go further, since it's the kind of thing worth saying up
+front instead of burying:** this repo's own real runs all use full-parameter
+fine-tuning (`train_cpt.py`), not LoRA. There's a `lora_train.py` here too,
+and it's a real, working script — but it's offered as an option for people
+who specifically want LoRA's memory/storage tradeoffs, not because it's what
+this repo recommends. If you skip straight to the tools list below, that
+framing is repeated there in the same terms, not softened.
 
 None of this is pinned to one GPU. There's no device-name check, no
 architecture branch, no hardcoded VRAM figure anywhere in the source —
@@ -48,12 +56,16 @@ different single-GPU problem on its own. The canonical pipeline order, if
 you use them together, is:
 
 ```
-prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py
+prune_vocab.py → prune_embeddings_torch.py → expand_model.py → [mtp_head.py] → train_cpt.py / train_sft.py
 ```
 
 Skip whichever steps you don't need — pruning, expansion, and MTP are all
 independently optional, and training directly against an unmodified base
-checkpoint is a completely normal way to use `train_cpt.py` on its own.
+checkpoint is a completely normal way to use `train_cpt.py` (or
+`train_sft.py`, its SFT-only alias — see below) on its own. `lora_train.py`
+can substitute for that last step too, if you specifically want LoRA
+instead of full-parameter training; it's covered in its own section further
+down, framed the same way it should be: an option, not the recommendation.
 
 ## Table of Contents
 
@@ -64,6 +76,8 @@ checkpoint is a completely normal way to use `train_cpt.py` on its own.
   - [`expand_model.py`](#expand_modelpy--grow-a-models-width-and-depth-without-retraining-from-scratch)
   - [`mtp_head.py`](#mtp_headpy--add-a-multi-token-prediction-head)
   - [`train_cpt.py`](#train_cptpy--continued-pretraining-single-gpu)
+  - [`train_sft.py`](#train_sftpy--the-sft-only-name-for-train_cptpy)
+  - [`lora_train.py`](#lora_trainpy--lora-via-peft-offered-not-recommended)
   - [`catch_and_resume.sh`](#catch_and_resumesh--keep-a-single-gpu-run-alive-across-crashes)
   - [Standalone utilities](#standalone-utilities)
   - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
@@ -301,6 +315,97 @@ codebase's own hardware" until you've run it yourself:
 These flags are designed to compose (`--ddp --flash-attn --dtype fp8
 --compile` on a multi-GPU MI300X box), but that combination specifically has
 not been run end-to-end here either.
+
+## `train_sft.py` — the SFT-only name for `train_cpt.py`
+
+Here's a thing worth being direct about: `train_cpt.py` already does SFT.
+It's the default mode — omit `--cpt` and you get chat-template tokenization
+with assistant-turn-only loss masking (`build_sft_example()`, described
+above). So why does a second file exist? Purely so that scanning this
+repo's file list — `ls`, a GitHub file browser, whatever — actually shows
+both a CPT tool and an SFT tool without making someone open `train_cpt.py`
+and read its docstring to learn the two are the same file behind a flag.
+That's the entire job of `train_sft.py`: a thin wrapper that rewrites its
+own argv into the equivalent `train_cpt.py` invocation and calls
+`train_cpt.main()` directly — no second training loop, no second copy of
+`build_sft_example()`, nothing that could drift out of sync with the real
+implementation. It also refuses `--cpt` outright with a clear error rather
+than silently accepting it, since accepting it would defeat the point of a
+separately-named SFT entry point. Every other `train_cpt.py` flag —
+checkpointing, DDP, flash-attn, compile, fp8, gfx override — passes through
+unchanged.
+
+```
+python3 train_sft.py --model <checkpoint> --data <jsonl_dir_or_file> --save <out_dir> --batch 1
+```
+
+`train_sft.py --selftest` runs its own argv-rewrite/refusal logic first,
+then delegates straight to `train_cpt.py`'s real `self_test()` — so the
+actual SFT logic is tested exactly once, in exactly one place, same as it's
+implemented.
+
+## `lora_train.py` — LoRA via `peft`, offered, not recommended
+
+Say this first, because it's the part that matters most if you're skimming:
+**this repo's own real runs all use full-parameter fine-tuning
+(`train_cpt.py` / `train_sft.py`), and that's still the recommended path
+here.** `lora_train.py` exists because some developers specifically want
+LoRA for its memory and storage tradeoffs — a much smaller optimizer
+footprint, adapter checkpoints in the tens of MB instead of tens of GB —
+not because it's a better default. The honest tradeoff, stated plainly in
+both directions: LoRA needs less VRAM and produces much smaller checkpoints,
+but only updates a small low-rank slice of the weight space, which
+generally adapts a model less than full fine-tuning does for the same data
+and step count. Full-parameter training updates every weight and is what
+this repo's own engineering narrative — the OOM war stories, the
+batch/seqlen tradeoffs, everything in the Tips section — is actually based
+on. If your GPU can afford full-parameter training (this repo's whole
+premise is that a single 80GB+ AMD GPU usually can), that's still the
+better default; reach for `lora_train.py` when you specifically want the
+memory/storage win badly enough to accept weaker adaptation for it.
+
+Built on `peft.LoraConfig` / `peft.get_peft_model` — HuggingFace's own,
+widely-tested LoRA implementation — rather than hand-rolled low-rank math,
+because reimplementing that math here would just be a second, less-tested
+copy of something `peft` already gets right. `--target-modules` defaults to
+the same q/k/v/o_proj + gate/up/down_proj submodule names the rest of this
+repo already targets, checked the same way `expand_model.py`'s tensor-suffix
+generalization was checked — against the installed `transformers` library's
+own modeling source, confirmed real for Llama, Mistral, Qwen2, Qwen3, and
+every Gemma generation (see `expand_model.py`'s docstring for the full
+verified exceptions list; point `--target-modules` at your own architecture's
+real submodule names if it's one of those exceptions). Reuses
+`train_cpt.py`'s data loading, tokenization, masking, collation, and eval
+functions directly (`load_jsonl`, `build_sft_example` / `build_cpt_example`,
+`collate`, `pack_examples`, `run_eval`, `lr_at_step`) rather than
+duplicating them — same "no duplicated logic" rule as everywhere else in
+this repo. What it does NOT reuse, because it doesn't apply to LoRA: the
+layer-window freeze/unfreeze logic (`peft` already restricts trainable
+parameters to the adapter, so there's no separate freeze-window concept),
+the atomic full-checkpoint rename dance (adapter saves are small enough
+that `peft`'s own `save_pretrained` is a reasonable checkpoint unit on its
+own), and DDP/fp8/torch.compile (out of scope for what's meant to be a
+lighter-weight path — full-scale multi-GPU training is `train_cpt.py --ddp`).
+
+```
+python3 lora_train.py --model <checkpoint> --data <jsonl_dir_or_file> --save <out_dir> \
+    --iters 2000 --lora-r 16 --lora-alpha 32
+
+# Also merge the adapter into the base weights and save a full standalone
+# checkpoint (bigger on disk, loadable with plain
+# AutoModelForCausalLM.from_pretrained(), no peft import required):
+python3 lora_train.py --model <checkpoint> --data <jsonl_dir_or_file> --save <out_dir> --merge-and-save
+```
+
+`lora_train.py --selftest` builds a tiny *real* Llama-architecture model via
+`transformers` (Llama is one of the confirmed-matching architectures for
+the default target modules), wraps it with a real `peft.LoraConfig`, and
+runs an actual forward pass, backward pass, adapter save, adapter reload
+onto a fresh base model, and `merge_and_unload()` — checking at each step
+that gradients land only on LoRA parameters, that the reloaded adapter
+weights match exactly what was saved, and that the merged model has zero
+`lora_` keys left. No GPU required; needs `peft` installed (see
+`requirements.txt`).
 
 ## `catch_and_resume.sh` — keep a single-GPU run alive across crashes
 
@@ -581,9 +686,19 @@ push/PR.
 # Run all self-tests + pytest locally (CPU-only):
 for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          local_cache_stream.py optimizer_compat_guard.py \
-         rocm_env.py mtp_head.py; do python3 "$f" --selftest; done
+         rocm_env.py mtp_head.py lora_train.py train_sft.py; do
+  python3 "$f" --selftest
+done
 pytest tests/ -v
 ```
+
+`lora_train.py --selftest` needs `peft` installed (`pip install peft`, or
+just `pip install -r requirements.txt`); it builds a tiny real
+`transformers` model and runs real `peft` calls against it rather than
+mocking either library out. `train_sft.py --selftest` checks its own
+argv-rewrite logic and then delegates straight to `train_cpt.py`'s real
+`self_test()` — no separate SFT-logic test exists because there's no
+separate SFT-logic implementation to test.
 
 `.gitignore` keeps the usual local-only noise (`.venv/`, `__pycache__/`,
 `.pytest_cache/`, `.DS_Store`) and `config.env` specifically — the file
@@ -613,6 +728,11 @@ bakes in a ROCm torch + all deps):
   `pip install flash-attn --no-build-isolation`; falls back to standard attention)
 - `torchao` (optional; for `--dtype fp8` — fp8 training on MI300X/MI325X; falls
   back to bf16 if absent)
+- `peft` (only needed for `lora_train.py` — confirmed working against `0.19.1`,
+  the current real PyPI release at the time this was written, checked via
+  `pip index versions peft`, not guessed. `train_cpt.py` / `train_sft.py`
+  don't import it at all; you don't need it unless you're specifically
+  reaching for LoRA)
 
 `requirements.txt` lists tested-known-good versions for convenience, not as a
 strict constraint — if your ROCm stack needs a different torch, override it.
