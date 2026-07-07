@@ -17,8 +17,3 @@ bitsandbytes>=0.43.0  # optional: 8-bit Adam optimizer (falls back to AdamW if a
 tensorboard>=2.14.0   # optional: --tb logging (not bundled with torch; warns + stdout-only if absent)
 flash-attn>=2.5.0     # optional: --flash-attn (build from source on ROCm: pip install flash-attn --no-build-isolation)
 torchao>=0.5.0        # optional: --dtype fp8 (fp8 training on MI300X/MI325X; falls back to bf16 if absent)
-peft==0.19.1          # optional: only needed by lora_train.py. train_cpt.py / train_sft.py
-                      # (full-parameter fine-tuning, the recommended path here) don't import
-                      # it at all. Version pinned to the current real PyPI release, checked
-                      # via `pip index versions peft` and confirmed working end-to-end in
-                      # this repo's own venv, not guessed.
