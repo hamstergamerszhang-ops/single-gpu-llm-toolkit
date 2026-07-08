@@ -1,6 +1,6 @@
 # single-gpu-llm-toolkit
 
-Sixteen independently-runnable tools (fourteen Python + two shell) for
+Nineteen independently-runnable tools (seventeen Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
 multi-node cluster, no distributed training framework. The pipeline covers
 the full path from a base checkpoint to a trained one: shrink a tokenizer,
@@ -351,17 +351,55 @@ is for:
   `torch.distributed` harness (no real multi-GPU ROCm cluster in the loop);
   run your own convergence check the first time you point it at a real
   multi-GPU box.
+- **`--fsdp`** — multi-GPU training via `FullyShardedDataParallel` (FSDP).
+  Unlike `--ddp` (which replicates the full model on every GPU), FSDP
+  **shards** params + grads + optimizer state across GPUs — so a model too
+  large for one MI300X (e.g. a 27B+ model) can be trained across a node of
+  them. FSDP also avoids the `find_unused_parameters=True` hazard that `--ddp`
+  hits with windowed `--start`/`--end` freezing (FSDP handles frozen params
+  natively). Launch with `torchrun --nproc_per_node=N train_cpt.py --fsdp
+  ...`. Checkpoint saving gathers the full (unsharded) state dict to rank 0
+  via `FSDP.state_dict_type(..., FULL_STATE_DICT)` before writing, so saved
+  checkpoints are standard HF format and loadable on a single GPU. Use
+  `--sharding-strategy` to control the shard granularity:
+  - `full` (default, `FULL_SHARD`): shards params+grads+optimizer state.
+    Maximum memory savings, most communication.
+  - `shard-grad-op` (`SHARD_GRAD_OP`): shards grads+optimizer state only;
+    params stay replicated. Less comm overhead, more memory.
+  - `no-shard` (`NO_SHARD`): equivalent to DDP.
+  
+  Multi-node launch (FSDP or DDP):
+  ```
+  # Single-node, 8 GPUs:
+  torchrun --nproc_per_node=8 train_cpt.py --fsdp --model ... --save ...
+
+  # Multi-node (2 nodes x 8 GPUs each), using one node as rendezvous host.
+  # --rdzv-id must be the SAME on all nodes so they find each other:
+  # Node 0 (rendezvous host):
+  torchrun --nnodes=2 --nproc_per_node=8 --rdzv-backend=c10d \
+      --rdzv-endpoint=node0:29500 --rdzv-id=cpt-multinode \
+      train_cpt.py --fsdp --model ... --save ...
+  # Node 1 (identical command, same --rdzv-id and --rdzv-endpoint):
+  torchrun --nnodes=2 --nproc_per_node=8 --rdzv-backend=c10d \
+      --rdzv-endpoint=node0:29500 --rdzv-id=cpt-multinode \
+      train_cpt.py --fsdp --model ... --save ...
+  ```
+  FSDP requires `use_reentrant=False` gradient checkpointing (set
+  automatically when `--fsdp` is used); the reentrant variant is
+  incompatible with FSDP's forward hooks. `--fsdp` and `--ddp` are mutually
+  exclusive.
 - **`--accum N`** (alias `--gradient-accumulation-steps`) — accumulate
   gradients over `N` micro-batches of size `--batch` before each optimizer
   step, giving an effective batch size of `batch * accum` without the extra
   VRAM a literally-larger `--batch` would need. Each micro-batch's loss is
   divided by `N` before `backward()`, so the accumulated gradient matches
   what a real batch of size `batch * accum` would produce. Default `1` (no
-  accumulation). Under `--ddp`, the non-final micro-batches run inside
-  `model.no_sync()`, so only the last micro-batch's backward triggers the
-  gradient all-reduce — `N` micro-batches cost one all-reduce, not `N`.
+  accumulation). Under `--ddp` or `--fsdp`, the non-final micro-batches run
+  inside `model.no_sync()`, so only the last micro-batch's backward triggers
+  the gradient sync (all-reduce for DDP, reduce-scatter+all-gather for FSDP)
+  — `N` micro-batches cost one sync, not `N`.
 
-These flags compose (`--ddp --flash-attn --dtype fp8 --compile` on a
+These flags compose (`--fsdp --flash-attn --dtype fp8 --compile` on a
 multi-GPU MI300X box); `benchmark.py` is the way to measure what that
 combination actually gets you on your own hardware before committing a long
 run to it.
@@ -478,6 +516,54 @@ Ctrl+D to exit) or batch mode (`--input prompts.txt`, one prompt per line).
 
 ```
 python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
+```
+
+## `compress_model.py` — quantize any model (int8/int4/fp8)
+
+Takes any HuggingFace-format checkpoint and produces a quantized version using
+torchao. Supports int8 (~2x smaller, no quality loss), int4 (~4x smaller,
+minimal loss), and fp8 (~2x smaller, best on MI300X). All three work on ANY
+AMD card — the weights are dequantized to bf16 for the matmul, so no special
+hardware is required (fp8 gets native-speed matmuls on MI300X/MI325X, but
+still works on everything else). Auto-detects nested (Gemma-4) vs flat
+(Llama/Mistral/Qwen) config layouts.
+
+```
+python3 compress_model.py --src ./checkpoints/base_15b --dst ./checkpoints/base_15b_int4
+```
+
+## `tensor_parallel.py` — auto-detect multi-GPU, run with pipeline parallelism
+
+Detects how many AMD GPUs are available and distributes the model across them
+using an explicit, layer-balanced device map (pipeline parallelism — different
+layers on different GPUs, with activations passed between them). On a node of
+identical GPUs (e.g. 8x MI300X), this balanced split is better than HF's
+`device_map="auto"` greedy memory fit, which can leave one GPU underloaded and
+another holding the LM head + embeddings + last layers (a large pipeline
+bubble). Use `--device-map auto` to fall back to HF's automatic assignment, or
+`--device-map single` to force single-GPU. If only 1 GPU is detected, falls
+back to single-GPU generation automatically. Supports interactive prompts or
+batch mode (`--input prompts.txt`), flash attention (`--flash-attn`), and
+streaming token-by-token output. Uses `rocm_env.setup_rocm_env()` for the gfx
+override, so the "every AMD device" guarantee carries over.
+
+```
+python3 tensor_parallel.py --model ./checkpoints/base_15b
+```
+
+## `smart_hipify.py` — intelligent CUDA→HIP converter
+
+Smarter than AMD's stock `hipify-perl`. Does the same API name substitutions
+(`cudaMalloc`→`hipMalloc`, etc.) but ALSO: detects CUDA library calls
+(cuBLAS/cuDNN/cuSPARSE) that have NO drop-in HIP equivalent and flags them with
+`/* HIPIFY: TODO */` comments instead of silently producing broken code; auto-adds
+`#include <hip/hip_runtime.h>`; warns about CUDA headers with no HIP mapping;
+counts `__global__` kernels; and produces a full diff-style report of every
+change. The "smart" part is being honest about what can and can't be automated.
+
+```
+python3 smart_hipify.py --src kernel.cu --dst kernel.cpp
+python3 smart_hipify.py --src ./cuda_project/ --dst ./hip_project/ --recursive
 ```
 
 ## Standalone utilities
@@ -747,7 +833,8 @@ push/PR.
 for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          local_cache_stream.py optimizer_compat_guard.py \
          rocm_env.py mtp_head.py train_sft.py \
-         preprocess_data.py benchmark.py generate.py; do
+         preprocess_data.py benchmark.py generate.py \
+         compress_model.py tensor_parallel.py smart_hipify.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v

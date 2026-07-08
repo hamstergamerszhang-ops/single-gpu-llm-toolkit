@@ -88,6 +88,50 @@ import subprocess
 GFX_RE = re.compile(r"gfx(\d{2,4}[a-z]?)")  # matches gfx90a, gfx942, gfx803, gfx1100
 
 
+def parse_kfd_gfx_target_version(ver):
+    """Decode a raw `gfx_target_version` sysfs value (str or int) into a
+    'gfxNNN' arch string, or None if it can't be parsed / is a non-GPU node.
+
+    `gfx_target_version` is a PLAIN DECIMAL integer (not a packed hex word)
+    encoding major/minor/stepping as base-10 digit GROUPS, per AMD's own
+    rocm_agent_enumerator (readFromKFD(), amd-staging branch) -- the same
+    script `rocminfo`/ROCm itself uses to derive gfxNNN strings from this
+    exact sysfs field, so it's the canonical decode:
+        major_ver    = (device_id // 10000) % 100
+        minor_ver    = (device_id // 100)   % 100      (formatted as HEX)
+        stepping_ver = device_id % 100                  (formatted as HEX)
+        gfx string   = f"gfx{major_ver}{minor_ver:x}{stepping_ver:x}"
+    Verified against known real values: 110000->gfx1100, 90402->gfx942,
+    90010->gfx90a, 100300->gfx1030, 80003->gfx803, 120001->gfx1201.
+
+    A prior version of this parser used a bitwise `(ver_int >> 16) & 0xFF` /
+    `(ver_int >> 8) & 0xFF` byte-packing scheme, as if gfx_target_version
+    were a packed hex word -- it isn't; it's decimal. That parser produced
+    silently WRONG archs for every real value tested (e.g. 90402 decoded to
+    "gfx0111" instead of "gfx942"), which is worse than not parsing at all:
+    a wrong detected arch can drive find_override_target() to set
+    HSA_OVERRIDE_GFX_VERSION to a bogus value.
+
+    Extracted as a standalone function (rather than inlined in
+    detect_gfx_arch's file-parsing loop) so it's directly unit-testable
+    against known real values without needing to fake /sys/class/kfd.
+    """
+    try:
+        ver_int = int(ver, 16) if isinstance(ver, str) and ver.startswith("0x") else int(ver)
+    except (ValueError, TypeError):
+        return None
+    if ver_int <= 0:
+        # gfx_target_version is 0 on CPU-only KFD nodes (e.g. an APU's CPU
+        # node) -- not a GPU, nothing to parse.
+        return None
+    major_ver = (ver_int // 10000) % 100
+    minor_ver = (ver_int // 100) % 100
+    stepping_ver = ver_int % 100
+    arch_str = f"gfx{major_ver}{minor_ver:x}{stepping_ver:x}"
+    m = GFX_RE.match(arch_str)
+    return f"gfx{m.group(1)}" if m else None
+
+
 def detect_gfx_arch():
     """Probe the GPU's gfx architecture WITHOUT importing torch (so the env
     var can be set before torch runtime init). Returns a string like 'gfx1100'
@@ -111,19 +155,24 @@ def detect_gfx_arch():
     except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         pass
 
-    # 2. /sys/class/kfd/topology/nodes/*/name — the amdkfd driver exposes
-    # per-node name files here (NOT /sys/class/kfd/<entry>/name, which are
-    # just "version" and "topology" — a common mistake).
+    # 2. /sys/class/kfd/topology/nodes/*/properties — the amdkfd driver exposes
+    # per-node properties files here. The `name` file in the same directory
+    # contains the ASIC marketing codename (e.g. "navi10", "sienna_cichlid"),
+    # NOT the gfx arch string. The gfx arch is in the `properties` file as a
+    # `gfx_target_version` line; see parse_kfd_gfx_target_version() above for
+    # the decode (a real bug in an earlier version of this parser silently
+    # produced wrong archs from this field -- see that function's docstring).
     kfd_nodes = "/sys/class/kfd/topology/nodes"
     if os.path.isdir(kfd_nodes):
         for entry in sorted(os.listdir(kfd_nodes)):
-            name_path = os.path.join(kfd_nodes, entry, "name")
+            props_path = os.path.join(kfd_nodes, entry, "properties")
             try:
-                with open(name_path) as f:
-                    name = f.read().strip()
-                m = GFX_RE.match(name)
-                if m:
-                    return f"gfx{m.group(1)}"
+                with open(props_path) as f:
+                    for line in f:
+                        if line.startswith("gfx_target_version"):
+                            arch = parse_kfd_gfx_target_version(line.split()[-1])
+                            if arch:
+                                return arch
             except (OSError, IOError):
                 continue
 
@@ -426,6 +475,32 @@ def _self_test():
     # Don't hard-assert None — if this runs ON a ROCm box it'd be a real arch.
     # Just assert it's a valid gfx string or None.
     assert detected is None or GFX_RE.match(detected), detected
+
+    # parse_kfd_gfx_target_version: the real KFD sysfs decode (major*10000 +
+    # minor*100 + stepping, minor/stepping formatted as hex), verified against
+    # known real gfx_target_version values (see rocm_agent_enumerator
+    # readFromKFD()). A prior bitwise-packing version of this parser produced
+    # WRONG archs for every one of these (e.g. 90402 -> "gfx0111" instead of
+    # "gfx942") -- these assertions are the regression guard for that bug.
+    assert parse_kfd_gfx_target_version("110000") == "gfx1100", \
+        parse_kfd_gfx_target_version("110000")
+    assert parse_kfd_gfx_target_version("90402") == "gfx942", \
+        parse_kfd_gfx_target_version("90402")
+    assert parse_kfd_gfx_target_version("90010") == "gfx90a", \
+        parse_kfd_gfx_target_version("90010")
+    assert parse_kfd_gfx_target_version("100300") == "gfx1030", \
+        parse_kfd_gfx_target_version("100300")
+    assert parse_kfd_gfx_target_version("80003") == "gfx803", \
+        parse_kfd_gfx_target_version("80003")
+    assert parse_kfd_gfx_target_version("120001") == "gfx1201", \
+        parse_kfd_gfx_target_version("120001")
+    # CPU-only KFD node (gfx_target_version == 0) parses to None, not a bogus arch.
+    assert parse_kfd_gfx_target_version("0") is None
+    # Garbage/non-numeric input parses to None rather than raising.
+    assert parse_kfd_gfx_target_version("not_a_number") is None
+    assert parse_kfd_gfx_target_version(None) is None
+    print("  OK (parse_kfd_gfx_target_version decodes real KFD gfx_target_version "
+          "values correctly -- gfx1100/gfx942/gfx90a/gfx1030/gfx803/gfx1201)")
 
     # _gfx_major extracts the gfxNN prefix.
     assert _gfx_major("gfx1100") == "gfx11"

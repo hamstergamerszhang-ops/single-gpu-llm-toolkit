@@ -109,15 +109,31 @@ def stream_from_cache(cache_path: str, seed: int = 42):
     Raises RuntimeError immediately if the cache file is empty -- training
     against zero rows is a silent no-op you want to fail loudly on, not a
     generator that just never yields anything.
+
+    Malformed lines (e.g. a truncated last line from a crash mid-write) are
+    skipped with a warning rather than crashing the streamer. This makes a
+    partial cache genuinely usable even if the write was interrupted.
     """
     import random
 
     rows = []
+    malformed = 0
     with open(cache_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A truncated trailing line (crash mid-write) should not abort
+                # streaming — the rest of the cache is still usable.
+                malformed += 1
+    if malformed:
+        print(f"[local_cache_stream] WARNING: skipped {malformed} malformed "
+              f"line(s) in {cache_path} (likely a truncated last line from a "
+              f"crash mid-write). {len(rows):,} valid rows loaded.",
+              flush=True)
     if not rows:
         raise RuntimeError(f"Cache at {cache_path} is empty -- nothing to stream")
 
