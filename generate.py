@@ -75,12 +75,18 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     iterate the streamer on the calling thread — that's what we do here."""
     import queue
     from threading import Thread
+    import torch
     from transformers import TextIteratorStreamer
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     streamer = TextIteratorStreamer(
         tokenizer, skip_prompt=True, skip_special_tokens=True,
-        timeout=1.0,  # prevents deadlock if generate() raises before streamer.end()
+        # timeout=30: long enough for any realistic prefill (a 15B model with
+        # a 2k-token prompt on MI300X takes <5s), short enough to detect a
+        # genuinely dead thread. The previous 1.0s was too short — prefill on
+        # a large model or multi-GPU pipeline can exceed 1s before the first
+        # token lands, causing queue.Empty to abort streaming prematurely.
+        timeout=30.0,
     )
     gen_kwargs = build_gen_kwargs(
         inputs["input_ids"], inputs["attention_mask"], max_new_tokens,
@@ -98,7 +104,22 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
 
     def _generate_with_exc():
         try:
-            model.generate(**gen_kwargs)
+            # inference_mode belongs HERE, not around the main thread's
+            # streamer-draining loop below: torch's inference_mode/no_grad
+            # context managers are thread-local, and the actual tensor compute
+            # (model.generate) runs on THIS background thread, not the thread
+            # that entered the context manager. Wrapping the main thread's
+            # print loop (which only reads decoded strings off a queue.Queue,
+            # no tensor ops) has zero effect on the generation call itself --
+            # confirmed directly: torch.is_inference_mode_enabled() reads
+            # False inside a background thread even while the main thread is
+            # inside `with torch.inference_mode():`. HF's generate() already
+            # wraps itself in @torch.no_grad() internally, so this is a
+            # belt-and-suspenders no-op for autograd, but inference_mode also
+            # disables the version-counter bookkeeping no_grad still does,
+            # which is the actual reason to prefer it here.
+            with torch.inference_mode():
+                model.generate(**gen_kwargs)
         except Exception as e:
             thread_exc.append(e)
 
@@ -107,12 +128,15 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     thread = Thread(target=_generate_with_exc, daemon=True)
     thread.start()
     try:
+        # No inference_mode wrapper needed here -- this loop only reads
+        # decoded strings off streamer's internal queue.Queue and prints them,
+        # no tensor ops. The actual generate() call is wrapped in
+        # _generate_with_exc above, on the thread that actually runs it.
         for new_text in streamer:
             print(new_text, end="", flush=True)
-    except StopIteration:
-        pass  # streamer exhausted normally (stream_end sentinel seen)
-    except queue.Empty:
-        # TextIteratorStreamer.__next__ does
+    except (StopIteration, queue.Empty):
+        # StopIteration: streamer exhausted normally (stream_end sentinel
+        # seen). queue.Empty: TextIteratorStreamer.__next__ does
         # `self.text_queue.get(timeout=self.timeout)`, a plain queue.Queue.get
         # with a timeout -- on timeout that raises queue.Empty, NOT
         # StopIteration (confirmed against the installed transformers'
@@ -120,10 +144,9 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
         # handler only caught StopIteration, so a real timeout (e.g.
         # generate() stalls or its background thread dies without ever
         # calling streamer.end()) propagated an uncaught queue.Empty out of
-        # stream_generate() instead of being handled the same way "streamer
-        # timed out" is described in the comment above. Both cases end the
-        # same way here: stop reading the streamer and fall through to
-        # joining the thread + surfacing any real generate() exception.
+        # stream_generate() instead of being handled here. Both cases end the
+        # same way: stop reading the streamer and fall through to joining the
+        # thread + surfacing any real generate() exception.
         pass
     thread.join(timeout=5.0)  # don't hang forever if generate() is stuck
     if thread_exc:
@@ -220,6 +243,8 @@ def main():
             log("flash-attn enabled")
         except ImportError:
             log("WARNING: flash-attn not installed, using standard attn")
+        except Exception as e:
+            log(f"WARNING: --flash-attn failed ({e}) — using standard attention.")
     if args.compile:
         try:
             model = torch.compile(model)

@@ -10,9 +10,8 @@ torchao's quantization APIs. Supports multiple compression levels:
   - **int4 weight-only**: ~4x smaller, tiny quality loss. Uses torchao's
     `int4_weight_only()`. Works on ALL AMD cards.
   - **fp8 weight-only**: ~2x smaller, no quality loss. Uses torchao's
-    `float8_weight_only()`. Best throughput on MI300X/MI325X (native fp8
-    compute), but the weights are dequantized to bf16 for the matmul on other
-    cards, so it works everywhere.
+    `float8_weight_only()`. Works on all AMD cards (weights dequantize to bf16
+    for matmul; best throughput on MI300X/MI325X with native fp8 compute).
 
 The tool auto-detects the model's config layout (nested text_config for
 Gemma-4, flat for Llama/Mistral/Qwen), dtype, and architecture. It uses
@@ -57,7 +56,7 @@ QUANT_OPTIONS = {
         "import_path": "torchao.quantization",
         "import_name": "float8_weight_only",
         "size_reduction": "~2x",
-        "quality": "no loss",
+        "quality": "negligible loss",
         "hardware": "all AMD cards (best on MI300X/MI325X with native fp8)",
     },
 }
@@ -219,7 +218,7 @@ def main():
                    for f in os.listdir(args.src) if f.endswith(".safetensors"))
     dst_size = sum(os.path.getsize(os.path.join(args.dst, f))
                    for f in os.listdir(args.dst) if f.endswith(".safetensors"))
-    if src_size > 0:
+    if src_size > 0 and dst_size > 0:
         reduction = src_size / dst_size
         log(f"size: {src_size/1024**3:.2f}GB -> {dst_size/1024**3:.2f}GB "
             f"({reduction:.1f}x reduction)")

@@ -17,6 +17,15 @@ you actually want on homogeneous AMD hardware. `build_explicit_device_map()`
 produces that explicit map; the plan it returns is passed directly to
 `from_pretrained(..., device_map=plan)`.
 
+NOTE: despite the above, the CLI default is `--device-map auto` (not
+`explicit`), for maximum compatibility — `auto` works for any HF model without
+needing to detect the layer prefix. `build_explicit_device_map` now
+auto-detects the layer prefix via `get_model_info_from_config` (checking
+`model_type` for "gemma" to pick `model.language_model.layers` vs the standard
+`model.layers`), so `--device-map explicit` works for both Gemma-4 and
+standard Llama/Mistral/Qwen layouts on homogeneous nodes where you want the
+balanced split.
+
 Pipeline parallelism (not tensor parallelism) is used because it works for ANY
 HF model without architecture-specific sharding code. True tensor parallelism
 (splitting each layer's weights across GPUs with all-gather) requires
@@ -47,7 +56,6 @@ Self-test (no GPU required — exercises GPU detection logic + device map builde
 
 import argparse
 import os
-import sys
 
 
 def log(msg: str):
@@ -80,19 +88,37 @@ def get_model_info_from_config(cfg_path: str) -> dict:
 
     Also detects the layer prefix: Gemma-4 uses "model.language_model.layers"
     (Gemma4ForConditionalGeneration wraps a Gemma4Model whose .language_model
-    holds the decoder), while standard Llama/Mistral/Qwen use "model.layers".
-    The detection checks for a "language_model" key in the text_config.
+    holds the decoder), while standard Llama/Mistral/Qwen AND every other real
+    Gemma generation (Gemma2, Gemma3/Gemma3-text) use flat "model.layers". The
+    detection checks model_type against the two known Gemma-4 spellings
+    (see prune_vocab.py's model_type normalization for why there are two).
     """
     import json
     with open(cfg_path) as f:
         cfg = json.load(f)
     tc = cfg.get("text_config", cfg)
-    # Detect layer prefix: if text_config has a "language_model" sub-dict, the
-    # model is a Gemma-4-style wrapper and layers are at
-    # model.language_model.layers. Otherwise standard model.layers.
-    if "language_model" in tc:
-        layer_prefix = "model.language_model.layers"
-    elif "language_model" in cfg:
+    # Detect layer prefix: Gemma-4 (model_type "gemma4", or "gemma4_unified"
+    # before prune_vocab.py's normalization runs) wraps the decoder under
+    # model.language_model (Gemma4ForConditionalGeneration -> Gemma4Model ->
+    # .language_model -> Gemma4TextModel holding the decoder layers).
+    #
+    # IMPORTANT: this must NOT be a `model_type.startswith("gemma")` prefix
+    # match. Verified directly against the installed transformers library:
+    # real Gemma2 (model_type="gemma2") and real Gemma3-text
+    # (model_type="gemma3_text") both use FLAT model.layers with no
+    # language_model wrapper at all (`hasattr(Gemma2ForCausalLM(...).model,
+    # "language_model")` is False for both) -- only Gemma-4 nests. A prefix
+    # match would silently misroute every real Gemma2/Gemma3 checkpoint to a
+    # device_map with keys that don't exist on the model, which either
+    # silently drops those layers from the map or crashes from_pretrained
+    # depending on the transformers version. We check model_type rather than
+    # a "language_model" config key because real Gemma-4 configs flatten
+    # text_config params without a nested "language_model" sub-dict -- the
+    # prefix comes from the module structure, not the config JSON. This
+    # matches expand_model.py and mtp_head.py, which both default to
+    # "model.language_model.layers" for Gemma-4.
+    model_type = cfg.get("model_type", "")
+    if model_type in ("gemma4", "gemma4_unified"):
         layer_prefix = "model.language_model.layers"
     else:
         layer_prefix = "model.layers"
@@ -317,12 +343,16 @@ def main():
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
     ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
-    ap.add_argument("--device-map", type=str, default="explicit",
+    ap.add_argument("--device-map", type=str, default="auto",
                     choices=["explicit", "auto", "single"],
-                    help="How to distribute the model across GPUs. 'explicit' "
-                         "(default) builds a layer-balanced device map — best on "
-                         "homogeneous AMD nodes (8x MI300X). 'auto' uses HF's "
-                         "device_map='auto' (greedy memory fit). 'single' forces "
+                    help="How to distribute the model across GPUs. 'auto' "
+                         "(default) uses HF's device_map='auto' (greedy memory "
+                         "fit) — the safe default that works with any module "
+                         "layout. 'explicit' builds a layer-balanced device map "
+                         "— best on homogeneous AMD nodes (8x MI300X). The "
+                         "explicit map auto-detects the layer prefix (standard "
+                         "model.layers or Gemma-4's model.language_model.layers), "
+                         "so it works for both layouts. 'single' forces "
                          "single-GPU even if multiple are detected.")
     ap.add_argument("--num-gpus", type=int, default=None,
                     help="Override the auto-detected GPU count (e.g. use only 4 "
@@ -359,11 +389,16 @@ def main():
 
     if args.dry_run:
         if plan.get("device_map") and isinstance(plan["device_map"], dict):
+            # Build the key names from the detected layer_prefix so this works
+            # for both standard ("model.layers") and Gemma-4 ("model.language_model.layers") layouts.
+            pfx = plan.get("layer_prefix", "model.layers")
+            base = pfx.rsplit(".layers", 1)[0]  # "model" or "model.language_model"
+            n_layers = model_info.get("num_layers") or 0
+            last = n_layers - 1 if n_layers else "?"
             log(f"  device_map ({len(plan['device_map'])} entries): "
-                f"embed_tokens->GPU {plan['device_map'].get('model.embed_tokens')}, "
-                f"layer0->GPU {plan['device_map'].get('model.layers.0')}, "
-                f"layer{model_info.get('num_layers', 0)-1 if model_info.get('num_layers') else '?'}"
-                f"->GPU {plan['device_map'].get(f'model.layers.{(model_info.get('num_layers') or 1)-1}')}, "
+                f"{base}.embed_tokens->GPU {plan['device_map'].get(f'{base}.embed_tokens')}, "
+                f"{pfx}.0->GPU {plan['device_map'].get(f'{pfx}.0')}, "
+                f"{pfx}.{last}->GPU {plan['device_map'].get(f'{pfx}.{last}')}, "
                 f"lm_head->GPU {plan['device_map'].get('lm_head')}")
         log("DRY RUN — nothing run.")
         return
@@ -376,6 +411,7 @@ def main():
             prompts = [line.strip() for line in f if line.strip()]
         for p in prompts:
             log(f"prompt: {p[:80]}{'...' if len(p) > 80 else ''}")
+            # NOTE: model is reloaded per prompt; for many prompts, refactor to load once.
             run_tensor_parallel(args.model, num_gpus, archs, p,
                                args.max_new_tokens, args.temperature, args.top_p,
                                args.gfx_override, args.hip_alloc_conf,
@@ -460,8 +496,58 @@ def _self_test():
     assert info["hidden_size"] == 4096
     assert info["num_layers"] == 32
     assert info["vocab_size"] == 256000
+    assert info["layer_prefix"] == "model.language_model.layers", \
+        f"gemma4 should detect model.language_model.layers, got {info['layer_prefix']}"
     os.unlink(cfg_path)
-    print("  OK (get_model_info_from_config: nested text_config parsed correctly)")
+    print("  OK (get_model_info_from_config: gemma4 -> layer_prefix=model.language_model.layers)")
+
+    # get_model_info_from_config: non-gemma model_type -> model.layers.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump({"model_type": "llama", "text_config": {"hidden_size": 4096,
+                   "num_hidden_layers": 32, "vocab_size": 32000}}, f)
+        cfg_path = f.name
+    info = get_model_info_from_config(cfg_path)
+    assert info["layer_prefix"] == "model.layers", \
+        f"llama should detect model.layers, got {info['layer_prefix']}"
+    os.unlink(cfg_path)
+    print("  OK (get_model_info_from_config: llama -> layer_prefix=model.layers)")
+
+    # get_model_info_from_config: REAL Gemma2/Gemma3-text model_types must NOT
+    # get the language_model prefix -- only Gemma-4 nests under
+    # model.language_model. Verified directly against the installed
+    # transformers library: Gemma2ForCausalLM and Gemma3ForCausalLM (text-only)
+    # both expose a flat `.model.layers`, no `.model.language_model` at all.
+    # A `model_type.startswith("gemma")` prefix match (a real bug caught and
+    # fixed while reviewing this file) would have wrongly routed both of these
+    # to model.language_model.layers, producing a device_map with keys that
+    # don't exist on the actual model.
+    for real_model_type in ("gemma2", "gemma3_text", "gemma3", "gemma"):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"model_type": real_model_type, "text_config": {
+                       "hidden_size": 4096, "num_hidden_layers": 32,
+                       "vocab_size": 32000}}, f)
+            cfg_path = f.name
+        info = get_model_info_from_config(cfg_path)
+        assert info["layer_prefix"] == "model.layers", (
+            f"real model_type={real_model_type!r} should detect flat "
+            f"model.layers (only gemma4/gemma4_unified nest), got "
+            f"{info['layer_prefix']}"
+        )
+        os.unlink(cfg_path)
+    print("  OK (get_model_info_from_config: real gemma2/gemma3 model_types "
+          "correctly stay on flat model.layers, NOT misrouted by a "
+          "startswith('gemma') prefix match)")
+
+    # build_explicit_device_map with gemma4 prefix (model.language_model.layers).
+    dm = build_explicit_device_map(8, 2, layer_prefix="model.language_model.layers")
+    assert dm["model.language_model.embed_tokens"] == 0
+    assert dm["model.language_model.layers.0"] == 0
+    assert dm["model.language_model.layers.3"] == 0
+    assert dm["model.language_model.layers.4"] == 1
+    assert dm["model.language_model.layers.7"] == 1
+    assert dm["model.language_model.norm"] == 1
+    assert dm["lm_head"] == 1
+    print("  OK (build_explicit_device_map: gemma4 prefix -> model.language_model.* keys)")
 
     print("\n[selftest] All checks passed (no GPU required — run on a multi-GPU "
           "AMD box for actual pipeline parallelism).")

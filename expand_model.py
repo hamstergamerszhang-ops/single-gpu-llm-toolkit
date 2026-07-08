@@ -172,8 +172,11 @@ def build_depth_plan(orig_layers: int, depth_step: int, interleave_every: int):
 
 
 def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows: bool):
-    """Returns a torch.bfloat16 tensor of `n_new` new orthogonal directions,
-    built via numpy QR (see module docstring for why numpy, not torch, here).
+    """Returns a float32 tensor of `n_new` new orthogonal directions, built via
+    numpy QR (see module docstring for why numpy, not torch, here). Returned as
+    float32 (NOT forced to bfloat16) so callers can cast to whatever dtype the
+    checkpoint actually uses -- see width_expand_layer / gqa_expand_kv for the
+    `.to(old_w.dtype)` cast applied at each torch.cat call site.
 
     QR on an (m, n) matrix with m <= n can only produce at most m orthogonal
     columns; requesting more than that silently truncated the pad before. We
@@ -193,7 +196,7 @@ def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows
         R = np.random.randn(n_existing, n_new).astype(np.float32)
         Q, _ = np.linalg.qr(R, mode="reduced")
         pad = (Q[:, :n_new] * scale).astype(np.float32)
-    return torch.from_numpy(np.ascontiguousarray(pad)).to(torch.bfloat16)
+    return torch.from_numpy(np.ascontiguousarray(pad))
 
 
 def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
@@ -207,11 +210,11 @@ def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
     for key in (gate_key, up_key):
         old_w = tensors[key]
         pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=True)
-        tensors[key] = torch.cat([old_w, pad], dim=0)
+        tensors[key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=0)
 
     old_w = tensors[down_key]
     pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=False)
-    tensors[down_key] = torch.cat([old_w, pad], dim=1)
+    tensors[down_key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=1)
 
 
 def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_prefix: str,
@@ -293,7 +296,7 @@ def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads:
 
     old_k = tensors[k_key]
     pad = orthogonal_pad(n_new, hidden, init_scale, transpose_for_rows=True)
-    tensors[k_key] = torch.cat([old_k, pad], dim=0)
+    tensors[k_key] = torch.cat([old_k, pad.to(old_k.dtype)], dim=0)
 
     # v_proj is a genuinely fresh matrix (no existing V data to pad from).
     # We need shape (new_out, hidden) for Linear(hidden -> new_out).
@@ -475,9 +478,30 @@ def main():
         return
 
     index_path = os.path.join(args.src, "model.safetensors.index.json")
-    with open(index_path) as f:
-        src_index = json.load(f)
-    shard_files = sorted(set(src_index["weight_map"].values()))
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            src_index = json.load(f)
+        shard_files = sorted(set(src_index["weight_map"].values()))
+    else:
+        # No index -- some checkpoints ship as a single unsharded
+        # model.safetensors with no index at all (a real downloaded case, not
+        # an assumption -- same fallback as prune_embeddings_torch.py). Synthesize
+        # a single-shard index from the safetensors header so the rest of this
+        # script can rely on one consistent format.
+        single_file = "model.safetensors"
+        single_path = os.path.join(args.src, single_file)
+        if not os.path.exists(single_path):
+            raise SystemExit(f"ERROR: no model.safetensors.index.json AND no "
+                             f"{single_file} in {args.src}")
+        with open(single_path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(header_len))
+        weight_map = {k: single_file for k in header if k != "__metadata__"}
+        src_index = {"metadata": {"total_size": os.path.getsize(single_path)},
+                     "weight_map": weight_map}
+        shard_files = [single_file]
+        log(f"no index.json found -- synthesized one for the single-file "
+            f"checkpoint ({single_file})")
 
     log(f"loading {len(shard_files)} source shards ...")
     tensors = {}

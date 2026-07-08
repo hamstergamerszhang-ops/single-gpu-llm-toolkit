@@ -39,7 +39,7 @@ Tensor key naming convention (so your modeling_custom.py can match it):
     model.mtp_layers.{i}.eh_proj.weight          (hidden, 2*hidden)
     model.mtp_layers.{i}.block.<suffix>          (cloned from last layer)
     model.mtp_layers.{i}.lnorm.weight            (hidden,)
-    model.mtp.norm.weight                        (hidden,)   [shared final]
+    model.mtp_layers.norm.weight                 (hidden,)   [shared final]
 
 The block <suffix> matches whatever the last decoder layer uses (e.g.
 self_attn.q_proj.weight, mlp.gate_proj.weight, ...) — controlled by
