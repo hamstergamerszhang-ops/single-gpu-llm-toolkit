@@ -74,6 +74,136 @@ def format_table(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
+                      warmup: int, steps: int,
+                      gfx_override: str, hip_alloc_conf: str):
+    """Run a generation benchmark: measures prefill latency, decode latency,
+    time-to-first-token (TTFT), and time-per-output-token (TPOT).
+
+    Unlike the training benchmark, this uses a single config (no multi-config
+    table) because generation is less parameterizable — the interesting axis is
+    prompt length vs. gen length, which the caller can sweep by re-running.
+
+    Returns a result dict.
+    """
+    from rocm_env import setup_rocm_env
+    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if not torch.cuda.is_available():
+        raise SystemExit("ERROR: no CUDA/ROCm device visible — benchmark needs a GPU.")
+
+    log(f"loading model for generation benchmark: {model_path}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+    ).to("cuda")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model.eval()
+
+    # Use a fixed prompt (all pad tokens) for reproducibility — the content
+    # doesn't affect throughput, only the length matters.
+    input_ids = torch.full((1, prompt_len), tokenizer.pad_token_id or 0,
+                           dtype=torch.long, device="cuda")
+
+    # Warmup.
+    with torch.inference_mode():
+        for _ in range(warmup):
+            _ = model.generate(input_ids, max_new_tokens=gen_len, use_cache=True,
+                               do_sample=False)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+    # Measure. Use a single generate() call per step and split the timing:
+    # TTFT ~ time for the first token (prefill + first decode), TPOT ~ time
+    # per subsequent token. A two-call approach (generate 1 token, then
+    # continue with past_key_values) is broken: HF's prepare_inputs_for_generation
+    # skips the input slice when past_length >= input_ids length, so the second
+    # call re-prefills the full prompt with wrong cache positions.
+    #
+    # NOTE: torch.inference_mode() is THREAD-LOCAL (per PyTorch docs). The
+    # generate() call runs on a background thread (for the streamer), so the
+    # inference_mode context must be entered INSIDE the thread, not on the
+    # main thread. Without this, the forward passes run with grad tracking
+    # enabled, inflating peak VRAM and biasing the measurement.
+    total_times = []
+    first_token_times = []
+
+    for _ in range(steps):
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=1.0)
+        gen_kwargs = {
+            "input_ids": input_ids, "max_new_tokens": gen_len,
+            "use_cache": True, "do_sample": False, "streamer": streamer,
+        }
+
+        def _gen():
+            with torch.inference_mode():
+                model.generate(**gen_kwargs)
+        thread = Thread(target=_gen)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        thread.start()
+        # Drain the streamer; record the time of the FIRST token.
+        first_token_time = None
+        import queue as _queue
+        try:
+            for _ in streamer:
+                if first_token_time is None:
+                    torch.cuda.synchronize()
+                    first_token_time = time.perf_counter() - t0
+        except _queue.Empty:
+            pass  # timeout — generate may have failed
+        thread.join(timeout=30.0)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        total_times.append(t1 - t0)
+        first_token_times.append(first_token_time if first_token_time else (t1 - t0))
+
+    peak_vram = torch.cuda.max_memory_allocated() / 1024**3
+    avg_ttft = sum(first_token_times) / len(first_token_times) * 1000  # ms
+    avg_total = sum(total_times) / len(total_times) * 1000             # ms
+    # TPOT = (total - TTFT) / (gen_len - 1) per-token decode time.
+    avg_tpot = ((avg_total - avg_ttft) / max(gen_len - 1, 1))           # ms
+    tokens_per_s = gen_len / (sum(total_times) / len(total_times))
+
+    result = {
+        "prompt_len": prompt_len, "gen_len": gen_len,
+        "ttft_ms": avg_ttft, "tpot_ms": avg_tpot,
+        "total_ms": avg_total, "tokens_per_sec": tokens_per_s,
+        "peak_vram_gb": peak_vram,
+    }
+    log(f"  TTFT: {avg_ttft:.1f}ms  TPOT: {avg_tpot:.1f}ms  "
+        f"total: {avg_total:.0f}ms  {tokens_per_s:,.0f} tok/s  "
+        f"VRAM: {peak_vram:.1f}GB")
+
+    del model
+    torch.cuda.empty_cache()
+    return result
+
+
+def format_gen_table(result: dict) -> str:
+    """Format generation benchmark results."""
+    if not result:
+        return "(no results)"
+    lines = [
+        f"{'Metric':<25} {'Value':>15}",
+        "-" * 42,
+        f"{'Prompt length':<25} {result['prompt_len']:>15}",
+        f"{'Generate length':<25} {result['gen_len']:>15}",
+        f"{'TTFT (ms)':<25} {result['ttft_ms']:>15.1f}",
+        f"{'TPOT (ms)':<25} {result['tpot_ms']:>15.1f}",
+        f"{'Total time (ms)':<25} {result['total_ms']:>15.0f}",
+        f"{'Tokens/sec':<25} {result['tokens_per_sec']:>15,.0f}",
+        f"{'Peak VRAM (GB)':<25} {result['peak_vram_gb']:>15.1f}",
+    ]
+    return "\n".join(lines)
+
+
 def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                   gfx_override: str, hip_alloc_conf: str):
     """Run the benchmark for each config. Returns a list of result dicts."""
@@ -181,7 +311,28 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
 
         # Free model + orphaned logits before next config (outputs.logits can
         # be ~1GB on a 15B model and isn't freed by empty_cache while referenced).
-        del outputs, input_ids, labels, attn, model, optimizer
+        # Guard against --steps 0 (loop never ran, outputs/input_ids/etc unbound).
+        #
+        # NOTE: `del locals()[name]` is a well-known CPython no-op inside a
+        # function -- locals() returns a snapshot dict of the fast-locals
+        # array; mutating that dict does NOT delete the real local variable
+        # (only module/class-scope locals() is the live namespace; function
+        # scope is not). A prior version of this loop used exactly that
+        # pattern and silently kept `outputs`/`input_ids`/`labels`/`attn`
+        # alive (and their CUDA tensors un-freed) until the next loop
+        # iteration's reassignment overwrote them -- defeating the comment's
+        # stated purpose one config's peak-VRAM measurement early. Real `del`
+        # statements can't take a dynamic name list, so guard each one
+        # explicitly against the --steps/--warmup == 0 unbound case instead.
+        if "outputs" in dir():
+            del outputs
+        if "input_ids" in dir():
+            del input_ids
+        if "labels" in dir():
+            del labels
+        if "attn" in dir():
+            del attn
+        del model, optimizer
         torch.cuda.empty_cache()
 
     return results
@@ -192,9 +343,10 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--model", required=True, help="HF model dir/repo to benchmark.")
-    ap.add_argument("--configs", required=True,
+    ap.add_argument("--configs", required=False, default=None,
                     help="Semicolon-separated configs: "
-                         "'batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8'")
+                         "'batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8' "
+                         "(required unless --gen is used).")
     ap.add_argument("--warmup", type=int, default=3,
                     help="Warmup steps before measurement (default 3).")
     ap.add_argument("--steps", type=int, default=10,
@@ -203,11 +355,35 @@ def main():
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
     ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
+    ap.add_argument("--gen", action="store_true", default=False,
+                    help="Run a generation benchmark instead of the training "
+                         "benchmark. Measures TTFT (time-to-first-token), TPOT "
+                         "(time-per-output-token), and tokens/sec for a single "
+                         "prompt. Use --gen-prompt-len and --gen-len to control "
+                         "the prompt and generation lengths.")
+    ap.add_argument("--gen-prompt-len", type=int, default=512,
+                    help="Prompt length (in tokens) for the generation benchmark "
+                         "(default 512). Only used with --gen.")
+    ap.add_argument("--gen-len", type=int, default=128,
+                    help="Number of tokens to generate in the generation benchmark "
+                         "(default 128). Only used with --gen.")
     args = ap.parse_args()
+
+    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
+
+    if args.gen:
+        log(f"generation benchmark: prompt_len={args.gen_prompt_len}, "
+            f"gen_len={args.gen_len}, warmup={args.warmup}, steps={args.steps}")
+        result = run_gen_benchmark(args.model, args.gen_prompt_len, args.gen_len,
+                                   args.warmup, args.steps,
+                                   args.gfx_override, hip_conf)
+        print("\n" + format_gen_table(result))
+        return
 
     configs = parse_configs(args.configs)
     if not configs:
-        raise SystemExit("ERROR: no configs parsed from --configs")
+        raise SystemExit("ERROR: no configs parsed from --configs (or --configs "
+                         "not set; use --gen for generation benchmarking).")
     log(f"benchmarking {len(configs)} config(s): warmup={args.warmup}, steps={args.steps}")
 
     hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
@@ -252,6 +428,20 @@ def _self_test():
     # Empty results don't crash.
     assert format_table([]) == "(no results)"
     print("  OK (empty results handled)")
+
+    # Generation benchmark table formatter.
+    gen_result = {
+        "prompt_len": 512, "gen_len": 128,
+        "ttft_ms": 45.2, "tpot_ms": 12.3,
+        "total_ms": 1610, "tokens_per_sec": 79.5,
+        "peak_vram_gb": 42.1,
+    }
+    gen_table = format_gen_table(gen_result)
+    assert "TTFT" in gen_table
+    assert "TPOT" in gen_table
+    assert "45.2" in gen_table
+    assert "80" in gen_table  # 79.5 rounds to 80 with ,.0f format
+    print("  OK (generation table formatter produces aligned output)")
 
     print("\n[selftest] All checks passed (no GPU required — run with a real "
           "model on AMD hardware for actual numbers).")

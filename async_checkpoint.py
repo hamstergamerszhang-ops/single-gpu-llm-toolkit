@@ -160,7 +160,18 @@ class AsyncCheckpointer:
                            for k, v in raw_state.items() if k not in tied_keys}
         opt_state_cpu = {
             "optimizer": _move_to_cpu(optimizer.state_dict()),
-            "optimizer_type": type(optimizer).__name__,
+            # optimizer.__class__.__name__ (attribute access), NOT
+            # type(optimizer).__name__ (builtin) -- see the matching comment
+            # in train_cpt.py's atomic_save_checkpoint for the full
+            # explanation. Under FSDP, `optimizer` here is a
+            # _StateDictOptimizer shim (train_cpt.py) that overrides
+            # __class__ via @property to report the wrapped optimizer's real
+            # class name; type() bypasses that property and always returns
+            # "_StateDictOptimizer", which broke optimizer-compat detection
+            # on every FSDP resume (checkpoint always looked
+            # optimizer-type-mismatched vs. the real optimizer, so momentum
+            # was silently discarded every time).
+            "optimizer_type": optimizer.__class__.__name__,
             "step": step,
             **(extra_state or {}),
         }

@@ -73,12 +73,14 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     returns (at which point the streamer has already seen stream_end and the
     text sits unread). HF's own docs run generate() in a background thread and
     iterate the streamer on the calling thread — that's what we do here."""
+    import queue
     from threading import Thread
     from transformers import TextIteratorStreamer
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     streamer = TextIteratorStreamer(
         tokenizer, skip_prompt=True, skip_special_tokens=True,
+        timeout=1.0,  # prevents deadlock if generate() raises before streamer.end()
     )
     gen_kwargs = build_gen_kwargs(
         inputs["input_ids"], inputs["attention_mask"], max_new_tokens,
@@ -100,11 +102,30 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
         except Exception as e:
             thread_exc.append(e)
 
-    thread = Thread(target=_generate_with_exc)
+    # daemon=True so the thread doesn't block process exit if interrupted
+    # (e.g. Ctrl+C) mid-generation — HF generate() has no cancellation API.
+    thread = Thread(target=_generate_with_exc, daemon=True)
     thread.start()
-    for new_text in streamer:
-        print(new_text, end="", flush=True)
-    thread.join()
+    try:
+        for new_text in streamer:
+            print(new_text, end="", flush=True)
+    except StopIteration:
+        pass  # streamer exhausted normally (stream_end sentinel seen)
+    except queue.Empty:
+        # TextIteratorStreamer.__next__ does
+        # `self.text_queue.get(timeout=self.timeout)`, a plain queue.Queue.get
+        # with a timeout -- on timeout that raises queue.Empty, NOT
+        # StopIteration (confirmed against the installed transformers'
+        # TextIteratorStreamer.__next__ source). A prior version of this
+        # handler only caught StopIteration, so a real timeout (e.g.
+        # generate() stalls or its background thread dies without ever
+        # calling streamer.end()) propagated an uncaught queue.Empty out of
+        # stream_generate() instead of being handled the same way "streamer
+        # timed out" is described in the comment above. Both cases end the
+        # same way here: stop reading the streamer and fall through to
+        # joining the thread + surfacing any real generate() exception.
+        pass
+    thread.join(timeout=5.0)  # don't hang forever if generate() is stuck
     if thread_exc:
         raise thread_exc[0]
 

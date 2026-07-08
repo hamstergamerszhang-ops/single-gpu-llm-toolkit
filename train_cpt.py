@@ -163,7 +163,25 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
 
     opt_state = {
         "optimizer": optimizer.state_dict(),
-        "optimizer_type": type(optimizer).__name__,
+        # NOTE: optimizer.__class__.__name__ (attribute access), NOT
+        # type(optimizer).__name__ (the builtin). Under FSDP, `optimizer` can
+        # be a _StateDictOptimizer shim (see train_cpt.py's checkpoint-write
+        # block), which overrides __class__ via a @property specifically so
+        # this reports the WRAPPED optimizer's real class name (e.g.
+        # "AdamW") instead of "_StateDictOptimizer". But `type(x)` is a
+        # builtin that reads the instance's actual C-level type slot and
+        # does NOT consult a __class__ property override -- only normal
+        # attribute access (`x.__class__`) does. A prior version of this
+        # line used type(optimizer).__name__, which always wrote
+        # "_StateDictOptimizer" here on every FSDP save, so on resume
+        # saved_optimizer_type ("_StateDictOptimizer") could never match
+        # current_optimizer_type (the real class, since the shim doesn't
+        # exist at resume time) -- check_optimizer_compat() always returned
+        # safe_to_load=False, silently discarding Adam momentum on every
+        # single FSDP checkpoint resume. Exactly the failure mode
+        # _StateDictOptimizer's own docstring says this __class__ override
+        # exists to prevent.
+        "optimizer_type": optimizer.__class__.__name__,
         "step": step,
         **(extra_state or {}),
     }
@@ -390,18 +408,28 @@ def _apply_fp8(model):
     """Convert linear layers to float8_e4m3fn via torchao's Float8Linear.
     MI300X/MI325X have native fp8 compute — this roughly 2x throughput vs bf16
     on those cards. Falls back to bf16 (no-op) with a warning if torchao isn't
-    installed or the conversion fails. NOTE: the fallback covers conversion-time
-    errors only — if the conversion succeeds but the card lacks fp8 hardware,
-    the failure surfaces at the first forward pass (torch._scaled_mm), not here.
-    Only use --dtype fp8 on MI300X/MI325X (gfx942) or cards with confirmed fp8
-    support."""
+    installed, the GPU lacks fp8 hardware, or the conversion fails."""
+    import torch
+    # Runtime capability gate: fp8 matmul (torch._scaled_mm) requires gfx942
+    # (MI300X/MI325X). On other AMD cards (e.g. gfx1100 / RX 7900 XTX), the
+    # conversion would succeed but the first forward pass would crash with
+    # no kernel. Check up front so the user gets a clear message instead.
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        # On ROCm, get_device_capability returns (gfx_major, gfx_minor).
+        # gfx942 (MI300X) reports (9, 42). Only CDNA gfx94x has native fp8.
+        if not (cap[0] == 9 and cap[1] >= 42):
+            arch = f"gfx{cap[0]}{cap[1]}"
+            print(f"[cpt] WARNING: --dtype fp8 but GPU arch {arch} lacks native "
+                  f"fp8 compute (needs gfx942/MI300X or gfx940/MI300A). Falling "
+                  f"back to bf16. Use --dtype fp8 only on MI300X/MI325X.",
+                  file=sys.stderr)
+            return model
     try:
         from torchao.float8 import convert_to_float8_training
         convert_to_float8_training(model)
         print("[cpt] fp8 training enabled (torchao Float8Linear, float8_e4m3fn) — "
-              "use only on MI300X/MI325X (gfx942) or cards with confirmed fp8 "
-              "support. If the card lacks fp8 hardware, the first forward pass "
-              "will crash (torch._scaled_mm has no kernel).")
+              "native fp8 compute on gfx942 (MI300X/MI325X).")
         return model
     except ImportError:
         print("[cpt] WARNING: --dtype fp8 but torchao not installed — falling back "
@@ -510,15 +538,266 @@ def unwrap_ddp(model):
     return model
 
 
+def _fsdp_unwrap(model):
+    """Returns the underlying model if `model` is FSDP-wrapped, else `model`
+    itself. Duck-typed on the class name (not isinstance) so this stays
+    importable/testable without a torch.distributed process group.
+
+    FSDP exposes the wrapped module as .module (same attribute name as DDP),
+    so this also handles single-level FSDP wrapping. For nested FSDP wrapping
+    (auto_wrap_policy wraps each transformer layer individually), only the
+    top-level is unwrapped here — callers that need the fully unsharded state
+    dict use get_full_state_dict() instead."""
+    if type(model).__name__ in ("FullyShardedDataParallel", "DistributedDataParallel"):
+        return model.module
+    return model
+
+
+def get_full_state_dict(model):
+    """Gather the full (unsharded) model state dict from an FSDP-wrapped model.
+
+    FSDP shards parameters across ranks, so model.state_dict() on an FSDP
+    wrapper returns only the local shard. To save a loadable checkpoint, we
+    need the FULL state dict — gathered from all ranks onto rank 0 (rank 0
+    gets the real tensors, other ranks get empty placeholders to free memory).
+
+    For non-FSDP models (single-GPU, DDP), this is just model.state_dict().
+
+    IMPORTANT: This is a COLLECTIVE operation under FSDP. All ranks must call
+    it (even though only rank 0 gets the result). Calling it only on rank 0
+    will deadlock — the all-gather needs all ranks to participate.
+    """
+    import torch
+    cls_name = type(model).__name__
+    if cls_name == "FullyShardedDataParallel":
+        # FSDP's recommended pattern for full state dict gathering:
+        # set state_dict_type to FULL_STATE_DICT, call get_state_dict (which
+        # gathers shards to rank 0), use it, then reset to the original type.
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
+            # All ranks call this; rank0_only=True means only rank 0 gets the
+            # real gathered tensors, others get an empty dict.
+            full_sd = model.state_dict()
+            # Clone on rank 0 so the dict is independent of FSDP internals
+            # after the context exits. Other ranks get {} (no copy needed).
+            if full_sd:
+                full_sd = {k: v.clone() for k, v in full_sd.items()}
+        return full_sd
+    # Non-FSDP: DDP or single-GPU. state_dict() is already complete.
+    return unwrap_ddp(model).state_dict()
+
+
+def get_full_optim_state_dict(model, optimizer):
+    """Gather the full (unsharded) optimizer state dict from an FSDP-wrapped model.
+
+    Like get_full_state_dict, but for optimizer state. The optimizer is built
+    over FSDP-wrapped params, so optimizer.state_dict() returns only the local
+    shard. This gathers the full state onto rank 0.
+
+    IMPORTANT: Collective under FSDP — all ranks must call it.
+
+    Uses FSDP.state_dict_type (the modern API that exists in torch 2.x) with
+    OptimStateDictType.FULL_STATE_DICT. The older FSDP.optim_state_dict_type
+    context manager was removed; FSDP.optim_state_dict(model, optimizer) is the
+    recommended gathering call inside the state_dict_type context.
+    """
+    if type(model).__name__ == "FullyShardedDataParallel":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import (
+            OptimStateDictType, FullOptimStateDictConfig)
+        optim_cfg = FullOptimStateDictConfig(rank0_only=True)
+        # state_dict_type accepts (module, state_dict_type, state_dict_config,
+        # optim_state_dict_config). It's a single context for both model and
+        # optimizer state dicts.
+        with FSDP.state_dict_type(
+                model, OptimStateDictType.FULL_STATE_DICT, optim_cfg):
+            # FSDP.optim_state_dict is the recommended gathering call — it
+            # returns the full (unsharded) optimizer state on rank 0 and {}
+            # on other ranks (when rank0_only=True).
+            full_optim_sd = FSDP.optim_state_dict(model, optimizer)
+        return full_optim_sd
+    # Non-FSDP: optimizer.state_dict() is already complete.
+    return optimizer.state_dict()
+
+
+def shard_optim_state_dict_for_load(model, optimizer, full_optim_sd):
+    """Convert a full (unsharded) optimizer state dict to the sharded format
+    FSDP expects for loading on resume.
+
+    The inverse of get_full_optim_state_dict: takes a saved FULL_STATE_DICT
+    optimizer state and returns the sharded version that
+    optimizer.load_state_dict() can consume under FSDP.
+
+    Collective under FSDP — all ranks must call it.
+    """
+    if type(model).__name__ == "FullyShardedDataParallel":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import (
+            OptimStateDictType, FullOptimStateDictConfig)
+        optim_cfg = FullOptimStateDictConfig(rank0_only=True)
+        with FSDP.state_dict_type(
+                model, OptimStateDictType.FULL_STATE_DICT, optim_cfg):
+            # optim_state_dict_to_load converts the full state dict to the
+            # sharded format the local optimizer expects.
+            sharded = FSDP.optim_state_dict_to_load(
+                model, optimizer, full_optim_sd)
+        return sharded
+    # Non-FSDP: the state dict is already in the right format.
+    return full_optim_sd
+
+
+class _StateDictModel:
+    """Shim that wraps an HF model and overrides save_pretrained() to use a
+    pre-gathered full state dict (for FSDP checkpoint saving).
+
+    FSDP shards parameters across ranks, so the model's own state_dict() returns
+    only the local shard. get_full_state_dict() gathers the full state dict onto
+    rank 0, but the underlying model still has sharded params. This shim lets
+    atomic_save_checkpoint / async_ckpt.save call save_pretrained() with the
+    gathered state dict without modifying those functions.
+
+    Delegates everything except save_pretrained to the wrapped model (config,
+    tokenizer, etc.) via __getattr__.
+    """
+    def __init__(self, model, full_state_dict):
+        self._model = model
+        self._full_state_dict = full_state_dict
+
+    def state_dict(self, *args, **kwargs):
+        # Return the gathered full state (NOT the wrapped model's sharded state).
+        # This is critical for AsyncCheckpointer.save, which calls
+        # model.state_dict() to snapshot before handing to the background
+        # thread, then strips tied-weight keys from THAT snapshot (see
+        # async_checkpoint.py's tied_keys dedup) and passes the deduped dict
+        # back in via save_pretrained(..., state_dict=...). See save_pretrained
+        # below for why we must NOT clobber that caller-supplied dict.
+        return self._full_state_dict
+
+    def save_pretrained(self, save_directory, **kwargs):
+        # Use the gathered full state dict instead of the model's own (sharded)
+        # state_dict() -- but ONLY if the caller didn't already pass one in.
+        # async_checkpoint.py's save() calls model.state_dict() (our override
+        # above, returning self._full_state_dict), then strips tied-weight
+        # keys from that snapshot into its own `model_state_cpu`, and passes
+        # THAT deduped dict here as state_dict=. A prior version of this shim
+        # unconditionally did `kwargs["state_dict"] = self._full_state_dict`,
+        # which clobbered the caller's deduped dict with the raw (undeduped)
+        # one -- silently writing a full extra copy of the tied embedding
+        # matrix (GB-scale on a large-vocab model) into every FSDP checkpoint,
+        # since the sync save path (atomic_save_checkpoint, which never passes
+        # state_dict=) still needs this shim to supply one. Only fall back to
+        # self._full_state_dict when the caller hasn't already supplied one.
+        kwargs.setdefault("state_dict", self._full_state_dict)
+        # safe_serialization defaults to True in modern transformers; pass it
+        # explicitly so the behavior matches the non-FSDP path.
+        kwargs.setdefault("safe_serialization", True)
+        self._model.save_pretrained(save_directory, **kwargs)
+
+    def __getattr__(self, name):
+        # Delegate any attribute access (config, etc.) to the wrapped model.
+        # __getattr__ is only called when normal attribute lookup fails, so
+        # self._model and self._full_state_dict are found normally.
+        return getattr(self._model, name)
+
+
+class _StateDictOptimizer:
+    """Shim that wraps an optimizer and overrides state_dict() to return a
+    pre-gathered full optimizer state dict (for FSDP checkpoint saving).
+
+    Same pattern as _StateDictModel: FSDP shards optimizer state, so we gather
+    the full state via get_full_optim_state_dict() and return it from
+    state_dict() instead of the sharded local state.
+
+    Delegates everything else to the wrapped optimizer via __getattr__.
+    """
+    def __init__(self, optimizer, full_state_dict):
+        self._optimizer = optimizer
+        self._full_state_dict = full_state_dict
+
+    def state_dict(self):
+        return self._full_state_dict
+
+    @property
+    def __class__(self):
+        # Make type(shim).__name__ report the wrapped optimizer's class name
+        # (e.g. "Adam8bit" / "AdamW") so the checkpoint's "optimizer_type"
+        # metadata is correct for optimizer_compat_guard's resume check.
+        # Without this, type(shim).__name__ would be "_StateDictOptimizer",
+        # which never matches the real optimizer on resume -> the guard
+        # would always return safe_to_load=False, silently discarding
+        # Adam momentum on every FSDP resume.
+        return type(self._optimizer)
+
+    def __getattr__(self, name):
+        return getattr(self._optimizer, name)
+
+
+def _wrap_fsdp(model, sharding_strategy: str, local_rank: int):
+    """Wrap a model in FullyShardedDataParallel with an auto_wrap_policy that
+    shards each transformer decoder layer independently. Returns the wrapped
+    model. Called after model modifications (fp8, flash-attn, compile) but
+    before apply_window_freeze.
+
+    auto_wrap_policy: wraps modules whose class name matches common transformer
+    decoder layer patterns (GemmaDecoderLayer, LlamaDecoderLayer, etc.). This
+    gives FSDP the right granularity — too-large a unit (the whole model) means
+    one rank holds the full param set momentarily during all-gather; too-small
+    (individual Linears) adds communication overhead per layer.
+    """
+    import torch
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardingStrategy
+
+    strategy_map = {
+        "full": ShardingStrategy.FULL_SHARD,
+        "shard-grad-op": ShardingStrategy.SHARD_GRAD_OP,
+        "no-shard": ShardingStrategy.NO_SHARD,
+    }
+    strategy = strategy_map.get(sharding_strategy, ShardingStrategy.FULL_SHARD)
+
+    # Auto-wrap transformer decoder layers. We match by class name suffix
+    # ("DecoderLayer", "Block") to cover Gemma/Llama/Mistral/Qwen naming
+    # without importing model-specific classes (which may not be installed).
+    def _is_decoder_layer(module):
+        cls = type(module).__name__
+        return cls.endswith("DecoderLayer") or cls.endswith("Block")
+
+    from functools import partial
+    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+    layer_policy = partial(lambda_auto_wrap_policy, lambda_fn=_is_decoder_layer)
+
+    model = FSDP(
+        model,
+        sharding_strategy=strategy,
+        auto_wrap_policy=layer_policy,
+        device_id=local_rank if torch.cuda.is_available() else None,
+        # use_orig_params=True: keeps parameter names stable so the optimizer
+        # state_dict keys match across save/resume. Without this, FSDP flattens
+        # params into "FlatParamHandle" groups and the optimizer state keys
+        # become indecipherable, breaking resume.
+        use_orig_params=True,
+        # limit_all_gathers=True: overlaps all-gather with forward compute to
+        # reduce peak memory — critical on MI300X where the all-gathered params
+        # for a layer can be large. PyTorch 2.0+ default is True but we set it
+        # explicitly for clarity and older versions.
+        limit_all_gathers=True,
+    )
+    return model
+
+
 def find_decoder_layers(model):
     """Locate the transformer's layer list across a handful of HF model-class
-    shapes a Gemma-4-family checkpoint might load as. Unwraps DistributedDataParallel
+    shapes a Gemma-4-family checkpoint might load as. Unwraps DDP/FSDP
     (whose wrapped model is at .module) before walking attributes."""
-    # Unwrap DDP: DistributedDataParallel exposes the wrapped model as .module,
-    # and does NOT forward attribute access to it (hasattr(ddp, "model") is False).
-    # Without this, find_decoder_layers fails on every --ddp run. Duck-type via
-    # class name to avoid importing torch in this module-level function.
-    if type(model).__name__ == "DistributedDataParallel":
+    # Unwrap DDP/FSDP: both expose the wrapped model as .module, and neither
+    # forwards attribute access to it (hasattr(ddp, "model") is False).
+    # Without this, find_decoder_layers fails on every --ddp/--fsdp run.
+    # Duck-type via class name to avoid importing torch in this module-level
+    # function (same convention unwrap_ddp uses).
+    if type(model).__name__ in ("DistributedDataParallel", "FullyShardedDataParallel"):
         model = model.module
     for path in ["model.layers", "language_model.model.layers", "model.model.layers",
                 "model.language_model.layers"]:  # the path used by custom multi-token-
@@ -786,6 +1065,23 @@ def main():
                          "vars. Only rank 0 writes checkpoints and logs; all ranks "
                          "participate in training with gradient all-reduce. "
                          "Converts 'one MI300X' -> 'a node of them'.")
+    ap.add_argument("--fsdp", action="store_true", default=False,
+                    help="Enable multi-GPU training via FullyShardedDataParallel "
+                         "(FSDP). Shards params/grads/optimizer state across GPUs, "
+                         "so models larger than a single GPU's VRAM can be trained "
+                         "(e.g. a 27B model across 4x MI300X). Also avoids the "
+                         "find_unused_parameters=True hazard that --ddp hits with "
+                         "windowed --start/--end freezing. Launch with 'torchrun "
+                         "--nproc_per_node=N train_cpt.py --fsdp ...'. Mutually "
+                         "exclusive with --ddp.")
+    ap.add_argument("--sharding-strategy", type=str, default="full",
+                    choices=["full", "shard-grad-op", "no-shard"],
+                    help="FSDP sharding strategy (only with --fsdp). 'full' "
+                         "(FULL_SHARD, default) shards params+grads+optimizer "
+                         "state -- maximum memory savings, most communication. "
+                         "'shard-grad-op' (SHARD_GRAD_OP) shards grads+optimizer "
+                         "state only -- params stay replicated, less comm overhead, "
+                         "more memory. 'no-shard' (NO_SHARD) is equivalent to DDP.")
     args = ap.parse_args()
 
     if args.selftest:
@@ -802,6 +1098,13 @@ def main():
     if args.accum < 1:
         ap.error("--accum / --gradient-accumulation-steps must be >= 1 "
                  f"(got {args.accum}).")
+
+    # --fsdp and --ddp are mutually exclusive (both set up process groups and
+    # wrap the model; using both would double-init distributed and crash).
+    if args.fsdp and args.ddp:
+        ap.error("--fsdp and --ddp are mutually exclusive. --fsdp shards params "
+                 "across GPUs (for models that don't fit on one); --ddp replicates "
+                 "params on every GPU (for models that do). Pick one.")
 
     # ROCm env bootstrap: MUST run before `import torch`. On AMD consumer/older
     # cards (RDNA1/2, gfx803, etc.) whose arch isn't in the torch wheel's
@@ -827,21 +1130,25 @@ def main():
               "for a tiny --iters smoke test.", file=sys.stderr)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ── Multi-GPU DDP setup ──────────────────────────────────────────────────
-    # When --ddp is set, the script expects to be launched via torchrun:
+    # ── Multi-GPU DDP/FSDP setup ──────────────────────────────────────────────
+    # When --ddp or --fsdp is set, the script expects to be launched via torchrun:
     #   torchrun --nproc_per_node=N train_cpt.py --ddp --model ... --save ...
+    #   torchrun --nproc_per_node=N train_cpt.py --fsdp --model ... --save ...
     # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars. We init the process
-    # group, pin each rank to its local GPU, and use DDP to all-reduce gradients.
+    # group, pin each rank to its local GPU, and use DDP or FSDP to sync gradients.
     # Only rank 0 writes checkpoints, logs to stdout, and runs eval — the other
     # ranks train silently and participate in the gradient sync.
     ddp_rank = 0
     ddp_world_size = 1
     is_main = True  # rank 0 (or single-GPU)
-    if args.ddp:
+    is_distributed = args.ddp or args.fsdp
+    if is_distributed:
         if "RANK" not in os.environ:
-            raise SystemExit("ERROR: --ddp set but RANK env var not found. Launch "
-                             "via 'torchrun --nproc_per_node=N train_cpt.py --ddp ...' "
-                             "so torchrun sets RANK/LOCAL_RANK/WORLD_SIZE.")
+            raise SystemExit(f"ERROR: --{'ddp' if args.ddp else 'fsdp'} set but RANK "
+                             f"env var not found. Launch via 'torchrun "
+                             f"--nproc_per_node=N train_cpt.py "
+                             f"--{'ddp' if args.ddp else 'fsdp'} ...' so torchrun "
+                             f"sets RANK/LOCAL_RANK/WORLD_SIZE.")
         ddp_rank = int(os.environ["RANK"])
         ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -855,7 +1162,8 @@ def main():
             world_size=ddp_world_size,
         )
         if is_main:
-            print(f"[cpt] DDP enabled: rank {ddp_rank}/{ddp_world_size}, "
+            mode = "FSDP" if args.fsdp else "DDP"
+            print(f"[cpt] {mode} enabled: rank {ddp_rank}/{ddp_world_size}, "
                   f"local_rank={local_rank}, device={device}")
         # Per-rank torch seeding: without this, dropout/RNG-based ops produce
         # identical masks on every rank (correlated noise), which is wasteful.
@@ -908,10 +1216,39 @@ def main():
         except ImportError:
             # _apply_flash_attn() below will print the fallback warning.
             pass
-    model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs).to(device)
+    # For FSDP, load WITHOUT .to(device) — FSDP handles device placement via
+    # device_id at wrap time, and pre-moving the whole model to one GPU defeats
+    # the memory savings (the full model would momentarily sit on rank 0's VRAM).
+    # Load on CPU, let FSDP shard it to the right devices.
+    #
+    # IMPORTANT: this must match the EXACT condition used below to decide
+    # whether the model actually gets FSDP-wrapped (`args.fsdp and
+    # ddp_world_size > 1`), not just `args.fsdp` alone. `torchrun
+    # --nproc_per_node=1 ... --fsdp` sets RANK=0/WORLD_SIZE=1 (torchrun sets
+    # these even for a single process), which passes the `--fsdp` validation
+    # above but makes `ddp_world_size == 1` — so `if args.fsdp and
+    # ddp_world_size > 1` below is False and _wrap_fsdp() is never called. A
+    # prior version of this branch keyed off `args.fsdp` alone: the model was
+    # skipped past `.to(device)` AND never wrapped/moved by FSDP either,
+    # silently training on CPU with no error (GPU-tensor-vs-CPU-model crashes
+    # only surface much later, if at all, deep in the training loop).
+    will_wrap_fsdp = args.fsdp and ddp_world_size > 1
+    if will_wrap_fsdp:
+        model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs).to(device)
     if not args.no_grad_checkpoint:
         model.config.use_cache = False  # incompatible with checkpointing/training either way
-        model.gradient_checkpointing_enable()
+        # FSDP requires use_reentrant=False for gradient checkpointing (the
+        # reentrant variant is incompatible with FSDP's forward hooks and raises
+        # "Calling _checkpoint without use_reentrant=False is incompatible with
+        # FSDP"). DDP and single-GPU work with either; use_reentrant=False is
+        # the PyTorch-recommended default for new code regardless.
+        # HF's gradient_checkpointing_enable takes a SINGLE dict kwarg
+        # `gradient_checkpointing_kwargs`, not **kwargs — passing use_reentrant
+        # directly raises TypeError.
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
         # Required because windowed training freezes most of the trunk (requires_grad=False)
         # -- torch.utils.checkpoint only creates a backward node if the checkpointed
         # segment's INPUT tensor requires grad, regardless of whether the layer's own
@@ -942,12 +1279,37 @@ def main():
         compile_dynamic = not args.pack
         model = _apply_compile(model, mode=args.compile_mode, dynamic=compile_dynamic)
 
-    # Wrap in DistributedDataParallel after all model modifications (fp8,
-    # flash-attn, compile) but before apply_window_freeze, so DDP sees the
-    # final parameter set for gradient sync. DDP syncs gradients via all-reduce
-    # during backward — the optimizer step then operates on synced grads.
+    # ── Distributed wrapping: DDP or FSDP ─────────────────────────────────────
+    # Both wrap the model after all modifications (fp8, flash-attn, compile) but
+    # before apply_window_freeze, so the wrapper sees the final parameter set.
+    # DDP replicates params on every GPU and all-reduces gradients; FSDP shards
+    # params/grads/optimizer state across GPUs (fits bigger models, avoids the
+    # find_unused_parameters hazard with windowed freezing).
     windowed_freeze = args.start != 0 or args.end is not None
-    if args.ddp and ddp_world_size > 1:
+    if will_wrap_fsdp:
+        if windowed_freeze:
+            print("[cpt] NOTE: --fsdp with windowed --start/--end is safe (FSDP "
+                  "handles frozen params without find_unused_parameters, unlike "
+                  "DDP). No performance warning needed for this combination.")
+        model = _wrap_fsdp(model, args.sharding_strategy, local_rank)
+        if is_main:
+            print(f"[cpt] model wrapped in FullyShardedDataParallel "
+                  f"(world_size={ddp_world_size}, strategy={args.sharding_strategy})")
+    elif args.fsdp:
+        # --fsdp was requested but world_size == 1 (e.g. `torchrun
+        # --nproc_per_node=1 ... --fsdp`, or WORLD_SIZE unset/1 while RANK is
+        # present). FSDP sharding across 1 rank has no effect, so we already
+        # skipped _wrap_fsdp() above -- the model was instead loaded with
+        # .to(device) (see will_wrap_fsdp at load time). Tell the user
+        # explicitly rather than silently behaving like plain single-GPU
+        # training under a flag that implies distributed sharding.
+        if is_main:
+            print(f"[cpt] NOTE: --fsdp requested but world_size={ddp_world_size} "
+                  f"(<=1) -- FSDP sharding needs >1 rank to do anything, so "
+                  f"training proceeds as plain single-GPU (model on {device}, "
+                  f"not FSDP-wrapped). Use 'torchrun --nproc_per_node=N>=2 "
+                  f"... --fsdp' to actually shard.")
+    elif args.ddp and ddp_world_size > 1:
         if windowed_freeze:
             # PyTorch warns that find_unused_parameters=True combined with
             # gradient checkpointing can be unsafe in some versions because DDP
@@ -959,7 +1321,7 @@ def main():
                   "checkpointing is supported for compatibility, but it is slower "
                   "and can be correctness-sensitive on some PyTorch/ROCm builds. "
                   "For best throughput and safety on MI300X-class hardware, use "
-                  "full-model training (--start 0 with no --end) or wait for FSDP.",
+                  "full-model training (--start 0 with no --end) or switch to --fsdp.",
                   file=sys.stderr)
         # find_unused_parameters=True handles the windowed-freeze case where only
         # a subset of params have requires_grad=True — DDP needs to know which
@@ -1015,7 +1377,16 @@ def main():
                                                                current_optimizer_type)
             print(f"[cpt] {compat_msg}")
             if safe_to_load:
-                optimizer.load_state_dict(state["optimizer"])
+                # Under FSDP, the saved optimizer state is a FULL (unsharded)
+                # state dict (gathered at save time via get_full_optim_state_dict).
+                # The optimizer expects SHARDED state, so we must convert the
+                # full state to the sharded format before loading. This is a
+                # collective — all ranks must call it.
+                optim_state = state["optimizer"]
+                if args.fsdp:
+                    optim_state = shard_optim_state_dict_for_load(
+                        model, optimizer, optim_state)
+                optimizer.load_state_dict(optim_state)
                 print(f"[cpt] resumed at step {start_step} (optimizer state restored -- "
                       f"cold-restarting momentum measurably hurts quality, so this matters)")
 
@@ -1149,7 +1520,13 @@ def main():
             # Hoisted out of the micro-batch loop: the wrapper type doesn't
             # change between micro-batches, so checking once is correct and
             # avoids a per-micro-batch isinstance() call.
-            is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+            # Both DDP and FSDP support no_sync() for gradient accumulation —
+            # DDP skips the gradient all-reduce, FSDP skips the reduce-scatter
+            # and all-gather. Same semantics: only the final micro-batch's
+            # backward triggers the sync.
+            model_cls_name = type(model).__name__
+            supports_no_sync = model_cls_name in (
+                "DistributedDataParallel", "FullyShardedDataParallel")
             for micro in range(args.accum):
                 if stream_gen is not None:
                     batch_rows = [next(stream_gen) for _ in range(args.batch)]
@@ -1164,11 +1541,11 @@ def main():
 
                 # DDP optimization: skip the gradient all-reduce on every
                 # micro-batch except the last. Without this, DDP all-reduces
-                # after EACH backward -- with accumulation that's accum-1
-                # redundant all-reduces per step, a real throughput hit on
-                # MI300X multi-GPU. no_sync() defers the sync to the final
-                # micro-batch's backward. No-op outside DDP.
-                no_sync_ctx = (model.no_sync() if is_ddp and micro < args.accum - 1
+                # (or FSDP reduce-scatter + all-gather) after EACH backward --
+                # with accumulation that's accum-1 redundant syncs per step, a
+                # real throughput hit on MI300X multi-GPU. no_sync() defers the
+                # sync to the final micro-batch's backward. No-op outside DDP/FSDP.
+                no_sync_ctx = (model.no_sync() if supports_no_sync and micro < args.accum - 1
                                else contextlib.nullcontext())
                 with no_sync_ctx:
                     outputs = model(**batch)
@@ -1217,33 +1594,50 @@ def main():
     
             # Held-out eval at eval_every intervals (rank 0 only — the eval forward
             # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
-            # Under --ddp with eval_every != checkpoint_every, rank 0 can be inside
-            # run_eval while other ranks reach the next step's backward all-reduce
+            # Under --ddp/--fsdp with eval_every != checkpoint_every, rank 0 can be
+            # inside run_eval while other ranks reach the next step's backward sync
             # and block (or time out). Barrier here on eval steps so all ranks wait
-            # for rank 0's eval to finish. (On non-eval steps this is skipped;
-            # the barrier at the checkpoint step below covers the checkpoint case.)
-            do_eval = (valid_rows is not None and is_main
-                       and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP))
-            if args.ddp and valid_rows is not None and (it % eval_every == 0 or it == args.iters or _SHOULD_STOP):
+            # for rank 0's eval to finish.
+            #
+            # NOTE: _SHOULD_STOP is intentionally NOT in the barrier condition (same
+            # principle as the checkpoint barrier below). The flag is set per-rank by
+            # an async signal handler; including it in a collective barrier would
+            # deadlock if ranks set the flag at different steps.
+            is_eval_step = (valid_rows is not None
+                            and (it % eval_every == 0 or it == args.iters))
+            if is_distributed and is_eval_step:
                 torch.distributed.barrier()
-            if do_eval:
-                # Unwrap DDP for eval (see unwrap_ddp()'s docstring above for the
-                # full reasoning): calling the DDP wrapper's own forward() here
-                # would trigger a rank-0-only collective buffer broadcast that
-                # the other ranks (which never call run_eval, gated by is_main
-                # above) never join -- a real deadlock, reproduced with a real
-                # 2-process gloo job during review. The barrier above still
-                # matters for the separate rank-lag race it documents;
-                # unwrapping here is what stops the eval forward itself from
-                # being a rank-0-only collective.
-                vloss = run_eval(unwrap_ddp(model), valid_rows, builder, tokenizer, args.max_seq_len,
-                                 args.batch, device, args.pack, tokenizer.pad_token_id)
-                last_valid_loss = vloss
-                print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
-                if tb_writer is not None:
-                    tb_writer.add_scalar("eval/valid_loss", vloss, it)
+            do_eval = is_eval_step and is_main
+            if is_eval_step:
+                # For DDP: unwrap to avoid the buffer-broadcast collective (see
+                # unwrap_ddp()'s docstring). For FSDP: summon_full_params gathers
+                # sharded params to rank 0 (a COLLECTIVE — all ranks must enter
+                # the context, even though only rank 0 runs the eval forward).
+                # Without summon_full_params, model.module(**batch) would run on
+                # each rank's local shard -> garbage valid_loss.
+                #
+                # ALL ranks enter this block (is_eval_step, not do_eval) so the
+                # collective completes; only rank 0 runs run_eval inside it.
+                is_fsdp = type(model).__name__ == "FullyShardedDataParallel"
+                if is_fsdp:
+                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                    eval_ctx = FSDP.summon_full_params(
+                        model, writeback=False, rank0_only=True, with_grads=False)
+                else:
+                    eval_ctx = contextlib.nullcontext()
+                with eval_ctx:
+                    if do_eval:
+                        vloss = run_eval(_fsdp_unwrap(unwrap_ddp(model)), valid_rows,
+                                         builder, tokenizer, args.max_seq_len,
+                                         args.batch, device, args.pack,
+                                         tokenizer.pad_token_id)
+                        last_valid_loss = vloss
+                        print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("eval/valid_loss", vloss, it)
     
-            # DDP barrier: ensure all ranks are at the same step before checkpointing.
+            # DDP/FSDP barrier: ensure all ranks are at the same step before
+            # checkpointing.
             # NOTE: _SHOULD_STOP is intentionally NOT in this condition. The flag is
             # set per-rank by an async signal handler, so including it in a collective
             # barrier would deadlock if ranks set the flag at different steps (some
@@ -1253,24 +1647,48 @@ def main():
             # on ANY step sets _SHOULD_STOP, which triggers checkpoint + exit on
             # the CURRENT step (the checkpoint condition below includes _SHOULD_STOP
             # independently of the barrier), so no next-step all-reduce is needed.
-            if args.ddp and (it % args.checkpoint_every == 0 or it == args.iters):
+            if is_distributed and (it % args.checkpoint_every == 0 or it == args.iters):
                 torch.distributed.barrier()
-    
-            # Only rank 0 writes checkpoints — DDP syncs gradients, so the model
-            # state is identical across ranks; writing from one is sufficient and
-            # avoids N copies of a multi-GB checkpoint hitting disk simultaneously.
-            if is_main and (it % args.checkpoint_every == 0 or it == args.iters or _SHOULD_STOP):
+
+            # Only rank 0 writes checkpoints — DDP syncs gradients (so the model
+            # state is identical across ranks); FSDP shards params, so rank 0
+            # gathers the full state dict before writing (other ranks get empty
+            # dicts, avoiding N copies of a multi-GB checkpoint on disk).
+            #
+            # IMPORTANT: get_full_state_dict() is a COLLECTIVE operation under
+            # FSDP (it all-gathers sharded params to rank 0). Even with
+            # rank0_only=True, ALL ranks must enter the context and call
+            # state_dict() — non-rank-0 ranks participate in the all-gather
+            # but receive {}. So the gather MUST happen OUTSIDE the `if is_main`
+            # gate; only the disk write is rank-0-only.
+            is_checkpoint_step = (it % args.checkpoint_every == 0
+                                  or it == args.iters or _SHOULD_STOP)
+            # FSDP: all ranks gather the full model + optimizer state (both are
+            # collectives — all ranks must participate even though only rank 0
+            # gets the result).
+            full_sd = None
+            full_optim_sd = None
+            is_fsdp = type(model).__name__ == "FullyShardedDataParallel"
+            if is_checkpoint_step and is_fsdp:
+                full_sd = get_full_state_dict(model)
+                full_optim_sd = get_full_optim_state_dict(model, optimizer)
+            if is_main and is_checkpoint_step:
                 ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
-                # Unwrap DDP for checkpointing: save_pretrained / state_dict need the
-                # underlying model, not the DDP wrapper (which prefixes keys with
-                # "module." and has no save_pretrained).
-                save_model = unwrap_ddp(model)
+                # For FSDP: use the gathered full state dicts via shims that
+                # override save_pretrained() / state_dict().
+                # For DDP/single-GPU: unwrap_ddp gives the raw model/optimizer.
+                if full_sd is not None:
+                    save_model = _StateDictModel(_fsdp_unwrap(model), full_sd)
+                    save_optimizer = _StateDictOptimizer(optimizer, full_optim_sd)
+                else:
+                    save_model = unwrap_ddp(model)
+                    save_optimizer = optimizer
                 # When resuming, the latest modeling_custom.py lives in the checkpoint
                 # dir (the user may have updated it there). For a fresh run, copy it
                 # from the original --model path.
                 custom_code_src = save_dir if resumed else Path(args.model)
                 if args.async_checkpoint:
-                    async_ckpt.save(save_model, optimizer, it, save_dir, tokenizer,
+                    async_ckpt.save(save_model, save_optimizer, it, save_dir, tokenizer,
                                     extra_state=ckpt_extra,
                                     custom_code_src=custom_code_src)
                     # On exit (SIGTERM or final iter) the write MUST finish before the
@@ -1281,7 +1699,7 @@ def main():
                     if _SHOULD_STOP or it == args.iters:
                         async_ckpt.wait_for_pending()
                 else:
-                    atomic_save_checkpoint(save_model, optimizer, it, save_dir, tokenizer,
+                    atomic_save_checkpoint(save_model, save_optimizer, it, save_dir, tokenizer,
                                            extra_state=ckpt_extra,
                                            custom_code_src=custom_code_src)
     
@@ -1306,7 +1724,7 @@ def main():
             tb_writer.close()
         if profiler is not None:
             profiler.__exit__(None, None, None)
-        if args.ddp:
+        if is_distributed and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
 

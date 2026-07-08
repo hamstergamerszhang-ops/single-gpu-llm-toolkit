@@ -1091,3 +1091,560 @@ def test_generate_build_gen_kwargs_sampling():
     assert kwargs["do_sample"] is True
     assert kwargs["temperature"] == 0.8
     assert kwargs["pad_token_id"] == 2, "pad_token_id=None should fall back to eos_token_id"
+
+
+# ── compress_model.py ───────────────────────────────────────────────────────
+
+def test_compress_detect_config_layout():
+    from compress_model import detect_config_layout
+    assert detect_config_layout({"text_config": {"hidden_size": 3072}}) == "nested"
+    assert detect_config_layout({"hidden_size": 4096}) == "flat"
+    assert detect_config_layout({}) == "flat"
+
+
+def test_compress_get_model_info_nested():
+    from compress_model import get_model_info
+    cfg = {"model_type": "gemma4", "text_config": {"hidden_size": 3072, "num_hidden_layers": 48, "vocab_size": 256000}}
+    info = get_model_info(cfg)
+    assert info["layout"] == "nested"
+    assert info["hidden_size"] == 3072
+    assert info["num_layers"] == 48
+
+
+def test_compress_get_model_info_flat():
+    from compress_model import get_model_info
+    cfg = {"model_type": "llama", "hidden_size": 4096, "num_hidden_layers": 32, "vocab_size": 32000}
+    info = get_model_info(cfg)
+    assert info["layout"] == "flat"
+    assert info["hidden_size"] == 4096
+    assert info["num_layers"] == 32
+
+
+def test_compress_plan_quantization():
+    from compress_model import plan_quantization, get_model_info
+    info = get_model_info({"model_type": "llama", "hidden_size": 4096})
+    for q in ("int8", "int4", "fp8"):
+        plan = plan_quantization(q, info)
+        assert plan["quant"] == q
+        assert "size_reduction" in plan
+        assert "hardware" in plan
+
+
+def test_compress_invalid_quant_raises():
+    from compress_model import plan_quantization, get_model_info
+    info = get_model_info({"model_type": "llama"})
+    with pytest.raises(SystemExit):
+        plan_quantization("int2", info)
+
+
+# ── tensor_parallel.py ──────────────────────────────────────────────────────
+
+def test_tp_plan_sharding_single():
+    from tensor_parallel import plan_sharding
+    plan = plan_sharding(1, {"model_type": "llama", "hidden_size": 4096, "num_layers": 32})
+    assert plan["mode"] == "single_gpu"
+    assert plan["num_gpus"] == 1
+
+
+def test_tp_plan_sharding_multi():
+    from tensor_parallel import plan_sharding
+    plan = plan_sharding(4, {"model_type": "llama", "hidden_size": 4096, "num_layers": 32})
+    assert plan["mode"] == "pipeline_parallel"
+    assert plan["num_gpus"] == 4
+
+
+def test_tp_plan_sharding_zero():
+    from tensor_parallel import plan_sharding
+    plan = plan_sharding(0, {})
+    assert plan["mode"] == "single_gpu"
+
+
+def test_tp_detect_gpu_count():
+    from tensor_parallel import detect_gpu_count
+    count, archs = detect_gpu_count()
+    assert count >= 0
+    if count == 0:
+        assert archs == []
+
+
+# ── smart_hipify.py ─────────────────────────────────────────────────────────
+
+def test_hipify_api_substitution():
+    from smart_hipify import hipify_text
+    result, report = hipify_text("cudaMalloc(&ptr, size); cudaFree(ptr);")
+    assert "hipMalloc" in result
+    assert "hipFree" in result
+    assert "cudaMalloc" not in result
+    assert len(report["api_substitutions"]) == 2
+
+
+def test_hipify_header_substitution():
+    from smart_hipify import hipify_text
+    result, report = hipify_text('#include <cuda_runtime.h>\nint main(){}')
+    assert "hip/hip_runtime.h" in result
+    assert len(report["header_substitutions"]) == 1
+
+
+def test_hipify_library_calls_flagged():
+    from smart_hipify import hipify_text
+    result, report = hipify_text("cublasCreate(&handle);")
+    assert len(report["library_calls_flagged"]) == 1
+    assert "HIPIFY: TODO" in result
+    assert "cublasCreate" in result  # NOT substituted, just flagged
+
+
+def test_hipify_kernel_detection():
+    from smart_hipify import hipify_text
+    _, report = hipify_text("__global__ void kernel() {}")
+    assert report["kernels_found"] == 1
+
+
+def test_hipify_no_false_positives():
+    from smart_hipify import hipify_text
+    _, report = hipify_text("int main() { return 0; }")
+    assert len(report["api_substitutions"]) == 0
+    assert report["kernels_found"] == 0
+
+
+def test_hipify_auto_add_header():
+    from smart_hipify import hipify_text
+    result, report = hipify_text('#include <cuda_runtime.h>\nint main(){}')
+    assert report["hip_header_added"] is True
+    assert result.startswith("#include <hip/hip_runtime.h>")
+
+
+def test_hipify_no_duplicate_header():
+    from smart_hipify import hipify_text
+    _, report = hipify_text('#include <cuda_runtime.h>\n#include <hip/hip_runtime.h>\n')
+    assert report["hip_header_added"] is False
+
+
+def test_hipify_todo_comment_attaches_to_real_call_not_substring_match():
+    """Regression test: the TODO-comment insertion loop used to do
+    `if cuda_call in line:` (plain substring containment) instead of the same
+    word-boundary `pattern` used to COUNT occurrences. That meant a longer
+    identifier merely CONTAINING a flagged call name as a substring (e.g. a
+    wrapper function `my_cublasCreate_wrapper`) could steal the TODO comment
+    away from the real call site on a later line, even though the
+    word-boundary count itself was correct. Fixed to re-use `pattern` (via
+    re.search) for the line-attachment search too."""
+    from smart_hipify import hipify_text
+    src = (
+        "void my_cublasCreate_wrapper() {\n"
+        "    return;\n"
+        "}\n"
+        "\n"
+        "void real_usage() {\n"
+        "    cublasCreate(&handle);\n"
+        "}\n"
+    )
+    result, report = hipify_text(src)
+    lines = result.split("\n")
+    todo_idx = next(i for i, l in enumerate(lines) if "HIPIFY: TODO" in l)
+    # The TODO comment must be immediately followed by the REAL call site
+    # (cublasCreate(&handle);), not the wrapper function's definition line.
+    assert "cublasCreate(&handle)" in lines[todo_idx + 1], (
+        f"TODO comment attached to the wrong line: {lines[todo_idx + 1]!r}"
+    )
+    # And it must NOT have attached to the wrapper's def line.
+    wrapper_idx = next(i for i, l in enumerate(lines) if "my_cublasCreate_wrapper" in l)
+    assert "HIPIFY: TODO" not in lines[wrapper_idx - 1] if wrapper_idx > 0 else True
+
+
+# ── rocm_env.py: gfx_target_version KFD parser ─────────────────────────────
+
+def test_rocm_env_parses_real_gfx_target_version_values():
+    """Regression test for a parser that silently produced WRONG archs for
+    every real-world KFD gfx_target_version value. The field is a plain
+    decimal integer (major*10000 + minor*100 + stepping, minor/stepping as
+    hex), per AMD's own rocm_agent_enumerator readFromKFD() -- NOT a packed
+    hex word as a prior version of this parser assumed (it did
+    `(ver_int >> 16) & 0xFF` / `(ver_int >> 8) & 0xFF`, which decoded 90402
+    ("gfx942", MI300X) to "gfx0111" -- completely wrong)."""
+    from rocm_env import parse_kfd_gfx_target_version
+    assert parse_kfd_gfx_target_version("110000") == "gfx1100"  # RX 7900 / consumer RDNA3
+    assert parse_kfd_gfx_target_version("90402") == "gfx942"    # MI300X
+    assert parse_kfd_gfx_target_version("90010") == "gfx90a"    # MI250X
+    assert parse_kfd_gfx_target_version("100300") == "gfx1030"  # RX 6800
+    assert parse_kfd_gfx_target_version("80003") == "gfx803"    # Fiji/Polaris
+    assert parse_kfd_gfx_target_version("120001") == "gfx1201"  # gfx1201
+
+
+def test_rocm_env_gfx_target_version_edge_cases():
+    from rocm_env import parse_kfd_gfx_target_version
+    # gfx_target_version == 0 on a CPU-only KFD node -- not a GPU, not a bug.
+    assert parse_kfd_gfx_target_version("0") is None
+    assert parse_kfd_gfx_target_version("garbage") is None
+    assert parse_kfd_gfx_target_version(None) is None
+    # Hex-prefixed strings are still accepted (0x-prefixed values seen on some
+    # kernels/tools) and decoded via the SAME decimal formula after int(x, 16).
+    assert parse_kfd_gfx_target_version("0x1adb2") == parse_kfd_gfx_target_version(str(0x1adb2))
+
+
+# ── benchmark.py: real `del` frees locals (locals()-mutation was a no-op) ──
+
+def test_benchmark_locals_cleanup_is_not_a_dict_mutation_noop():
+    """Regression test for the CPython gotcha where `del locals()[name]`
+    inside a function body is a silent no-op (locals() returns a snapshot
+    dict; writing to it does not delete the real fast-local variable). A
+    prior version of benchmark.py's per-config cleanup loop did exactly that
+    for `outputs`/`input_ids`/`labels`/`attn`, so those variables (and their
+    tensors) stayed alive across configs instead of being freed. This test
+    exercises the exact pattern (not benchmark.py's GPU-only code directly,
+    which needs CUDA) to pin the correct behavior: a real conditional `del`
+    statement DOES free the name, where the locals()-mutation pattern does
+    NOT."""
+    def using_locals_dict_mutation():
+        outputs = object()
+        for name in ("outputs",):
+            if name in locals():
+                del locals()[name]
+        # BUG: outputs is still bound after the no-op "deletion" above.
+        return "outputs" in dir()
+
+    def using_real_del_statement():
+        outputs = object()
+        if "outputs" in dir():
+            del outputs
+        return "outputs" in dir()
+
+    assert using_locals_dict_mutation() is True, (
+        "sanity check: locals()-dict-mutation is a no-op (this documents the "
+        "bug pattern itself, not benchmark.py -- confirms the no-op exists in "
+        "this Python version before asserting the fix pattern below works)"
+    )
+    assert using_real_del_statement() is False, (
+        "a real `del` statement (guarded by dir() for the unbound case) "
+        "correctly frees the local variable"
+    )
+
+
+# ── generate.py: streamer timeout raises queue.Empty, not StopIteration ────
+
+def test_generate_streamer_timeout_raises_queue_empty_not_stopiteration():
+    """Regression test: TextIteratorStreamer.__next__() calls
+    `self.text_queue.get(timeout=self.timeout)` (a plain queue.Queue.get),
+    which raises queue.Empty on timeout -- NOT StopIteration. A prior version
+    of stream_generate()'s read loop only caught `except StopIteration`,
+    so a real timeout (generate() stalls, or its background thread dies
+    without calling streamer.end()) would propagate an uncaught queue.Empty
+    out of stream_generate(). Verifies both exception types against the
+    actual installed transformers' TextIteratorStreamer implementation."""
+    import queue
+    import inspect
+    from transformers import TextIteratorStreamer
+    src = inspect.getsource(TextIteratorStreamer.__next__)
+    assert ".get(timeout=" in src, (
+        "TextIteratorStreamer.__next__ no longer calls Queue.get(timeout=...) "
+        "in this transformers version -- re-check what exception it raises "
+        "on timeout before trusting this test's premise"
+    )
+    # Directly confirm queue.Queue.get(timeout=...) raises queue.Empty (the
+    # underlying primitive TextIteratorStreamer relies on).
+    q = queue.Queue()
+    with pytest.raises(queue.Empty):
+        q.get(timeout=0.05)
+
+    # And confirm stream_generate's except clause actually names queue.Empty
+    # (not just StopIteration) by reading its own source.
+    from generate import stream_generate
+    gen_src = inspect.getsource(stream_generate)
+    assert "except queue.Empty" in gen_src, (
+        "stream_generate() must catch queue.Empty from the streamer read "
+        "loop, not just StopIteration"
+    )
+
+
+# ── train_cpt.py: _StateDictModel FSDP checkpoint shim ─────────────────────
+
+def _make_tied_weight_model():
+    """A tiny torch.nn.Module simulating an HF causal-LM with tied
+    embeddings: lm_head.weight and embed.weight share the same Parameter
+    object (real tied-weight tensor sharing, not just equal values), plus
+    `_tied_weights_keys` naming the tied key the way HF models expose it."""
+    import torch
+
+    class TinyTiedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+            self.lm_head.weight = self.embed.weight  # real tied-weight sharing
+            self._tied_weights_keys = ["lm_head.weight"]
+
+        def forward(self, x):
+            return self.lm_head(self.embed(x))
+
+        def save_pretrained(self, out_dir, safe_serialization=True, state_dict=None):
+            import os
+            os.makedirs(out_dir, exist_ok=True)
+            sd = state_dict if state_dict is not None else self.state_dict()
+            torch.save(dict(sd), os.path.join(out_dir, "model_state.pt"))
+            return sd
+
+    return TinyTiedModel()
+
+
+def test_state_dict_model_save_pretrained_preserves_caller_deduped_state_dict():
+    """Regression test for the core async-checkpoint FSDP bug: _StateDictModel
+    .save_pretrained() used to unconditionally do
+    `kwargs["state_dict"] = self._full_state_dict`, clobbering a
+    caller-supplied (already tied-weight-deduped) state_dict= kwarg with its
+    own raw, un-deduped full_state_dict. This is exactly the call pattern
+    async_checkpoint.py's save() uses: it calls model.state_dict() (returns
+    the full/raw dict), strips tied keys itself into a new deduped dict, then
+    passes THAT to save_pretrained(state_dict=deduped). The dedup must
+    survive through to the actual save_pretrained call."""
+    from train_cpt import _StateDictModel
+
+    model = _make_tied_weight_model()
+    full_state_dict = model.state_dict()  # includes BOTH embed.weight and lm_head.weight
+    assert "lm_head.weight" in full_state_dict and "embed.weight" in full_state_dict
+
+    shim = _StateDictModel(model, full_state_dict)
+
+    # shim.state_dict() must return the pre-gathered full dict (this is what
+    # async_checkpoint.py calls to build its own deduped snapshot from).
+    assert shim.state_dict() is full_state_dict
+
+    # Simulate async_checkpoint.py's own dedup step exactly (see
+    # async_checkpoint.py save(), tied_keys stripping): drop the tied key.
+    tied_keys = set(getattr(model, "_tied_weights_keys", {}) or {})
+    deduped = {k: v for k, v in shim.state_dict().items() if k not in tied_keys}
+    assert "lm_head.weight" not in deduped
+    assert "embed.weight" in deduped
+
+    captured = {}
+
+    def fake_underlying_save_pretrained(out_dir, safe_serialization=True, state_dict=None):
+        captured["state_dict"] = state_dict
+        captured["safe_serialization"] = safe_serialization
+
+    model.save_pretrained = fake_underlying_save_pretrained
+
+    shim.save_pretrained("/tmp/unused", state_dict=deduped)
+
+    # The deduped dict passed by the caller must survive unmodified -- NOT be
+    # replaced by the shim's own full_state_dict (which still has the tied key).
+    assert captured["state_dict"] is deduped, (
+        "save_pretrained() must not clobber a caller-supplied state_dict= kwarg"
+    )
+    assert "lm_head.weight" not in captured["state_dict"], (
+        "tied-weight dedup was undone -- the shim overwrote the caller's "
+        "deduped state_dict with its own un-deduped full_state_dict"
+    )
+
+
+def test_state_dict_model_save_pretrained_still_supplies_default_when_absent():
+    """The sync checkpoint path (atomic_save_checkpoint) calls
+    model.save_pretrained(tmp_dir, safe_serialization=True) with NO
+    state_dict= kwarg at all -- the shim must still supply its
+    full_state_dict as the default in that case (this is the behavior the
+    shim exists for in the first place)."""
+    from train_cpt import _StateDictModel
+
+    model = _make_tied_weight_model()
+    full_state_dict = model.state_dict()
+    shim = _StateDictModel(model, full_state_dict)
+
+    captured = {}
+
+    def fake_underlying_save_pretrained(out_dir, safe_serialization=True, state_dict=None):
+        captured["state_dict"] = state_dict
+
+    model.save_pretrained = fake_underlying_save_pretrained
+    shim.save_pretrained("/tmp/unused")  # no state_dict= kwarg passed at all
+
+    assert captured["state_dict"] is full_state_dict
+
+
+def test_state_dict_optimizer_class_spoofing_via_attribute_access():
+    """_StateDictOptimizer.__class__ is a @property override so the wrapped
+    optimizer's real class name (e.g. "AdamW") is reported instead of
+    "_StateDictOptimizer". IMPORTANT: this only works via normal ATTRIBUTE
+    access (`shim.__class__.__name__`) -- the `type()` BUILTIN reads the
+    instance's real C-level type slot directly and does NOT consult a
+    __class__ property override, so `type(shim).__name__` is ALWAYS
+    "_StateDictOptimizer" regardless of the property. A real bug (found while
+    testing _StateDictModel, same file/mechanism) used `type(optimizer)
+    .__name__` at both checkpoint-write call sites (train_cpt.py's
+    atomic_save_checkpoint + async_checkpoint.py's save()), so every FSDP
+    checkpoint wrote optimizer_type="_StateDictOptimizer" instead of the real
+    class -- causing check_optimizer_compat() to ALWAYS see a mismatch on
+    resume (since the shim doesn't exist at resume time) and silently discard
+    Adam momentum on every single FSDP resume. Fixed both call sites to use
+    `.__class__.__name__` (attribute access) instead of `type(...).__name__`
+    (builtin)."""
+    import torch
+    from train_cpt import _StateDictOptimizer
+
+    model = _make_tied_weight_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    shim = _StateDictOptimizer(optimizer, {"fake": "state"})
+
+    # Documents the gotcha itself: type() bypasses the property.
+    assert type(shim).__name__ == "_StateDictOptimizer"
+    # The property DOES work via attribute access -- this is what the two
+    # checkpoint-write call sites must use.
+    assert shim.__class__.__name__ == "AdamW"
+    assert shim.state_dict() == {"fake": "state"}
+
+
+def test_checkpoint_write_sites_use_class_attribute_not_type_builtin():
+    """Regression test pinning that BOTH checkpoint-write call sites
+    (train_cpt.py's atomic_save_checkpoint, async_checkpoint.py's save())
+    read the optimizer's class name via `.__class__.__name__` (attribute
+    access, respects _StateDictOptimizer's @property override), not
+    `type(optimizer).__name__` (builtin, silently always returns
+    "_StateDictOptimizer" for the shim -- breaking FSDP resume's
+    optimizer-compat check every time)."""
+    import inspect
+    import io
+    import tokenize
+    import train_cpt
+    import async_checkpoint
+
+    def _code_tokens_only(func):
+        """Return only NAME/OP/NUMBER/STRING-as-code tokens' exact text,
+        joined -- i.e. tokenize.generate_tokens with COMMENT tokens dropped
+        and docstring/string literals reduced to a placeholder, so a
+        substring check below only matches real executable expressions like
+        `type(optimizer).__name__`, not the same text appearing inside a `#`
+        comment or a docstring explaining what NOT to do (both of which this
+        fix's own explanatory comments do, on purpose, as prose)."""
+        src = inspect.getsource(func)
+        out = []
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type in (tokenize.COMMENT,):
+                continue
+            if tok.type == tokenize.STRING:
+                out.append("STRING_LITERAL")
+                continue
+            out.append(tok.string)
+        return " ".join(out)
+
+    train_code = _code_tokens_only(train_cpt.atomic_save_checkpoint)
+    assert "optimizer . __class__ . __name__" in train_code
+    assert "type ( optimizer ) . __name__" not in train_code
+
+    async_code = _code_tokens_only(async_checkpoint.AsyncCheckpointer.save)
+    assert "optimizer . __class__ . __name__" in async_code
+    assert "type ( optimizer ) . __name__" not in async_code
+
+
+# ── train_cpt.py: --fsdp with world_size==1 must not silently stay on CPU ──
+
+def test_fsdp_world_size_one_condition_matches_wrap_condition():
+    """Regression test for a bug where `torchrun --nproc_per_node=1 ...
+    --fsdp` (which sets RANK=0/WORLD_SIZE=1, passing the --fsdp validation)
+    caused the model to be loaded WITHOUT .to(device) (because the load-time
+    check was `if args.fsdp:` alone) AND never actually FSDP-wrapped (because
+    the wrap-time check is `if args.fsdp and ddp_world_size > 1:`) -- the
+    model silently stayed on CPU with no error. The fix makes both the
+    load-time device-move decision and the wrap-time decision key off the
+    IDENTICAL condition (`args.fsdp and ddp_world_size > 1`), so this test
+    parses train_cpt.py's source and asserts:
+      1. a single shared `will_wrap_fsdp` condition is computed once
+      2. it gates BOTH the .to(device) skip at load time
+      3. and the _wrap_fsdp() call at wrap time
+    (A true end-to-end test would need torchrun + a real process group, which
+    isn't feasible in this CPU-only pytest suite -- this test instead pins
+    the source-level invariant that made the bug possible: two independently
+    written conditions silently drifting apart.)"""
+    import ast
+    import inspect
+    import re
+    import train_cpt
+
+    src = inspect.getsource(train_cpt)
+
+    # Exactly one definition of the shared condition, computed once.
+    def_matches = list(re.finditer(r"will_wrap_fsdp\s*=\s*args\.fsdp\s+and\s+ddp_world_size\s*>\s*1", src))
+    assert len(def_matches) == 1, (
+        f"expected exactly one `will_wrap_fsdp = args.fsdp and ddp_world_size > 1` "
+        f"definition (single shared condition), found {len(def_matches)}"
+    )
+    def_pos = def_matches[0].start()
+
+    # Every subsequent use of the condition must be the bare variable
+    # `will_wrap_fsdp` (reused), not a re-derived `args.fsdp and
+    # ddp_world_size > 1` expression that could silently drift out of sync
+    # with the definition -- that drift is exactly what caused the original
+    # bug (load-time used `if args.fsdp:` alone; wrap-time used
+    # `if args.fsdp and ddp_world_size > 1:` -- two independently written
+    # conditions that didn't match for world_size==1).
+    after_def = src[def_pos:]
+    usage_matches = list(re.finditer(r"\bwill_wrap_fsdp\b", after_def))
+    # def_matches[0] itself is one occurrence (the LHS); need at least 2 more
+    # uses: the load-time device-move gate and the wrap-time _wrap_fsdp() gate.
+    assert len(usage_matches) >= 3, (
+        f"expected will_wrap_fsdp to be referenced at least twice after its "
+        f"definition (load-time .to(device) gate + wrap-time _wrap_fsdp() "
+        f"gate), found {len(usage_matches) - 1} uses"
+    )
+
+    # The load-time model-loading branch (the one containing
+    # AutoModelForCausalLM.from_pretrained twice, .to(device) in the else)
+    # must be gated by `if will_wrap_fsdp:`.
+    load_branch_match = re.search(
+        r"if will_wrap_fsdp:\s*\n\s*model = AutoModelForCausalLM\.from_pretrained\([^)]*\)\s*\n"
+        r"\s*else:\s*\n\s*model = AutoModelForCausalLM\.from_pretrained\([^)]*\)\.to\(device\)",
+        src,
+    )
+    assert load_branch_match is not None, (
+        "expected `if will_wrap_fsdp: ... else: ... .to(device)` gating the "
+        "model load"
+    )
+
+    # The wrap-time branch that actually calls _wrap_fsdp() must ALSO be
+    # gated (possibly via an intermediate nested `if`, e.g. windowed-freeze
+    # logging) by the same `will_wrap_fsdp` variable somewhere in its chain
+    # of enclosing `if` statements -- not a re-derived condition instead of
+    # it. Use ast to walk the real enclosing-block structure rather than
+    # fragile regex/text-distance heuristics (which broke on a nested
+    # `if windowed_freeze:` between `if will_wrap_fsdp:` and the actual call).
+    import train_cpt as _train_cpt_module
+    module_src = inspect.getsource(_train_cpt_module)
+    tree = ast.parse(module_src)
+
+    call_node = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_wrap_fsdp"):
+            call_node = node
+            break
+    assert call_node is not None, "no _wrap_fsdp(...) call found in train_cpt.py"
+
+    # Find every If node in the module and check whether call_node's line
+    # falls within an `if will_wrap_fsdp:` node's body (directly, or nested
+    # inside another If within that body).
+    def contains_line(node, lineno):
+        return getattr(node, "lineno", None) is not None and \
+            node.lineno <= lineno <= getattr(node, "end_lineno", node.lineno)
+
+    def is_will_wrap_fsdp_test(test_node):
+        return isinstance(test_node, ast.Name) and test_node.id == "will_wrap_fsdp"
+
+    gated_by_will_wrap_fsdp = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and is_will_wrap_fsdp_test(node.test):
+            if any(contains_line(stmt, call_node.lineno) for stmt in node.body):
+                gated_by_will_wrap_fsdp = True
+                break
+            # Also true if the call is nested inside a deeper If within this
+            # If's body (e.g. `if will_wrap_fsdp: if windowed_freeze: ...
+            # _wrap_fsdp(...)` -- windowed_freeze only gates a print, but
+            # _wrap_fsdp() itself is still inside the outer will_wrap_fsdp
+            # body at the top level, per the actual source layout).
+            for stmt in ast.walk(node):
+                if contains_line(stmt, call_node.lineno) and stmt is not node:
+                    gated_by_will_wrap_fsdp = True
+                    break
+            if gated_by_will_wrap_fsdp:
+                break
+
+    assert gated_by_will_wrap_fsdp, (
+        "_wrap_fsdp() call must be inside an `if will_wrap_fsdp:` block -- "
+        "this is exactly the kind of independently-derived condition drift "
+        "that caused the original --fsdp/world_size==1 bug"
+    )

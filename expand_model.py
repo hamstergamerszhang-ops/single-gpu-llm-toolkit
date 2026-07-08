@@ -488,7 +488,7 @@ def main():
 
     gqa_applied = False
     if args.gqa_kv_heads > 0:
-        old_kv_heads = tc.get("num_global_key_value_heads", 1)
+        old_kv_heads = tc.get("num_global_key_value_heads", tc.get("num_key_value_heads", 1))
         # .get(...) all the way down -- NOT tc["head_dim"] -- because "no
         # head_dim key at all" must flow into the same safe-skip path as any
         # other layout mismatch, not raise a raw KeyError before
@@ -586,7 +586,10 @@ def main():
     # a spurious text_config dict on flat configs (Llama/Mistral/Qwen).
     tc["intermediate_size"] = new_intermediate
     tc["num_hidden_layers"] = new_layers
-    tc["layer_types"] = new_layer_types
+    # Only write layer_types back if the original config had it — don't create
+    # a spurious Gemma-4-specific field on flat (Llama/Mistral/Qwen) configs.
+    if "layer_types" in tc:
+        tc["layer_types"] = new_layer_types
 
     if gqa_applied:
         # attention_k_eq_v=False disables the MQA shortcut (V reusing K) for
