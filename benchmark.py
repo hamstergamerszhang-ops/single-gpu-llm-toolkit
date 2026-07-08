@@ -244,14 +244,30 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         # unsupported architecture falls back gracefully instead of killing the
         # whole benchmark sweep — mirrors train_cpt.py's _apply_* pattern.
         if cfg["dtype"] == "fp8":
-            try:
-                from torchao.float8 import convert_to_float8_training
-                convert_to_float8_training(model)
-                log("  fp8 enabled (torchao)")
-            except ImportError:
-                log("  WARNING: torchao not installed, using bf16")
-            except Exception as e:
-                log(f"  WARNING: fp8 conversion failed ({e}), using bf16")
+            # Arch gate: fp8 training requires gfx942 (MI300X/MI325X). On other
+            # cards the conversion succeeds but the first forward crashes
+            # (torch._scaled_mm has no kernel). Gate before converting so the
+            # benchmark reports "skipped" instead of crashing — mirrors
+            # train_cpt.py's _apply_fp8 capability check.
+            _fp8_ok = False
+            if torch.cuda.is_available():
+                cap = torch.cuda.get_device_capability()
+                # On ROCm, get_device_capability returns (gfx_major, gfx_minor).
+                # gfx942 = MI300X/MI325X (native fp8). NVIDIA H100 = (9, 0) also
+                # has fp8, but this repo targets ROCm.
+                if cap[0] == 9 and cap[1] >= 42:
+                    _fp8_ok = True
+            if not _fp8_ok:
+                log("  WARNING: fp8 requires gfx942 (MI300X/MI325X) — skipping, using bf16")
+            else:
+                try:
+                    from torchao.float8 import convert_to_float8_training
+                    convert_to_float8_training(model)
+                    log("  fp8 enabled (torchao)")
+                except ImportError:
+                    log("  WARNING: torchao not installed, using bf16")
+                except Exception as e:
+                    log(f"  WARNING: fp8 conversion failed ({e}), using bf16")
         if cfg["flash"]:
             try:
                 import flash_attn  # noqa: F401
