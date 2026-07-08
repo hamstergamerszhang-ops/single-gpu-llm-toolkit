@@ -21,16 +21,48 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check executable bits
+        # The CLI entrypoints below are invoked directly (./file.py) by real
+        # users per the README, and have lost their +x bit and regained it
+        # again across several review passes in this repo's history (most
+        # recently: benchmark.py, catch_and_resume.sh, compress_model.py,
+        # expand_model.py, generate.py, rocm_env.py, smart_hipify.py,
+        # tensor_parallel.py, train_cpt.py all reverted to 644 in one pass).
+        # The self-test loop below invokes `python "$f" --selftest` explicitly,
+        # which does NOT exercise the executable bit at all -- so that loop
+        # passing is not evidence the bit survived. Check it here directly so
+        # CI actually catches the regression instead of it only being noticed
+        # when a user tries `./train_cpt.py ...` and gets "Permission denied".
+        run: |
+          missing=0
+          for f in async_checkpoint.py benchmark.py bnb_optimizer.py \
+                   catch_and_resume.sh compress_model.py expand_model.py \
+                   generate.py local_cache_stream.py mtp_head.py \
+                   oom_guard.sh optimizer_compat_guard.py preprocess_data.py \
+                   prune_embeddings_torch.py prune_vocab.py rocm_env.py \
+                   smart_hipify.py tensor_parallel.py train_cpt.py \
+                   train_sft.py; do
+            if [ ! -x "$f" ]; then
+              echo "MISSING +x: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "One or more CLI entrypoints lost their executable bit. Fix with: chmod +x <file>"
+            exit 1
+          fi
+          echo "OK: all CLI entrypoints are executable."
       - name: Install deps
         run: |
-          pip install numpy safetensors torch pytest transformers
+          pip install numpy safetensors torch pytest "transformers==5.7.0"
       - name: Run module self-tests
         run: |
           # Only modules with a --selftest flag (transformation tools like
           # prune_vocab/expand_model need real checkpoints, so they have no
           # self-test — they're covered by the pytest suite's logic tests).
-          # train_sft.py needs transformers installed above -- it builds a
-          # tiny real model rather than mocking transformers out.
+          # train_sft.py needs transformers installed above -- its selftest
+          # imports build_sft_example to verify the symbol exists (it
+          # delegates the real tests to train_cpt.self_test).
           for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
                    local_cache_stream.py optimizer_compat_guard.py \
                    rocm_env.py mtp_head.py train_sft.py \

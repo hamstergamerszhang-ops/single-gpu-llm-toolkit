@@ -39,15 +39,19 @@ RUN pip install --no-cache-dir \
         tensorboard \
         pytest
 
-# ROCm-specific optional performance deps. Generic PyPI wheels for these are
-# CUDA-only and will not use AMD GPU kernels. The commands below build/install
-# against the ROCm stack in this base image (headers and hipcc are present).
+# ROCm-specific optional performance deps. These are installed against the
+# ROCm stack in this base image (headers and hipcc are present). If a build
+# fails, the image build fails loudly so users know the feature is unavailable
+# rather than discovering it silently at runtime.
 
-# bitsandbytes: install a ROCm-enabled release. If the wheel does not exist for
-# this ROCm version, the trainer's bnb_optimizer.py falls back to AdamW, so a
-# missing build is not fatal to basic training -- but we still fail the image
-# build if the install command itself errors, because "silently missing bnb"
-# has been observed to OOM real runs.
+# bitsandbytes: as of current releases, the PyPI wheel ships ROCm kernels for
+# CDNA archs (gfx90a, gfx942) and RDNA3 archs (gfx1100-1103). Plain
+# `pip install bitsandbytes` is the recommended install path for ROCm
+# (preview support per bitsandbytes' own docs). If the wheel doesn't cover
+# your arch, the trainer's bnb_optimizer.py falls back to AdamW, so a missing
+# build is not fatal to basic training -- but we still fail the image build
+# if the install command itself errors, because "silently missing bnb" has
+# been observed to OOM real runs.
 RUN pip install --no-cache-dir bitsandbytes
 
 # torchao: used for fp8 training on MI300X/MI325X. The PyPI wheel may not have

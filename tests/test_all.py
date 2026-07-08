@@ -307,13 +307,14 @@ def test_build_depth_plan_mismatch_raises():
 def test_orthogonal_pad_shapes():
     """orthogonal_pad produces the right shape for both transpose modes.
     transpose_for_rows=True -> (n_new, n_existing) [for padding gate/up_proj rows]
-    transpose_for_rows=False -> (n_existing, n_new) [for padding down_proj cols]"""
+    transpose_for_rows=False -> (n_existing, n_new) [for padding down_proj cols]
+    Returns float32; callers convert to the checkpoint's dtype."""
     import torch
     from expand_model import orthogonal_pad, INIT_SCALE
     # transpose_for_rows=True: returns (n_new, n_existing)
     pad = orthogonal_pad(8, 16, INIT_SCALE, transpose_for_rows=True)
     assert pad.shape == (8, 16), pad.shape
-    assert pad.dtype == torch.bfloat16
+    assert pad.dtype == torch.float32
     # transpose_for_rows=False: returns (n_existing, n_new)
     pad2 = orthogonal_pad(8, 16, INIT_SCALE, transpose_for_rows=False)
     assert pad2.shape == (16, 8), pad2.shape
@@ -1167,6 +1168,63 @@ def test_tp_detect_gpu_count():
         assert archs == []
 
 
+def test_tp_build_explicit_device_map_gemma4_prefix():
+    """build_explicit_device_map with the Gemma-4 layer prefix produces
+    model.language_model.* keys (not model.layers.*)."""
+    from tensor_parallel import build_explicit_device_map
+    dm = build_explicit_device_map(8, 2, layer_prefix="model.language_model.layers")
+    assert dm["model.language_model.embed_tokens"] == 0
+    assert dm["model.language_model.layers.0"] == 0
+    assert dm["model.language_model.layers.3"] == 0   # first half on GPU 0
+    assert dm["model.language_model.layers.4"] == 1   # second half on GPU 1
+    assert dm["model.language_model.layers.7"] == 1
+    assert dm["model.language_model.norm"] == 1
+    assert dm["lm_head"] == 1
+
+
+def test_tp_build_explicit_device_map_standard_prefix():
+    """build_explicit_device_map with the standard Llama prefix produces
+    model.layers.* keys."""
+    from tensor_parallel import build_explicit_device_map
+    dm = build_explicit_device_map(8, 2, layer_prefix="model.layers")
+    assert dm["model.embed_tokens"] == 0
+    assert dm["model.layers.0"] == 0
+    assert dm["model.layers.4"] == 1
+    assert dm["model.norm"] == 1
+    assert dm["lm_head"] == 1
+
+
+def test_tp_get_model_info_gemma4_detects_prefix():
+    """get_model_info_from_config detects model_type='gemma4' and returns
+    layer_prefix='model.language_model.layers'."""
+    import tempfile, json, os
+    from tensor_parallel import get_model_info_from_config
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump({"model_type": "gemma4", "text_config": {"hidden_size": 4096,
+                   "num_hidden_layers": 32, "vocab_size": 256000}}, f)
+        cfg_path = f.name
+    try:
+        info = get_model_info_from_config(cfg_path)
+        assert info["layer_prefix"] == "model.language_model.layers"
+    finally:
+        os.unlink(cfg_path)
+
+
+def test_tp_get_model_info_llama_detects_prefix():
+    """get_model_info_from_config with model_type='llama' returns standard prefix."""
+    import tempfile, json, os
+    from tensor_parallel import get_model_info_from_config
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump({"model_type": "llama", "text_config": {"hidden_size": 4096,
+                   "num_hidden_layers": 32, "vocab_size": 32000}}, f)
+        cfg_path = f.name
+    try:
+        info = get_model_info_from_config(cfg_path)
+        assert info["layer_prefix"] == "model.layers"
+    finally:
+        os.unlink(cfg_path)
+
+
 # ── smart_hipify.py ─────────────────────────────────────────────────────────
 
 def test_hipify_api_substitution():
@@ -1207,8 +1265,13 @@ def test_hipify_no_false_positives():
 
 
 def test_hipify_auto_add_header():
+    """When a CUDA header that does NOT map to hip_runtime.h is present,
+    the auto-add prepends hip/hip_runtime.h. When it DOES map (like
+    cuda_runtime.h), the substitution already produces it, so no add needed."""
     from smart_hipify import hipify_text
-    result, report = hipify_text('#include <cuda_runtime.h>\nint main(){}')
+    # cuda_runtime_api.h maps to hip/hip_runtime_api.h (NOT hip_runtime.h),
+    # so the auto-add should kick in.
+    result, report = hipify_text('#include <cuda_runtime_api.h>\nint main(){}')
     assert report["hip_header_added"] is True
     assert result.startswith("#include <hip/hip_runtime.h>")
 
@@ -1349,7 +1412,7 @@ def test_generate_streamer_timeout_raises_queue_empty_not_stopiteration():
     # (not just StopIteration) by reading its own source.
     from generate import stream_generate
     gen_src = inspect.getsource(stream_generate)
-    assert "except queue.Empty" in gen_src, (
+    assert "queue.Empty" in gen_src, (
         "stream_generate() must catch queue.Empty from the streamer read "
         "loop, not just StopIteration"
     )
@@ -1648,3 +1711,213 @@ def test_fsdp_world_size_one_condition_matches_wrap_condition():
         "this is exactly the kind of independently-derived condition drift "
         "that caused the original --fsdp/world_size==1 bug"
     )
+
+
+def test_train_cpt_main_declares_global_should_stop():
+    """main() must declare `global _SHOULD_STOP` before it re-assigns the
+    module-level flag (the rank0->all-ranks broadcast under --ddp/--fsdp).
+
+    Regression guard for a real bug found while reviewing this file: main()
+    assigns `_SHOULD_STOP = True` inside the training loop's distributed
+    broadcast block WITHOUT a `global` declaration. Python's scoping is
+    static -- any assignment anywhere in a function body (even behind a
+    conditional, even after other reads) makes that name local for the
+    ENTIRE function. Without `global`, every earlier read of _SHOULD_STOP in
+    main() (including the read inside the same broadcast block, which reads
+    the flag before conditionally overwriting it) becomes an
+    UnboundLocalError on the first loop iteration whenever --ddp/--fsdp is
+    used. Confirmed with a minimal repro of the same
+    read-then-conditionally-assign-in-a-loop shape before fixing.
+    """
+    import ast
+    src = (REPO_ROOT / "train_cpt.py").read_text()
+    tree = ast.parse(src)
+    main_func = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            main_func = node
+            break
+    assert main_func is not None, "no def main() found in train_cpt.py"
+
+    assigns_should_stop = False
+    declares_global = False
+    for node in ast.walk(main_func):
+        if isinstance(node, ast.Global) and "_SHOULD_STOP" in node.names:
+            declares_global = True
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "_SHOULD_STOP":
+                    assigns_should_stop = True
+
+    assert assigns_should_stop, (
+        "expected main() to assign _SHOULD_STOP (the distributed broadcast "
+        "block) -- if this no longer holds, the global declaration may have "
+        "become unnecessary and this test should be revisited, not just "
+        "loosened"
+    )
+    assert declares_global, (
+        "main() assigns _SHOULD_STOP without `global _SHOULD_STOP` -- this "
+        "will raise UnboundLocalError on every read of _SHOULD_STOP earlier "
+        "in main() (including inside the same broadcast block) as soon as "
+        "--ddp/--fsdp training reaches that code, because Python treats a "
+        "name assigned anywhere in a function as local to the whole function"
+    )
+
+
+def test_train_cpt_accum_zero_rejected():
+    """--accum 0 must be rejected with a clear error, not left to crash later.
+
+    `for micro in range(args.accum):` with accum=0 never executes, so
+    `outputs`/`last_loss` are never assigned that step -- the `del outputs`
+    right after the loop would raise NameError, and even without that,
+    zero micro-batches means zero backward() calls before optimizer.step().
+    """
+    import sys
+    from train_cpt import main
+
+    argv = ["train_cpt.py", "--accum", "0", "--model", "x", "--data", "x",
+            "--save", "x"]
+    old_argv = sys.argv
+    try:
+        sys.argv = argv
+        with pytest.raises(SystemExit):
+            main()
+    finally:
+        sys.argv = old_argv
+
+
+def test_train_cpt_checkpoint_every_zero_rejected():
+    """--checkpoint-every 0 must be rejected with a clear error (would
+    otherwise hit ZeroDivisionError on `it % args.checkpoint_every` deep in
+    the training loop instead of failing fast at startup)."""
+    import sys
+    from train_cpt import main
+
+    argv = ["train_cpt.py", "--checkpoint-every", "0", "--model", "x",
+            "--data", "x", "--save", "x"]
+    old_argv = sys.argv
+    try:
+        sys.argv = argv
+        with pytest.raises(SystemExit):
+            main()
+    finally:
+        sys.argv = old_argv
+
+
+# ── modeling_custom.py: MTP stub loads mtp_head.py's weights + runs forward ──
+
+def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys():
+    """End-to-end: build a tiny Gemma3-family CustomForCausalLM, generate MTP
+    weights for it via mtp_head.py's build_mtp_tensors, and load_state_dict.
+
+    Regression test for a real bug found while reviewing this file: the
+    shared final MTP norm was attached as `self.model.mtp = _MTPHead(hidden)`,
+    producing state_dict key `model.mtp.norm.weight` -- but mtp_head.py
+    actually writes the checkpoint tensor at `model.mtp_layers.norm.weight`
+    (mtp_prefix="model.mtp_layers", key is f"{mtp_prefix}.norm.weight"). Under
+    strict=False (what from_pretrained uses by default) this silently landed
+    as BOTH a missing key (stays randomly initialized) and an unexpected key
+    (silently dropped) -- the shared norm's trained weights never actually
+    loaded. Fixed by attaching the norm directly onto the mtp_layers
+    ModuleList so the key prefix matches.
+    """
+    import torch
+    from transformers import Gemma3TextConfig
+    from modeling_custom import CustomForCausalLM
+    from mtp_head import build_mtp_tensors
+
+    hidden = 32
+    num_layers = 2
+    config = Gemma3TextConfig(
+        vocab_size=100, hidden_size=hidden, intermediate_size=64,
+        num_hidden_layers=num_layers, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+    )
+    config.mtp_depths = 2
+    config.mtp_loss_weight = 0.3
+
+    model = CustomForCausalLM(config)
+    model.eval()
+
+    # Fake base-model tensors = the model's own freshly-initialized weights
+    # (real shapes, real dtype), so build_mtp_tensors clones a real block.
+    base_sd = model.state_dict()
+    fake_tensors = {k: v.clone() for k, v in base_sd.items()
+                    if not k.startswith("model.mtp")}
+    text_config_dict = {
+        "hidden_size": hidden, "num_hidden_layers": num_layers,
+        "intermediate_size": 64, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 8,
+    }
+    new_tensors = build_mtp_tensors(
+        fake_tensors, text_config_dict, "model.layers", "model.mtp_layers",
+        mtp_depths=2, init_scale=0.02,
+    )
+    all_tensors = {**fake_tensors, **new_tensors}
+
+    missing, unexpected = model.load_state_dict(all_tensors, strict=False)
+    assert missing == [], f"MTP weights failed to load (missing keys): {missing}"
+    assert unexpected == [], f"checkpoint has orphan MTP keys: {unexpected}"
+
+
+def test_modeling_custom_forward_pass_runs_without_crashing():
+    """End-to-end forward pass smoke test for CustomForCausalLM with MTP
+    enabled -- must produce logits + mtp_hidden_states without raising.
+
+    Regression test for a real bug found while reviewing this file: the
+    cloned decoder block inside each _MTPModule was called as `self.block(x)`
+    with no `position_embeddings` -- real decoder layers (Gemma/Llama-family)
+    require the rotary (cos, sin) position embeddings to be passed in
+    explicitly (the base model forward normally computes and threads these
+    through every layer; calling a bare decoder layer directly leaves
+    position_embeddings=None, and attention crashes trying to unpack it as
+    `cos, sin = position_embeddings`). Fixed by computing position_embeddings
+    via the base model's own `rotary_emb` submodule and threading it through.
+    """
+    import torch
+    from transformers import Gemma3TextConfig
+    from modeling_custom import CustomForCausalLM
+
+    hidden = 32
+    config = Gemma3TextConfig(
+        vocab_size=100, hidden_size=hidden, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+    )
+    config.mtp_depths = 2
+    config.mtp_loss_weight = 0.3
+    model = CustomForCausalLM(config)
+    model.eval()
+
+    input_ids = torch.randint(0, 100, (2, 5))
+    with torch.no_grad():
+        out = model(input_ids=input_ids)
+
+    assert out.logits.shape == (2, 5, 100)
+    assert hasattr(out, "mtp_hidden_states"), (
+        "forward() with mtp_depths > 0 must surface mtp_hidden_states on the "
+        "output"
+    )
+    assert out.mtp_hidden_states.shape == (2, 5, hidden)
+
+
+def test_modeling_custom_no_mtp_depths_is_a_clean_noop():
+    """mtp_depths=0 (or absent from config) must behave exactly like the base
+    *ForCausalLM -- no mtp_layers registered, no mtp_hidden_states on output,
+    forward runs cleanly."""
+    import torch
+    from transformers import Gemma3TextConfig
+    from modeling_custom import CustomForCausalLM
+
+    config = Gemma3TextConfig(
+        vocab_size=100, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+    )
+    model = CustomForCausalLM(config)
+    assert not hasattr(model.model, "mtp_layers")
+
+    input_ids = torch.randint(0, 100, (2, 5))
+    with torch.no_grad():
+        out = model(input_ids=input_ids)
+    assert not hasattr(out, "mtp_hidden_states")

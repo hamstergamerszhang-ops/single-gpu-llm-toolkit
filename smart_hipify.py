@@ -41,7 +41,6 @@ Self-test (no GPU required — exercises the substitution + detection logic):
 import argparse
 import os
 import re
-import sys
 
 
 def log(msg: str):
@@ -123,9 +122,6 @@ CUDA_LIBRARY_CALLS = {
     "cusparseDestroy": "rocsparse_destroy_handle",
 }
 
-# CUDA qualifiers that are compatible with HIP (no change needed, but log them).
-CUDA_QUALIFIERS = ["__global__", "__device__", "__host__", "__shared__", "__constant__"]
-
 
 def hipify_text(source: str) -> tuple:
     """Convert CUDA source text to HIP. Returns (hipified_text, report) where
@@ -199,11 +195,14 @@ def hipify_text(source: str) -> tuple:
                 f"conversion required. A TODO comment was inserted."
             )
 
-    # Add hip/hip_runtime.h if CUDA headers were found but no HIP header
-    # already existed in the ORIGINAL source (before our substitution added one).
+    # Add hip/hip_runtime.h if CUDA headers were found but no HIP header is
+    # already present. Check against `result` (post-substitution), NOT the
+    # original `source`: a CUDA header like cuda.h or cuda_runtime.h is itself
+    # substituted to hip/hip_runtime.h above, so checking `source` would miss
+    # that and prepend a DUPLICATE #include <hip/hip_runtime.h>.
     has_cuda = bool(report["header_substitutions"])
-    has_hip_original = "hip/hip_runtime.h" in source
-    if has_cuda and not has_hip_original:
+    has_hip = "hip/hip_runtime.h" in result
+    if has_cuda and not has_hip:
         result = '#include <hip/hip_runtime.h>\n' + result
         report["hip_header_added"] = True
 
@@ -332,11 +331,25 @@ def _self_test():
     print("  OK (HIP header not duplicated when already present)")
 
     # HIP header added when CUDA headers found but no HIP header.
-    src = '#include <cuda_runtime.h>\nint main() { return 0; }'
+    # Use cuda_runtime_api.h (maps to hip/hip_runtime_api.h, NOT
+    # hip/hip_runtime.h) so the auto-add path is genuinely exercised:
+    # cuda_runtime.h itself substitutes to hip/hip_runtime.h, so with the
+    # post-substitution duplicate check it would no longer trigger an add.
+    src = '#include <cuda_runtime_api.h>\nint main() { return 0; }'
     result, report = hipify_text(src)
     assert report["hip_header_added"]
     assert result.startswith("#include <hip/hip_runtime.h>")
     print("  OK (HIP header auto-added when CUDA headers detected)")
+
+    # No duplicate hip header when a CUDA header itself maps to
+    # hip/hip_runtime.h (cuda_runtime.h -> hip/hip_runtime.h): the
+    # post-substitution check must see the already-present hip header and NOT
+    # prepend a second one.
+    src = '#include <cuda_runtime.h>\nint main() { return 0; }'
+    result, report = hipify_text(src)
+    assert result.count("#include <hip/hip_runtime.h>") == 1
+    assert not report["hip_header_added"]
+    print("  OK (no duplicate hip header when CUDA header maps to it)")
 
     # Library calls flagged (not silently converted).
     src = "cublasCreate(&handle); cublasSgemm(handle, ...);"

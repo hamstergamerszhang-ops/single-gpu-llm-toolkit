@@ -89,33 +89,61 @@ GFX_RE = re.compile(r"gfx(\d{2,4}[a-z]?)")  # matches gfx90a, gfx942, gfx803, gf
 
 
 def parse_kfd_gfx_target_version(ver):
-    """Decode a raw `gfx_target_version` sysfs value (str or int) into a
-    'gfxNNN' arch string, or None if it can't be parsed / is a non-GPU node.
+    """Decode a raw `gfx_target_version` value (str or int) into a 'gfxNNN'
+    arch string, or None if it can't be parsed / is a non-GPU node.
 
-    `gfx_target_version` is a PLAIN DECIMAL integer (not a packed hex word)
-    encoding major/minor/stepping as base-10 digit GROUPS, per AMD's own
-    rocm_agent_enumerator (readFromKFD(), amd-staging branch) -- the same
-    script `rocminfo`/ROCm itself uses to derive gfxNNN strings from this
-    exact sysfs field, so it's the canonical decode:
-        major_ver    = (device_id // 10000) % 100
-        minor_ver    = (device_id // 100)   % 100      (formatted as HEX)
-        stepping_ver = device_id % 100                  (formatted as HEX)
-        gfx string   = f"gfx{major_ver}{minor_ver:x}{stepping_ver:x}"
-    Verified against known real values: 110000->gfx1100, 90402->gfx942,
-    90010->gfx90a, 100300->gfx1030, 80003->gfx803, 120001->gfx1201.
+    The value can arrive as a literal 'gfxNNNN' string or in either of two
+    integer encodings, so this tries decoders in order of specificity and is
+    careful never to let one encoding's decoder mis-read another's value:
 
-    A prior version of this parser used a bitwise `(ver_int >> 16) & 0xFF` /
-    `(ver_int >> 8) & 0xFF` byte-packing scheme, as if gfx_target_version
-    were a packed hex word -- it isn't; it's decimal. That parser produced
-    silently WRONG archs for every real value tested (e.g. 90402 decoded to
-    "gfx0111" instead of "gfx942"), which is worse than not parsing at all:
-    a wrong detected arch can drive find_override_target() to set
-    HSA_OVERRIDE_GFX_VERSION to a bogus value.
+      1. Literal pass-through: if `ver` is a string that already contains a
+         'gfxNNNN' token (rocm-smi-style), extract it with GFX_RE.
+
+      2. Decimal-group -- the encoding AMD's own rocm_agent_enumerator
+         (readFromKFD(), amd-staging branch) decodes, and what every real
+         amdgpu kfd node actually writes to /sys/class/kfd/.../properties.
+         The value is a PLAIN DECIMAL integer (not a packed hex word) with
+         major/minor/stepping as base-10 digit GROUPS:
+             major    = (ver // 10000) % 100
+             minor    = (ver // 100)   % 100     (one hex digit)
+             stepping =  ver % 100               (one hex digit)
+             gfx      = f"gfx{major}{minor:x}{stepping:x}"
+         Verified against known real values: 110000->gfx1100, 90402->gfx942,
+         90010->gfx90a, 100300->gfx1030, 80003->gfx803, 120001->gfx1201.
+         Real gfx IP minor/stepping are always 0..15 (single hex digits), so a
+         decimal-group decode whose minor or stepping is >= 16 is NOT a real
+         decimal-group value -- fall through to the bit-packed tier instead.
+
+      3. Bit-packed fallback -- some non-sysfs sources pack the version as
+         (major<<16)|(minor<<8)|stepping (major in bits 23-16, minor in bits
+         15-8, stepping in bits 7-0). For those: major=(v>>16)&0xFF,
+         minor=(v>>8)&0xFF, stepping=v&0xFF, and the gfx string is
+         f"gfx{major}{minor:x}{stepping:x}" (stepping always emitted as one
+         hex digit, 0-9 or a-f -- dropping a zero stepping would turn gfx1100
+         into the bogus "gfx110"). This tier only runs when the decimal-group
+         decode is implausible (minor/stepping >= 16), so it can never
+         mis-decode a real (decimal-group) sysfs value.
+
+    History note: an earlier version of this parser applied the bit-packed
+    decode UNCONDITIONALLY (treating the decimal-group sysfs value as if it
+    were packed), which produced silently WRONG archs for every real value
+    tested (e.g. 90402 -> "gfx0111" instead of "gfx942") -- worse than not
+    parsing at all, since a wrong detected arch can drive
+    find_override_target() to set HSA_OVERRIDE_GFX_VERSION to a bogus value.
+    The decimal-group tier is what makes real hardware decode correctly; the
+    bit-packed tier is kept only as a guarded fallback, never as the primary
+    decode.
 
     Extracted as a standalone function (rather than inlined in
     detect_gfx_arch's file-parsing loop) so it's directly unit-testable
     against known real values without needing to fake /sys/class/kfd.
     """
+    # 1. Literal 'gfxNNNN' string (e.g. a rocm-smi-style value) -- pass through.
+    if isinstance(ver, str):
+        m = GFX_RE.search(ver)
+        if m:
+            return f"gfx{m.group(1)}"
+
     try:
         ver_int = int(ver, 16) if isinstance(ver, str) and ver.startswith("0x") else int(ver)
     except (ValueError, TypeError):
@@ -124,12 +152,30 @@ def parse_kfd_gfx_target_version(ver):
         # gfx_target_version is 0 on CPU-only KFD nodes (e.g. an APU's CPU
         # node) -- not a GPU, nothing to parse.
         return None
-    major_ver = (ver_int // 10000) % 100
-    minor_ver = (ver_int // 100) % 100
-    stepping_ver = ver_int % 100
-    arch_str = f"gfx{major_ver}{minor_ver:x}{stepping_ver:x}"
-    m = GFX_RE.match(arch_str)
-    return f"gfx{m.group(1)}" if m else None
+
+    # 2. Decimal-group (the real amdgpu kfd sysfs encoding).
+    major = (ver_int // 10000) % 100
+    minor = (ver_int // 100) % 100
+    stepping = ver_int % 100
+    if minor < 16 and stepping < 16:
+        arch_str = f"gfx{major}{minor:x}{stepping:x}"
+        m = GFX_RE.match(arch_str)
+        if m:
+            return f"gfx{m.group(1)}"
+
+    # 3. Bit-packed fallback: (major<<16)|(minor<<8)|stepping. Only reached
+    # when the decimal-group decode was implausible, so this can't clobber a
+    # real sysfs value.
+    major = (ver_int >> 16) & 0xFF
+    minor = (ver_int >> 8) & 0xFF
+    stepping = ver_int & 0xFF
+    if major > 0 and minor < 16 and stepping < 16:
+        arch_str = f"gfx{major}{minor:x}{stepping:x}"
+        m = GFX_RE.match(arch_str)
+        if m:
+            return f"gfx{m.group(1)}"
+
+    return None
 
 
 def detect_gfx_arch():
@@ -476,12 +522,14 @@ def _self_test():
     # Just assert it's a valid gfx string or None.
     assert detected is None or GFX_RE.match(detected), detected
 
-    # parse_kfd_gfx_target_version: the real KFD sysfs decode (major*10000 +
-    # minor*100 + stepping, minor/stepping formatted as hex), verified against
-    # known real gfx_target_version values (see rocm_agent_enumerator
-    # readFromKFD()). A prior bitwise-packing version of this parser produced
-    # WRONG archs for every one of these (e.g. 90402 -> "gfx0111" instead of
-    # "gfx942") -- these assertions are the regression guard for that bug.
+    # parse_kfd_gfx_target_version: tries a literal pass-through, then the
+    # real amdgpu kfd sysfs encoding (decimal digit groups: major*10000 +
+    # minor*100 + stepping, minor/stepping as one hex digit each), then a
+    # guarded bit-packed fallback. The decimal-group values below are real
+    # gfx_target_version sysfs values (see rocm_agent_enumerator readFromKFD());
+    # a prior UNCONDITIONAL bit-packed version of this parser mis-decoded every
+    # one of them (e.g. 90402 -> "gfx0111" instead of "gfx942"), so these
+    # assertions guard against re-introducing that as the primary decode.
     assert parse_kfd_gfx_target_version("110000") == "gfx1100", \
         parse_kfd_gfx_target_version("110000")
     assert parse_kfd_gfx_target_version("90402") == "gfx942", \
@@ -494,13 +542,25 @@ def _self_test():
         parse_kfd_gfx_target_version("80003")
     assert parse_kfd_gfx_target_version("120001") == "gfx1201", \
         parse_kfd_gfx_target_version("120001")
+    # Literal 'gfxNNNN' string passes straight through (tier 1).
+    assert parse_kfd_gfx_target_version("gfx1100") == "gfx1100"
+    assert parse_kfd_gfx_target_version("gfx90a") == "gfx90a"
+    # Bit-packed fallback (tier 3): (major<<16)|(minor<<8)|stepping. These are
+    # NOT real sysfs values (sysfs uses decimal-group above), but some
+    # non-sysfs sources pack the version this way; the fallback handles them
+    # without ever mis-decoding a real decimal-group value (each one's
+    # decimal-group decode has stepping >= 16, so it falls through cleanly).
+    assert parse_kfd_gfx_target_version(720896) == "gfx1100", \
+        parse_kfd_gfx_target_version(720896)   # (11<<16)|(0<<8)|0
+    assert parse_kfd_gfx_target_version(590850) == "gfx942", \
+        parse_kfd_gfx_target_version(590850)   # (9<<16)|(4<<8)|2
     # CPU-only KFD node (gfx_target_version == 0) parses to None, not a bogus arch.
     assert parse_kfd_gfx_target_version("0") is None
     # Garbage/non-numeric input parses to None rather than raising.
     assert parse_kfd_gfx_target_version("not_a_number") is None
     assert parse_kfd_gfx_target_version(None) is None
-    print("  OK (parse_kfd_gfx_target_version decodes real KFD gfx_target_version "
-          "values correctly -- gfx1100/gfx942/gfx90a/gfx1030/gfx803/gfx1201)")
+    print("  OK (parse_kfd_gfx_target_version: literal pass-through + decimal-group "
+          "real sysfs values + guarded bit-packed fallback all decode correctly)")
 
     # _gfx_major extracts the gfxNN prefix.
     assert _gfx_major("gfx1100") == "gfx11"

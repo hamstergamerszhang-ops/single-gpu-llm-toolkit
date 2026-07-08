@@ -10,7 +10,7 @@ crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
 `benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
 data in, compare configs before committing to a long run, and actually talk
 to the model you just trained. Every tool ships its own `--selftest` or
-pytest coverage (see [Testing](#testing)) and is independently runnable —
+pytest coverage (the two shell scripts, `catch_and_resume.sh` and `oom_guard.sh`, are not covered by selftests or pytest — their logic is exercised manually; see [Testing](#testing)) and is independently runnable —
 use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
@@ -19,7 +19,7 @@ oversight: the quality this repo's own runs are built around comes from
 training the real weights, not a low-rank approximation of them.
 
 None of this is pinned to one GPU. There's no device-name check, no
-architecture branch, no hardcoded VRAM figure anywhere in the source —
+architecture branch, no VRAM-threshold logic in the source —
 batch size, sequence length, and how many layers stay unfrozen are all
 plain CLI flags, so the same scripts scale down to a smaller card by
 freezing more layers and shrinking the batch, or scale up by unfreezing
@@ -43,7 +43,7 @@ run it wide on an 80GB+ one.
 The other half of "actually usable on hardware that isn't a managed
 cluster" is what happens when the run dies. `train_cpt.py` checkpoints
 every `--checkpoint-every` steps (500 by default) to local disk, and the
-write itself is atomic — `async_checkpoint.py` builds the new checkpoint
+write itself is atomic — `train_cpt.py`'s `atomic_save_checkpoint()` (or the opt-in `async_checkpoint.py`) builds the new checkpoint
 in a temp directory, then does two `os.replace()` calls (retire the live
 checkpoint to `.prev`, promote the temp dir to live), so a `kill -9` or a
 host reset mid-write can never leave you with a half-written, unreadable
@@ -125,6 +125,9 @@ from it.
   - [`preprocess_data.py`](#preprocess_datapy--dedup-filter-and-pack-training-data)
   - [`benchmark.py`](#benchmarkpy--measure-throughput-and-vram-across-configs)
   - [`generate.py`](#generatepy--streaming-inference-from-a-trained-checkpoint)
+  - [`compress_model.py`](#compress_modelpy--quantize-any-model-int8int4fp8)
+  - [`tensor_parallel.py`](#tensor_parallelpy--auto-detect-multi-gpu-run-with-pipeline-parallelism)
+  - [`smart_hipify.py`](#smart_hipifypy--intelligent-cudahip-converter)
   - [Standalone utilities](#standalone-utilities)
   - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
 - [Tips](#tips)
@@ -271,13 +274,17 @@ not fresh init) + a final RMSNorm. The weights are written as a safetensors
 shard and merged into the checkpoint's index, and `config.json` is updated
 with `mtp_depths` / `mtp_loss_weight` / `auto_map`.
 
-**What it does NOT provide:** the modeling Python code. For the generated
-weights to be used at train/inference time, you need a `modeling_custom.py`
-(alongside the checkpoint) defining a `CustomForCausalLM` class whose forward
-instantiates MTP modules consuming the keys `mtp_head.py` documents
-(`model.mtp_layers.{i}.enorm.weight`, `.eh_proj.weight`, `.block.<suffix>`,
-`.lnorm.weight`, `model.mtp.norm.weight`). `mtp_head.py` produces correct
-weights + config; the modeling code is your responsibility.
+**Modeling code:** `modeling_custom.py` (repo root) is a stub `CustomForCausalLM`
+that loads these weights with zero missing/unexpected keys and runs a
+structurally-correct forward pass — it does NOT implement the real MTP
+training loss (target shifting, weighted loss sum); see that file's own
+docstring for exactly what it does and doesn't do. Copy it alongside the
+checkpoint mtp_head.py writes (config.json's `auto_map` already points at it)
+and extend `forward` for your real train/inference path. It consumes the keys
+`mtp_head.py` documents: `model.mtp_layers.{i}.enorm.weight`, `.eh_proj.weight`,
+`.block.<suffix>`, `.lnorm.weight`, `model.mtp_layers.norm.weight` (the shared
+final norm — note the key lives under `mtp_layers`, not a separate `mtp`
+prefix).
 
 ```
 python3 mtp_head.py --src <expanded_checkpoint> --dst <mtp_checkpoint>
@@ -320,8 +327,17 @@ is for:
   flash-attn --no-build-isolation`). Falls back to standard attention with a
   warning if not installed.
 - **`--dtype fp8`** — fp8 training via `torchao`'s `Float8Linear`
-  (`float8_e4m3fn`). MI300X/MI325X have native fp8 compute. Falls back to
-  bf16 if `torchao` isn't installed or the card lacks fp8 hardware.
+  (`float8_e4m3fn`). MI300X, MI300A, AND MI325X all have native fp8 compute —
+  verified directly against AMD's own gpu-arch-specs documentation, all three
+  are `gfx942` (there is no separate `gfx940`/`gfx941` architecture for
+  MI300A/MI325X; those strings appear in some early/internal ROCm references
+  but don't correspond to real, currently-shipping distinct chips — don't
+  reintroduce a "gfx940=MI300A, gfx941=MI325X" mapping in a future pass). A
+  runtime capability gate checks `torch.cuda.get_device_capability()` and
+  gracefully falls back to bf16 with a warning on any card outside gfx942
+  (e.g. gfx1100 / RX 7900 XTX), so `--dtype fp8` is safe to pass on any AMD
+  card — it will just skip fp8 on unsupported hardware. Falls back to bf16 if
+  `torchao` is missing.
 - **`--compile`** — `torch.compile()` with ROCm's inductor backend for kernel
   fusion + graph optimization. First few steps are slower (compilation), then
   faster. Falls back to eager mode if compilation fails. With `--pack` (fixed
@@ -494,6 +510,18 @@ python3 benchmark.py --model ./checkpoints/base_expanded_15b \
     --configs "batch=2,seqlen=1024,dtype=bf16;batch=4,seqlen=512,dtype=fp8"
 ```
 
+### Generation benchmark (`--gen`)
+
+For inference-focused metrics, `--gen` benchmarks generation throughput
+instead of training. It measures **TTFT** (time-to-first-token, prefill
+latency), **TPOT** (time-per-output-token, decode latency), total time, and
+tokens/sec for a single prompt:
+
+```
+python3 benchmark.py --model ./checkpoints/base_expanded_15b --gen \
+    --gen-prompt-len 2048 --gen-len 256
+```
+
 ## `generate.py` — streaming inference from a trained checkpoint
 
 Training produces a checkpoint; this is what actually talks to it. It loads
@@ -521,7 +549,7 @@ python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
 ## `compress_model.py` — quantize any model (int8/int4/fp8)
 
 Takes any HuggingFace-format checkpoint and produces a quantized version using
-torchao. Supports int8 (~2x smaller, no quality loss), int4 (~4x smaller,
+torchao. Supports int8 (~2x smaller, negligible loss), int4 (~4x smaller,
 minimal loss), and fp8 (~2x smaller, best on MI300X). All three work on ANY
 AMD card — the weights are dequantized to bf16 for the matmul, so no special
 hardware is required (fp8 gets native-speed matmuls on MI300X/MI325X, but
@@ -545,7 +573,7 @@ bubble). Use `--device-map auto` to fall back to HF's automatic assignment, or
 back to single-GPU generation automatically. Supports interactive prompts or
 batch mode (`--input prompts.txt`), flash attention (`--flash-attn`), and
 streaming token-by-token output. Uses `rocm_env.setup_rocm_env()` for the gfx
-override, so the "every AMD device" guarantee carries over.
+override, so the "every AMD device" gfx-override auto-detection carries over.
 
 ```
 python3 tensor_parallel.py --model ./checkpoints/base_15b
@@ -571,8 +599,7 @@ python3 smart_hipify.py --src ./cuda_project/ --dst ./hip_project/ --recursive
 Four of these back `train_cpt.py` directly and are independently useful on
 their own merits: optimizer construction, async checkpoint writes, the
 optimizer-type resume guard, and local-cache data streaming. A fifth,
-`oom_guard.sh`, is a memory-safety guard whose poll/warn/kill pattern has
-nothing OS- or vendor-specific about it.
+`oom_guard.sh`, is a memory-safety guard whose poll/warn/kill pattern is generic (the implementation uses Linux `/proc/meminfo` and ROCm's `rocm-smi`).
 
 **`bnb_optimizer.py`** exists because "which optimizer did this run
 actually get" turns out to matter a lot on a single GPU, and it's not a
@@ -767,8 +794,8 @@ python3 rocm_env.py --gfx-override gfx1100
   releases expose a `float8_weight_only()` function; newer ones replaced it
   with a `Float8WeightOnlyConfig` class passed to `quantize_()`.
   `requirements.txt` pins `torchao>=0.5.0` with no upper bound, so either
-  could be installed — `generate.py` and `benchmark.py` try the function
-  first and fall back to the config class, so `--dtype fp8` works across
+  could be installed — `generate.py` tries the function
+  first and falls back to the config class, so `--dtype fp8` works across
   that version range rather than only whichever API happened to be current
   when the code was written.
 
@@ -802,6 +829,18 @@ python3 rocm_env.py --gfx-override gfx1100
   `wait_for_pending()` call, so a failed write (disk full, NFS error) stops
   training with a real error instead of continuing checkpoint-less. The
   prior checkpoint is retained as `.prev` for recovery.
+- **Multi-GPU hang / "NCCL communicator init" error** — ROCm's NCCL (RCCL)
+  sometimes needs environment variables for multi-GPU to work on certain node
+  topologies. If `--ddp` or `--fsdp` hangs at the first all-reduce:
+  - `NCCL_SOCKET_IFNAME=hsn0` (or `eth0`, `ibs5` — the high-speed interface on
+    your node; use `ip addr` to find it). Without this NCCL may pick a slow
+    management interface and hang.
+  - `NCCL_P2P_DISABLE=1` — disables peer-to-peer (XGMI) if it's flaky on
+    your topology. Slower but unblocks.
+  - `NCCL_IB_DISABLE=1` — disables InfiniBand if present and problematic.
+  - `NCCL_DEBUG=INFO` — logs NCCL's topology discovery, useful for diagnosing.
+  Set these in the environment before `torchrun`:
+  `NCCL_SOCKET_IFNAME=hsn0 torchrun --nproc_per_node=8 train_cpt.py --fsdp ...`
 
 ## Where this hits a real ceiling
 

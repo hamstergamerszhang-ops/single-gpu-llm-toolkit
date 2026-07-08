@@ -218,7 +218,11 @@ def load_jsonl(path: Path) -> list[dict]:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"[cpt] WARNING: skipping malformed JSON line in {path}: {e}",
+                          file=sys.stderr)
     return rows
 
 
@@ -287,6 +291,9 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
             (i for i, m in enumerate(messages) if m["role"] == "assistant"),
             default=-1,
         )
+        if last_assistant_idx == -1:
+            return {"input_ids": torch.tensor([], dtype=torch.long),
+                    "labels": torch.tensor([], dtype=torch.long)}
         prompt_text = tokenizer.apply_chat_template(
             messages[:last_assistant_idx] if last_assistant_idx >= 0 else [],
             tokenize=False, add_generation_prompt=True,
@@ -406,30 +413,40 @@ def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int
 
 def _apply_fp8(model):
     """Convert linear layers to float8_e4m3fn via torchao's Float8Linear.
-    MI300X/MI325X have native fp8 compute — this roughly 2x throughput vs bf16
-    on those cards. Falls back to bf16 (no-op) with a warning if torchao isn't
-    installed, the GPU lacks fp8 hardware, or the conversion fails."""
+    MI300X/MI300A/MI325X have native fp8 compute — this roughly 2x throughput
+    vs bf16 on those cards. Falls back to bf16 (no-op) with a warning if
+    torchao isn't installed, the GPU lacks fp8 hardware, or the conversion
+    fails."""
     import torch
     # Runtime capability gate: fp8 matmul (torch._scaled_mm) requires gfx942
-    # (MI300X/MI325X). On other AMD cards (e.g. gfx1100 / RX 7900 XTX), the
-    # conversion would succeed but the first forward pass would crash with
+    # (MI300X/MI300A/MI325X). On other AMD cards (e.g. gfx1100 / RX 7900 XTX),
+    # the conversion would succeed but the first forward pass would crash with
     # no kernel. Check up front so the user gets a clear message instead.
     if torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
         # On ROCm, get_device_capability returns (gfx_major, gfx_minor).
-        # gfx942 (MI300X) reports (9, 42). Only CDNA gfx94x has native fp8.
-        if not (cap[0] == 9 and cap[1] >= 42):
+        # MI300X, MI300A, AND MI325X are all gfx942 -- verified directly
+        # against AMD's own current gpu-arch-specs docs (all three list
+        # "CDNA3" / "gfx942"; there is no separate gfx940/gfx941 target for
+        # MI300A/MI325X as an earlier version of this comment claimed).
+        # gfx940/gfx941 appear in some early/internal ROCm references but are
+        # not real, currently-shipping distinct architectures -- don't
+        # reintroduce a "gfx940=MI300A, gfx941=MI325X" mapping. The `>= 40`
+        # bound below is intentionally a little loose (accepts the whole
+        # gfx940-94f range) as a defensive margin, not because those other
+        # values correspond to real distinct chips.
+        if not (cap[0] == 9 and cap[1] >= 40):
             arch = f"gfx{cap[0]}{cap[1]}"
             print(f"[cpt] WARNING: --dtype fp8 but GPU arch {arch} lacks native "
-                  f"fp8 compute (needs gfx942/MI300X or gfx940/MI300A). Falling "
-                  f"back to bf16. Use --dtype fp8 only on MI300X/MI325X.",
+                  f"fp8 compute (needs gfx942: MI300X/MI300A/MI325X). Falling "
+                  f"back to bf16. Use --dtype fp8 only on gfx942 CDNA3 hardware.",
                   file=sys.stderr)
             return model
     try:
         from torchao.float8 import convert_to_float8_training
         convert_to_float8_training(model)
         print("[cpt] fp8 training enabled (torchao Float8Linear, float8_e4m3fn) — "
-              "native fp8 compute on gfx942 (MI300X/MI325X).")
+              "native fp8 compute on gfx942 (MI300X/MI300A/MI325X).")
         return model
     except ImportError:
         print("[cpt] WARNING: --dtype fp8 but torchao not installed — falling back "
@@ -598,21 +615,23 @@ def get_full_optim_state_dict(model, optimizer):
 
     IMPORTANT: Collective under FSDP — all ranks must call it.
 
-    Uses FSDP.state_dict_type (the modern API that exists in torch 2.x) with
-    OptimStateDictType.FULL_STATE_DICT. The older FSDP.optim_state_dict_type
-    context manager was removed; FSDP.optim_state_dict(model, optimizer) is the
-    recommended gathering call inside the state_dict_type context.
+    Uses FSDP.state_dict_type with StateDictType.FULL_STATE_DICT, passing BOTH
+    a FullStateDictConfig (model config, 3rd arg) and a FullOptimStateDictConfig
+    (optim config, 4th arg). PyTorch uses a single StateDictType enum for both
+    model and optimizer state — there is no separate OptimStateDictType.
+    FSDP.optim_state_dict(model, optimizer) is the recommended gathering call.
     """
     if type(model).__name__ == "FullyShardedDataParallel":
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import (
-            OptimStateDictType, FullOptimStateDictConfig)
+            StateDictType, FullStateDictConfig, FullOptimStateDictConfig)
+        # Both configs are required: state_dict_type validates that the
+        # state_dict_config (3rd arg) is FullStateDictConfig and the
+        # optim_state_dict_config (4th arg) is FullOptimStateDictConfig.
+        model_cfg = FullStateDictConfig(rank0_only=True)
         optim_cfg = FullOptimStateDictConfig(rank0_only=True)
-        # state_dict_type accepts (module, state_dict_type, state_dict_config,
-        # optim_state_dict_config). It's a single context for both model and
-        # optimizer state dicts.
         with FSDP.state_dict_type(
-                model, OptimStateDictType.FULL_STATE_DICT, optim_cfg):
+                model, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg):
             # FSDP.optim_state_dict is the recommended gathering call — it
             # returns the full (unsharded) optimizer state on rank 0 and {}
             # on other ranks (when rank0_only=True).
@@ -635,10 +654,11 @@ def shard_optim_state_dict_for_load(model, optimizer, full_optim_sd):
     if type(model).__name__ == "FullyShardedDataParallel":
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import (
-            OptimStateDictType, FullOptimStateDictConfig)
+            StateDictType, FullStateDictConfig, FullOptimStateDictConfig)
+        model_cfg = FullStateDictConfig(rank0_only=True)
         optim_cfg = FullOptimStateDictConfig(rank0_only=True)
         with FSDP.state_dict_type(
-                model, OptimStateDictType.FULL_STATE_DICT, optim_cfg):
+                model, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg):
             # optim_state_dict_to_load converts the full state dict to the
             # sharded format the local optimizer expects.
             sharded = FSDP.optim_state_dict_to_load(
@@ -945,6 +965,19 @@ def _on_sigterm(signum, frame):
 # ── main training loop ────────────────────────────────────────────────────────
 
 def main():
+    # REQUIRED: main() re-assigns _SHOULD_STOP further down (the rank-0 ->
+    # all-ranks broadcast under --ddp/--fsdp). Without this `global`
+    # declaration, that assignment makes Python treat _SHOULD_STOP as a LOCAL
+    # name for the entire function body (Python's scoping is static: any
+    # assignment anywhere in a function marks the name local for the whole
+    # function, regardless of where the assignment sits or whether it's
+    # behind a conditional) -- which turns every earlier READ of
+    # _SHOULD_STOP in this function (including the one inside the broadcast
+    # block itself, which reads it before conditionally reassigning it) into
+    # an UnboundLocalError on the very first loop iteration under
+    # --ddp/--fsdp. Confirmed with a minimal repro of the same read-before-
+    # conditional-assign shape while reviewing this file.
+    global _SHOULD_STOP
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true", default=False)
     ap.add_argument("--model", help="HF-format model dir or repo id to train.")
@@ -1047,9 +1080,14 @@ def main():
                     choices=["bf16", "fp8"],
                     help="Training dtype. 'bf16' (default) works on all ROCm cards. "
                          "'fp8' uses torch.float8_e4m3fn via torchao's Float8Linear "
-                         "for ~2x throughput on MI300X/MI325X (native fp8 compute). "
-                         "Requires the 'torchao' package; falls back to bf16 with a "
-                         "warning if not installed or the card lacks fp8 support.")
+                         "for ~2x throughput on gfx942 (MI300X/MI300A/MI325X -- all "
+                         "three are gfx942, per AMD's own gpu-arch-specs docs; there "
+                         "is no separate gfx940/gfx941 architecture for MI300A/MI325X). "
+                         "A runtime capability gate checks the GPU arch and gracefully "
+                         "falls back to bf16 with a warning on any card outside gfx942, "
+                         "so --dtype fp8 is safe to pass on any AMD card. Requires the "
+                         "'torchao' package; falls back to bf16 if torchao is missing "
+                         "or conversion fails.")
     ap.add_argument("--profile", type=str, default=None,
                     help="If set, profile the training loop with torch.profiler and "
                          "write trace artifacts to this directory. The trace is "
@@ -1083,6 +1121,20 @@ def main():
                          "state only -- params stay replicated, less comm overhead, "
                          "more memory. 'no-shard' (NO_SHARD) is equivalent to DDP.")
     args = ap.parse_args()
+
+    # --checkpoint-every of 0 would hit ZeroDivisionError on `it % args.checkpoint_every`
+    # in the training loop; validate up front with a clear message.
+    if args.checkpoint_every < 1:
+        ap.error("--checkpoint-every must be >= 1")
+
+    # --accum of 0 makes `for micro in range(args.accum):` never execute --
+    # `outputs`/`last_loss` are never assigned that step, so the `del outputs`
+    # right after the loop raises NameError (and even without that, zero
+    # micro-batches means zero backward() calls, so optimizer.step() would
+    # apply a stale or nonexistent gradient). Validate up front, same as
+    # --checkpoint-every above.
+    if args.accum < 1:
+        ap.error("--accum must be >= 1")
 
     if args.selftest:
         self_test()
@@ -1237,8 +1289,8 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs).to(device)
+    model.config.use_cache = False  # incompatible with checkpointing/training either way
     if not args.no_grad_checkpoint:
-        model.config.use_cache = False  # incompatible with checkpointing/training either way
         # FSDP requires use_reentrant=False for gradient checkpointing (the
         # reentrant variant is incompatible with FSDP's forward hooks and raises
         # "Calling _checkpoint without use_reentrant=False is incompatible with
@@ -1329,9 +1381,22 @@ def main():
         # DDP's default assumption that every param participates in every
         # backward pass raises a runtime error the moment a frozen param's
         # gradient never arrives).
+        #
+        # NOTE for MTP checkpoints (mtp_head.py + modeling_custom.py) under
+        # full-model --ddp (windowed_freeze=False here): modeling_custom.py's
+        # CustomForCausalLM is an explicitly-unfinished stub whose forward()
+        # does NOT add an MTP loss term (see that file's docstring) -- if you
+        # use it as-is, the MTP params (enorm/eh_proj/block/lnorm/norm) never
+        # receive gradients, and find_unused_parameters=False will make DDP
+        # raise. Once you extend forward() to actually include the MTP loss
+        # (the whole point of extending it), every param participates and
+        # False is correct. If you need to run DDP against the unmodified
+        # stub for some reason, pass windowed --start/--end (even a no-op
+        # window covering all layers) to force find_unused_parameters=True,
+        # or use --fsdp instead (FSDP doesn't have this hazard).
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-            find_unused_parameters=True,
+            find_unused_parameters=windowed_freeze,
         )
         if is_main:
             print(f"[cpt] model wrapped in DistributedDataParallel "
@@ -1488,15 +1553,19 @@ def main():
             schedule=torch.profiler.schedule(wait=2, warmup=2, active=10, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(args.profile),
         )
-        profiler.__enter__()
-        print(f"[cpt] profiling enabled — trace artifacts -> {args.profile} "
-              f"(viewable in chrome://tracing or Perfetto)")
+        # profiler.__enter__() is deferred into the try block below so that if
+        # __enter__ raises, the `finally` doesn't try to __exit__ a profiler
+        # that was never entered (which would mask the real error).
 
     # Wrap the training loop in try/finally so cleanup (profiler, tb_writer,
     # DDP process group) runs even on exception (OOM, CUDA error, etc.).
     # Without this, an exception mid-loop leaks the profiler context, leaves
     # TB events unflushed, and leaves NCCL in a dirty state.
     try:
+        if profiler is not None:
+            profiler.__enter__()
+            print(f"[cpt] profiling enabled — trace artifacts -> {args.profile} "
+                  f"(viewable in chrome://tracing or Perfetto)")
         for it in range(start_step + 1, args.iters + 1):
             lr = lr_at_step(it, args.iters, args.lr, args.warmup_steps)
             for g in optimizer.param_groups:
@@ -1561,6 +1630,7 @@ def main():
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+            del outputs  # free the logits tensor (~1GB) before the next step
             loss = last_loss  # for the logging/eval code below, unchanged from pre-accum shape
 
             if profiler is not None:
@@ -1578,13 +1648,14 @@ def main():
             # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
             if it % 10 == 0 or it == args.iters:
                 if is_main:
-                    msg = f"[cpt] Iter {it}/{args.iters}: loss={loss.item():.4f}  lr={lr:.2e}"
+                    li = loss.item()
+                    msg = f"[cpt] Iter {it}/{args.iters}: loss={li:.4f}  lr={lr:.2e}"
                     if step_tps is not None:
                         msg += (f"  {step_tps:,.0f} tok/s  step={step_ms:.0f}ms"
                                 f"  vram={step_peak_vram_gb:.1f}GB  {step_tflops:.0f} TFLOPs/s")
                     print(msg)
             if tb_writer is not None and is_main and it % 10 == 0:
-                tb_writer.add_scalar("train/loss", loss.item(), it)
+                tb_writer.add_scalar("train/loss", li, it)
                 tb_writer.add_scalar("train/lr", lr, it)
                 if step_tps is not None:
                     tb_writer.add_scalar("train/tokens_per_s", step_tps, it)
@@ -1592,6 +1663,23 @@ def main():
                     tb_writer.add_scalar("train/peak_vram_gb", step_peak_vram_gb, it)
                     tb_writer.add_scalar("train/achieved_tflops", step_tflops, it)
     
+            # Broadcast _SHOULD_STOP from rank 0 to all ranks BEFORE the
+            # eval/checkpoint decisions below. Under --fsdp, the checkpoint
+            # gather (get_full_state_dict etc.) is a COLLECTIVE — if SIGTERM
+            # hits only rank 0 (common: torchrun doesn't forward signals to
+            # all ranks), rank 0 would enter the all-gather alone and deadlock
+            # while other ranks proceed to the next step's gradient sync.
+            # Broadcasting the flag ensures all ranks make the same checkpoint
+            # decision on the same step. (For --ddp this is harmless — DDP's
+            # checkpoint path is rank-0-only with no collective, so the extra
+            # broadcast is a no-op on correctness.)
+            if is_distributed:
+                stop_tensor = torch.tensor(
+                    [1 if _SHOULD_STOP else 0], device=device)
+                torch.distributed.broadcast(stop_tensor, src=0)
+                if stop_tensor.item():
+                    _SHOULD_STOP = True
+
             # Held-out eval at eval_every intervals (rank 0 only — the eval forward
             # pass doesn't need gradient sync, so non-rank-0 GPUs idle during eval).
             # Under --ddp/--fsdp with eval_every != checkpoint_every, rank 0 can be
@@ -1600,9 +1688,9 @@ def main():
             # for rank 0's eval to finish.
             #
             # NOTE: _SHOULD_STOP is intentionally NOT in the barrier condition (same
-            # principle as the checkpoint barrier below). The flag is set per-rank by
-            # an async signal handler; including it in a collective barrier would
-            # deadlock if ranks set the flag at different steps.
+            # principle as the checkpoint barrier below). The flag is broadcast
+            # above so all ranks see the same value, but an asymmetric barrier
+            # (some ranks enter, others don't) would still deadlock.
             is_eval_step = (valid_rows is not None
                             and (it % eval_every == 0 or it == args.iters))
             if is_distributed and is_eval_step:

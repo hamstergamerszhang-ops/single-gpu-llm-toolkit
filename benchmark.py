@@ -87,10 +87,13 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     Returns a result dict.
     """
     from rocm_env import setup_rocm_env
-    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
+    hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
+    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+    from threading import Thread
+    import queue as _queue
 
     if not torch.cuda.is_available():
         raise SystemExit("ERROR: no CUDA/ROCm device visible — benchmark needs a GPU.")
@@ -104,7 +107,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
 
     # Use a fixed prompt (all pad tokens) for reproducibility — the content
     # doesn't affect throughput, only the length matters.
-    input_ids = torch.full((1, prompt_len), tokenizer.pad_token_id or 0,
+    input_ids = torch.full((1, prompt_len), tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
                            dtype=torch.long, device="cuda")
 
     # Warmup.
@@ -128,14 +131,17 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     # inference_mode context must be entered INSIDE the thread, not on the
     # main thread. Without this, the forward passes run with grad tracking
     # enabled, inflating peak VRAM and biasing the measurement.
+    from transformers import TextIteratorStreamer
+    from threading import Thread
+    import queue as _queue
+
     total_times = []
     first_token_times = []
 
     for _ in range(steps):
-        from transformers import TextIteratorStreamer
-        from threading import Thread
         streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=1.0)
+            tokenizer, skip_prompt=True, skip_special_tokens=True,
+            timeout=30.0)  # long enough for prefill on large models
         gen_kwargs = {
             "input_ids": input_ids, "max_new_tokens": gen_len,
             "use_cache": True, "do_sample": False, "streamer": streamer,
@@ -144,20 +150,20 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
         def _gen():
             with torch.inference_mode():
                 model.generate(**gen_kwargs)
-        thread = Thread(target=_gen)
+        # daemon=True so a stuck generate() doesn't block process exit.
+        thread = Thread(target=_gen, daemon=True)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         thread.start()
         # Drain the streamer; record the time of the FIRST token.
         first_token_time = None
-        import queue as _queue
         try:
             for _ in streamer:
                 if first_token_time is None:
                     torch.cuda.synchronize()
                     first_token_time = time.perf_counter() - t0
         except _queue.Empty:
-            pass  # timeout — generate may have failed
+            pass  # timeout — generate may have failed or is still in prefill
         thread.join(timeout=30.0)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -233,7 +239,10 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         ).to("cuda")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-        # Apply optimizations.
+        # Apply optimizations. Catch Exception (not just ImportError) so a
+        # ValueError from set_attn_implementation or a conversion failure on an
+        # unsupported architecture falls back gracefully instead of killing the
+        # whole benchmark sweep — mirrors train_cpt.py's _apply_* pattern.
         if cfg["dtype"] == "fp8":
             try:
                 from torchao.float8 import convert_to_float8_training
@@ -241,15 +250,11 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                 log("  fp8 enabled (torchao)")
             except ImportError:
                 log("  WARNING: torchao not installed, using bf16")
+            except Exception as e:
+                log(f"  WARNING: fp8 conversion failed ({e}), using bf16")
         if cfg["flash"]:
             try:
-                import flash_attn  # noqa: F401 — just checking it's importable
-                # Prefer the public set_attn_implementation() API (see
-                # train_cpt.py's _apply_flash_attn for why): it validates the
-                # requested implementation and propagates to nested sub-configs
-                # (e.g. Gemma-4 nests under text_config) instead of silently
-                # no-op'ing on architectures where the private attribute poke
-                # doesn't take effect post-load.
+                import flash_attn  # noqa: F401
                 if hasattr(model, "set_attn_implementation"):
                     model.set_attn_implementation("flash_attention_2")
                 else:
@@ -259,6 +264,8 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                 log("  flash-attn enabled")
             except ImportError:
                 log("  WARNING: flash-attn not installed, using standard attn")
+            except Exception as e:
+                log(f"  WARNING: flash-attn failed ({e}), using standard attn")
         if cfg["compile"]:
             try:
                 model = torch.compile(model)
@@ -267,6 +274,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                 log(f"  WARNING: compile failed ({e}), using eager")
 
         model.train()
+        model.config.use_cache = False  # KV cache incompatible with training
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
         # Warmup.

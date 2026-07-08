@@ -4,3 +4,14 @@ __pycache__/
 .venv/
 .pytest_cache/
 config.env
+
+# runtime outputs
+logs/
+checkpoints/
+*_history/
+*.pt
+*.safetensors
+*.bin
+.stop_autoresume
+oom_guard.log
+cpt_cache/

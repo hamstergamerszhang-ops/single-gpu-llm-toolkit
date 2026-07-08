@@ -122,9 +122,12 @@ state_path = save_dir / "training_state.pt"
 if not state_path.exists():
     print("")
 else:
-    state = torch.load(state_path, map_location="cpu", weights_only=False)
-    vl = state.get("valid_loss", None)
-    print(vl if vl is not None else "")
+    try:
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        vl = state.get("valid_loss", None)
+        print(vl if vl is not None else "")
+    except Exception:
+        print("")
 PYEOF
 }
 
@@ -212,7 +215,11 @@ while true; do
         if [ -n "$last_loss" ] && [ -d "$SAVE" ]; then
             hist_entry="$HISTORY_DIR/step${new_step}"
             rm -rf "$hist_entry"
-            cp -r "$SAVE" "$hist_entry"
+            if ! cp -r "$SAVE" "$hist_entry"; then
+                echo "[autoresume] ERROR: history copy failed"
+                rm -rf "$hist_entry"
+                continue
+            fi
             # NOTE: .train_loss may hold valid_loss OR train_loss depending on
             # which was available (see $loss_kind above). The rollback
             # comparison below compares these numerically — if eval cadence
@@ -255,7 +262,7 @@ while true; do
         is_regression=$(awk -v cur="$current_loss" -v best="$best_loss" -v factor="$LOSS_REGRESSION_FACTOR" \
             'BEGIN{print (cur > best*factor) ? 1 : 0}')
         if [ "$is_regression" -eq 1 ] && [ "$best_dir" != "$HISTORY_DIR/step${new_step}" ]; then
-            echo "[autoresume] Current checkpoint (step $new_step) has train loss $current_loss, "\
+            echo "[autoresume] Current checkpoint (step $new_step) has $loss_kind loss $current_loss, "\
 "more than ${LOSS_REGRESSION_FACTOR}x the best kept loss $best_loss ($best_dir) -- "\
 "rolling back to the better checkpoint instead of compounding a bad patch."
             rm -rf "$SAVE"
