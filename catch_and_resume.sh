@@ -44,30 +44,33 @@ cd "$(dirname "$0")"
 # Config: sourced from config.env if present (see config.env.example), so you
 # edit config.env rather than this script. Falls back to built-in defaults
 # matching config.env.example if config.env doesn't exist.
+# Define ALL defaults first, then source config.env on top to override. This
+# way a partial config.env (missing some vars) doesn't crash under set -u.
+MODEL=./checkpoints/base_expanded_15b
+DATA=./data/data_cpt_1
+CPT_CACHE=
+SAVE=./checkpoints/model_cpt_1
+TOTAL_ITERS=10000
+CHECKPOINT_EVERY=500
+BATCH=4
+LR=5e-7
+WARMUP_STEPS=50
+MAX_SEQ_LEN=2048
+STOP_FILE=.stop_autoresume
+LOG_PREFIX=./logs/cpt_1_autoresume
+HISTORY_KEEP=4
+LOSS_REGRESSION_FACTOR=1.5
+MAX_SAME_POSITION_RETRIES=8
+RETRY_SLEEP_SECS=10
+
 CONFIG_FILE="${1:-config.env}"
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck source=config.env
     source "$CONFIG_FILE"
-    echo "[autoresume] loaded config from $CONFIG_FILE"
+    echo "[autoresume] loaded config from $CONFIG_FILE (defaults overridden where set)"
 else
     echo "[autoresume] WARNING: $CONFIG_FILE not found -- using built-in defaults. "
     echo "[autoresume] Copy config.env.example to config.env and edit it for your run."
-    MODEL=./checkpoints/base_expanded_15b
-    DATA=./data/data_cpt_1
-    CPT_CACHE=
-    SAVE=./checkpoints/model_cpt_1
-    TOTAL_ITERS=10000
-    CHECKPOINT_EVERY=500
-    BATCH=4
-    LR=5e-7
-    WARMUP_STEPS=50
-    MAX_SEQ_LEN=2048
-    STOP_FILE=.stop_autoresume
-    LOG_PREFIX=./logs/cpt_1_autoresume
-    HISTORY_KEEP=4
-    LOSS_REGRESSION_FACTOR=1.5
-    MAX_SAME_POSITION_RETRIES=8
-    RETRY_SLEEP_SECS=10
 fi
 
 HISTORY_DIR="${SAVE}_history"
@@ -259,10 +262,16 @@ while true; do
     current_loss_file="$HISTORY_DIR/step${new_step}/.train_loss"
     if [ -n "$best_dir" ] && [ -e "$current_loss_file" ]; then
         current_loss=$(cat "$current_loss_file")
+        # Read the loss kind from the sidecar file (may be "valid" or "train")
+        # rather than relying on the loop-scoped $loss_kind which may be stale.
+        current_loss_kind="train"
+        if [ -e "$HISTORY_DIR/step${new_step}/.loss_kind" ]; then
+            current_loss_kind=$(cat "$HISTORY_DIR/step${new_step}/.loss_kind")
+        fi
         is_regression=$(awk -v cur="$current_loss" -v best="$best_loss" -v factor="$LOSS_REGRESSION_FACTOR" \
             'BEGIN{print (cur > best*factor) ? 1 : 0}')
         if [ "$is_regression" -eq 1 ] && [ "$best_dir" != "$HISTORY_DIR/step${new_step}" ]; then
-            echo "[autoresume] Current checkpoint (step $new_step) has $loss_kind loss $current_loss, "\
+            echo "[autoresume] Current checkpoint (step $new_step) has $current_loss_kind loss $current_loss, "\
 "more than ${LOSS_REGRESSION_FACTOR}x the best kept loss $best_loss ($best_dir) -- "\
 "rolling back to the better checkpoint instead of compounding a bad patch."
             rm -rf "$SAVE"

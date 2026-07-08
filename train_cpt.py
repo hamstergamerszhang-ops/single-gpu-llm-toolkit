@@ -386,7 +386,7 @@ def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int
     total_tokens = 0
     model.eval()
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             for i in range(0, len(valid_rows), batch):
                 chunk = valid_rows[i:i + batch]
                 examples = [builder(r, tokenizer, max_seq_len) for r in chunk]
@@ -1646,15 +1646,18 @@ def main():
                 step_tflops = estimate_step_tflops(n_trainable, step_tokens, step_ms / 1000)
 
             # Only rank 0 logs to stdout / TB / runs eval — other ranks train silently.
-            if it % 10 == 0 or it == args.iters:
-                if is_main:
-                    li = loss.item()
-                    msg = f"[cpt] Iter {it}/{args.iters}: loss={li:.4f}  lr={lr:.2e}"
-                    if step_tps is not None:
-                        msg += (f"  {step_tps:,.0f} tok/s  step={step_ms:.0f}ms"
-                                f"  vram={step_peak_vram_gb:.1f}GB  {step_tflops:.0f} TFLOPs/s")
-                    print(msg)
-            if tb_writer is not None and is_main and it % 10 == 0:
+            # Compute li once (guarded by is_main) so both stdout and TB share it
+            # without fragile cross-if variable coupling.
+            li = None
+            if is_main and (it % 10 == 0 or it == args.iters):
+                li = loss.item()
+            if li is not None:
+                msg = f"[cpt] Iter {it}/{args.iters}: loss={li:.4f}  lr={lr:.2e}"
+                if step_tps is not None:
+                    msg += (f"  {step_tps:,.0f} tok/s  step={step_ms:.0f}ms"
+                            f"  vram={step_peak_vram_gb:.1f}GB  {step_tflops:.0f} TFLOPs/s")
+                print(msg)
+            if tb_writer is not None and is_main and it % 10 == 0 and li is not None:
                 tb_writer.add_scalar("train/loss", li, it)
                 tb_writer.add_scalar("train/lr", lr, it)
                 if step_tps is not None:
@@ -1723,6 +1726,10 @@ def main():
                         print(f"[cpt] eval step {it}: valid_loss={vloss:.4f}")
                         if tb_writer is not None:
                             tb_writer.add_scalar("eval/valid_loss", vloss, it)
+                        # Free eval activations + reclaim fragmented VRAM before
+                        # the next training step (eval allocates different-sized
+                        # tensors than training, leaving fragmentation).
+                        torch.cuda.empty_cache()
     
             # DDP/FSDP barrier: ensure all ranks are at the same step before
             # checkpointing.

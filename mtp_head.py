@@ -417,11 +417,15 @@ def _self_test():
 
         # End-to-end: run main() via argparse to exercise write + index merge.
         import sys
-        sys.argv = [
-            "mtp_head.py", "--src", str(src), "--dst", str(dst),
-            "--mtp-depths", "2",
-        ]
-        main()
+        _saved_argv = sys.argv
+        try:
+            sys.argv = [
+                "mtp_head.py", "--src", str(src), "--dst", str(dst),
+                "--mtp-depths", "2",
+            ]
+            main()
+        finally:
+            sys.argv = _saved_argv
 
         # Index merged: MTP keys present in the written index.
         with open(dst / "model.safetensors.index.json") as f:

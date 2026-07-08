@@ -269,9 +269,12 @@ def main():
             full_prompt = prefix + prompt
             print(f"\n--- Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''} ---")
             print("[response] ", end="", flush=True)
-            stream_generate(model, tokenizer, full_prompt, args.max_new_tokens,
-                            args.temperature, args.top_p, args.repetition_penalty,
-                            "cuda")
+            try:
+                stream_generate(model, tokenizer, full_prompt, args.max_new_tokens,
+                                args.temperature, args.top_p, args.repetition_penalty,
+                                "cuda")
+            except KeyboardInterrupt:
+                print("\n[generate] interrupted, skipping to next prompt.")
             print()
     else:
         # Interactive mode.

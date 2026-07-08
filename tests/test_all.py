@@ -1822,7 +1822,10 @@ def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys():
     ModuleList so the key prefix matches.
     """
     import torch
-    from transformers import Gemma3TextConfig
+    try:
+        from transformers import Gemma3TextConfig
+    except ImportError:
+        pytest.skip("Gemma3TextConfig not available in this transformers version")
     from modeling_custom import CustomForCausalLM
     from mtp_head import build_mtp_tensors
 
@@ -1875,7 +1878,10 @@ def test_modeling_custom_forward_pass_runs_without_crashing():
     via the base model's own `rotary_emb` submodule and threading it through.
     """
     import torch
-    from transformers import Gemma3TextConfig
+    try:
+        from transformers import Gemma3TextConfig
+    except ImportError:
+        pytest.skip("Gemma3TextConfig not available in this transformers version")
     from modeling_custom import CustomForCausalLM
 
     hidden = 32
@@ -1906,7 +1912,10 @@ def test_modeling_custom_no_mtp_depths_is_a_clean_noop():
     *ForCausalLM -- no mtp_layers registered, no mtp_hidden_states on output,
     forward runs cleanly."""
     import torch
-    from transformers import Gemma3TextConfig
+    try:
+        from transformers import Gemma3TextConfig
+    except ImportError:
+        pytest.skip("Gemma3TextConfig not available in this transformers version")
     from modeling_custom import CustomForCausalLM
 
     config = Gemma3TextConfig(

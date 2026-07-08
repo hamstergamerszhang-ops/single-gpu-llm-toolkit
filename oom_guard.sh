@@ -79,9 +79,16 @@ read_available_mb() {
     echo $((kb / 1024))
 }
 
-# Track whether we've already warned that rocm-smi is unavailable, so we don't
-# spam the log every poll cycle on a non-ROCm box.
-VRAM_PROBE_WARNED=0
+# Check rocm-smi availability ONCE in the parent shell (not in a subshell).
+# read_vram_free_mb is called via $(...) which runs in a subshell, so a flag
+# set inside it is lost. Instead, we skip VRAM polling entirely if rocm-smi
+# is absent, and warn once here.
+ROCM_SMI_AVAILABLE=0
+if command -v rocm-smi >/dev/null 2>&1; then
+    ROCM_SMI_AVAILABLE=1
+else
+    echo "[oom_guard] rocm-smi not on PATH -- GPU-VRAM checks skipped (system-RAM only)." >&2
+fi
 
 read_vram_free_mb() {
     # Returns free VRAM in MB via rocm-smi, or empty string if unavailable.
@@ -89,11 +96,7 @@ read_vram_free_mb() {
     # rocm-smi --showmeminfo vram --json emits e.g.:
     #   { "card0": { "VRAM Total Memory (B)": 17163091968, "VRAM Total Used Memory (B)": 1234567, "VRAM Free Memory (B)": 17141857401 } }
     # The text variant prints lines like "VRAM Free Memory (B): 17141857401".
-    if ! command -v rocm-smi >/dev/null 2>&1; then
-        if [ "$VRAM_PROBE_WARNED" -eq 0 ]; then
-            echo "[oom_guard] rocm-smi not on PATH -- GPU-VRAM checks skipped (system-RAM only)." >&2
-            VRAM_PROBE_WARNED=1
-        fi
+    if [ "$ROCM_SMI_AVAILABLE" -eq 0 ]; then
         echo ""
         return
     fi
@@ -120,11 +123,7 @@ read_vram_free_mb() {
         return
     fi
 
-    # rocm-smi exists but parsing failed — don't crash, just skip this poll.
-    if [ "$VRAM_PROBE_WARNED" -eq 0 ]; then
-        echo "[oom_guard] rocm-smi present but could not parse VRAM free memory -- VRAM checks skipped this cycle." >&2
-        VRAM_PROBE_WARNED=1
-    fi
+    # rocm-smi exists but parsing failed — just return empty (skip this poll).
     echo ""
 }
 
