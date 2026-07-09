@@ -148,6 +148,297 @@ def test_gradient_accumulation_matches_single_larger_batch():
     )
 
 
+# ── Compute backends (backends/) ────────────────────────────────────────────
+
+def test_list_backends_includes_expected():
+    from backends import list_backends
+    names = list_backends()
+    for expected in ("rocm", "cuda", "xpu", "mps", "cpu"):
+        assert expected in names, f"missing backend {expected} in {names}"
+
+
+def test_get_backend_unknown_raises():
+    from backends import get_backend
+    with pytest.raises(ValueError):
+        get_backend("not-a-backend")
+
+
+def test_autodetect_backend_returns_device():
+    from backends import autodetect_backend, default_device, BackendDevice
+    backend = autodetect_backend()
+    assert isinstance(backend.name, str) and backend.name
+    dev = default_device(prefer="cpu")
+    assert isinstance(dev, BackendDevice)
+    assert dev.name == "cpu"
+
+
+def test_cpu_backend_always_available():
+    from backends import get_backend
+    cpu = get_backend("cpu")
+    assert cpu.is_available()
+    assert cpu.get_device_count() == 1
+    assert cpu.recommended_dtype() == "fp32"
+
+
+def test_backend_device_moves_tensor():
+    import torch
+    from backends.device import BackendDevice
+
+    dev = BackendDevice(backend="cpu")
+    t = torch.tensor([1.0, 2.0])
+    moved = dev.to(t)
+    assert moved.device.type == "cpu"
+
+
+def test_backend_prefer_unavailable_falls_back():
+    """If the user requests an unavailable backend, auto-detection falls back
+    instead of crashing."""
+    from backends import default_device
+    # ROCm is unavailable on macOS/CPU test runners; this should still succeed.
+    dev = default_device(prefer="rocm")
+    assert dev.name in ("cpu", "mps", "cuda", "xpu")
+
+
+# ── Distributed strategies (distributed/) ───────────────────────────────────
+
+def test_process_group_env_defaults(monkeypatch):
+    from distributed.env import detect_process_group_env
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    env = detect_process_group_env()
+    assert env.rank == 0
+    assert env.world_size == 1
+    assert env.local_rank == 0
+    assert not env.is_distributed
+
+
+def test_process_group_env_torchrun(monkeypatch):
+    from distributed.env import detect_process_group_env
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "6000")
+    env = detect_process_group_env()
+    assert env.rank == 2
+    assert env.world_size == 8
+    assert env.local_rank == 1
+    assert env.master_addr == "10.0.0.1"
+    assert env.master_port == "6000"
+
+
+def test_create_single_strategy_falls_back_when_not_distributed():
+    from distributed import create_strategy
+    from backends import get_backend, default_device
+    dev = default_device(prefer="cpu")
+    strategy = create_strategy("ddp", get_backend("cpu"), dev)
+    assert strategy.name == "single"
+    assert strategy.world_size == 1
+    assert strategy.is_main
+
+
+def test_single_strategy_no_sync_is_no_op():
+    from distributed import create_strategy
+    from backends import get_backend, default_device
+    dev = default_device(prefer="cpu")
+    strategy = create_strategy("single", get_backend("cpu"), dev)
+    with strategy.no_sync(None):
+        pass
+
+
+# ── Model-family registry (models/) ─────────────────────────────────────────
+
+def test_list_model_families_includes_common():
+    from models import list_model_families
+    families = list_model_families()
+    for expected in ("llama", "gemma", "phi3", "falcon", "mpt", "gpt2", "bloom"):
+        assert expected in families, f"missing family {expected} in {families}"
+
+
+def test_get_unknown_family_raises():
+    from models import get_model_family
+    with pytest.raises(ValueError):
+        get_model_family("not-a-family")
+
+
+def test_detect_llama_family():
+    from models import detect_model_family
+    family = detect_model_family({"model_type": "llama"})
+    assert family.name == "llama"
+    assert family.decoder_layers_path == "model.layers"
+
+
+def test_detect_gemma_nested_text_config():
+    from models import detect_model_family
+    family = detect_model_family({
+        "model_type": "gemma4_unified",
+        "text_config": {"model_type": "gemma4"},
+    })
+    assert family.name == "gemma"
+
+
+def test_resolve_model_family_override_wins():
+    from models import resolve_model_family
+    family = resolve_model_family({"model_type": "llama"}, override="gpt2")
+    assert family.name == "gpt2"
+
+
+def test_detect_from_state_dict_keys():
+    from models import detect_model_family
+    family = detect_model_family(
+        {"model_type": "unknown"},
+        state_dict_keys=["transformer.wte.weight", "transformer.h.0.ln_1.weight"],
+    )
+    assert family.name == "gpt2"
+
+
+# ── Config recipes and presets (config/) ────────────────────────────────────
+
+def test_list_presets_includes_cpu_and_mps():
+    from config import list_presets
+    presets = list_presets()
+    assert "cpu" in presets
+    assert "mps" in presets
+    assert "mi300x-80g" in presets
+
+
+def test_get_preset_cpu_is_fp32():
+    from config.presets import get_preset
+    preset = get_preset("cpu")
+    assert preset["dtype"] == "fp32"
+    assert preset["batch_size"] == 1
+
+
+def test_apply_preset_does_not_override_explicit():
+    from config import apply_preset
+    config = {"dtype": "bf16", "batch_size": 16}
+    merged = apply_preset(config, "cpu")
+    assert merged["dtype"] == "bf16"
+    assert merged["batch_size"] == 16
+    assert merged["compile"] is False  # filled in from preset
+
+
+def test_resolve_toml_recipe(tmp_path):
+    from config import resolve_recipe
+    recipe = tmp_path / "test.toml"
+    recipe.write_text('batch_size = 8\nseq_length = 512\n')
+    cfg = resolve_recipe(recipe, base_defaults={"dtype": "bf16", "batch_size": 1})
+    assert cfg["batch_size"] == 8
+    assert cfg["seq_length"] == 512
+    assert cfg["dtype"] == "bf16"
+
+
+def test_resolve_recipe_extends_chain(tmp_path):
+    from config import resolve_recipe
+    base = tmp_path / "base.toml"
+    base.write_text('dtype = "bf16"\ncompile = true\n')
+    child = tmp_path / "child.toml"
+    child.write_text(f'extends = "base.toml"\nbatch_size = 4\n')
+    cfg = resolve_recipe(child, base_defaults={"batch_size": 1})
+    assert cfg["dtype"] == "bf16"
+    assert cfg["compile"] is True
+    assert cfg["batch_size"] == 4
+
+
+# ── Runtime capability probes (runtime/) ────────────────────────────────────
+
+def test_probe_fp8_false_on_cpu():
+    from runtime import probe_fp8
+    from backends import BackendDevice
+    dev = BackendDevice(backend="cpu")
+    usable, reason = probe_fp8(dev)
+    assert not usable
+    assert "does not advertise" in reason
+
+
+def test_probe_flash_attn_false_on_cpu():
+    from runtime import probe_flash_attn
+    from backends import BackendDevice
+    dev = BackendDevice(backend="cpu")
+    usable, reason = probe_flash_attn(dev)
+    assert not usable
+
+
+def test_resolve_dtype_cpu_defaults_to_fp32():
+    from runtime import resolve_dtype
+    from backends import BackendDevice
+    dev = BackendDevice(backend="cpu")
+    assert resolve_dtype(dev, None) == "fp32"
+    assert resolve_dtype(dev, "fp32") == "fp32"
+
+
+def test_resolve_compile_false_when_requested_false():
+    from runtime import resolve_compile
+    from backends import BackendDevice
+    dev = BackendDevice(backend="cpu")
+    assert resolve_compile(dev, requested=False) is False
+
+
+# ── MTP helpers (models/mtp.py) ─────────────────────────────────────────────
+
+def test_shift_labels_depth_0_is_standard_next_token():
+    import torch
+    from models.mtp import shift_labels
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    labels = shift_labels(input_ids, depth=0, ignore_index=-100)
+    expected = torch.tensor([[2, 3, 4, 5, -100]])
+    assert torch.equal(labels, expected)
+
+
+def test_shift_labels_depth_1_skips_two():
+    import torch
+    from models.mtp import shift_labels
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    labels = shift_labels(input_ids, depth=1, ignore_index=-100)
+    expected = torch.tensor([[3, 4, 5, -100, -100]])
+    assert torch.equal(labels, expected)
+
+
+def test_compute_total_mtp_loss_shape_and_grad():
+    import torch
+    from models.mtp import compute_total_mtp_loss
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    vocab_size = 10
+    logits = [torch.randn(1, 5, vocab_size, requires_grad=True) for _ in range(2)]
+    loss = compute_total_mtp_loss(logits, input_ids, global_weight=0.3)
+    assert loss.shape == ()
+    assert loss.item() >= 0
+    loss.backward()
+    assert logits[0].grad is not None
+
+
+# ── Export tools ────────────────────────────────────────────────────────────
+
+def test_export_safetensors_consolidates_shards(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+    src = tmp_path / "src"
+    src.mkdir()
+    tensors = {
+        "a.weight": torch.randn(4, 4),
+        "b.weight": torch.randn(4, 4),
+    }
+    save_file(tensors, src / "model-00001-of-00001.safetensors")
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {k: "model-00001-of-00001.safetensors" for k in tensors},
+    }
+    (src / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    dst = tmp_path / "dst"
+    import sys
+    saved = sys.argv
+    try:
+        sys.argv = ["export_safetensors.py", "--src", str(src), "--dst", str(dst)]
+        from export_safetensors import main
+        main()
+    finally:
+        sys.argv = saved
+
+    assert (dst / "model.safetensors").exists()
+
+
 # ── BPE merges parsing (prune_vocab.py) ─────────────────────────────────────
 
 def test_prune_vocab_merges_string_format():
@@ -1905,6 +2196,84 @@ def test_modeling_custom_forward_pass_runs_without_crashing():
         "output"
     )
     assert out.mtp_hidden_states.shape == (2, 5, hidden)
+
+
+def test_modeling_custom_mtp_loss_with_input_ids_and_labels():
+    """Regression check: input_ids + labels (the normal training path) must
+    keep working and return a real, finite scalar loss that includes the MTP
+    term (not just the base CE loss)."""
+    import torch
+    try:
+        from transformers import Gemma3TextConfig
+    except ImportError:
+        pytest.skip("Gemma3TextConfig not available in this transformers version")
+    from modeling_custom import CustomForCausalLM
+
+    hidden = 32
+    config = Gemma3TextConfig(
+        vocab_size=100, hidden_size=hidden, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+    )
+    config.mtp_depths = 2
+    config.mtp_loss_weight = 0.3
+    model = CustomForCausalLM(config)
+
+    input_ids = torch.randint(0, 100, (2, 8))
+    labels = input_ids.clone()
+    out = model(input_ids=input_ids, labels=labels)
+
+    assert out.loss is not None
+    assert torch.isfinite(out.loss), f"loss must be finite, got {out.loss}"
+    assert out.loss.item() > 0.0
+
+
+def test_modeling_custom_mtp_loss_with_inputs_embeds_and_labels_does_not_crash():
+    """Regression test for a real bug found while reviewing this file:
+    _compute_mtp_total_loss -> _shift_labels did `input_ids.shape`, but
+    input_ids can legitimately be None when inputs_embeds is used instead
+    (the forward() signature explicitly accepts both). This crashed with
+    `AttributeError: 'NoneType' object has no attribute 'shape'` any time
+    someone called the model with inputs_embeds + labels while MTP was
+    enabled.
+
+    Also guards against a second-order bug in the fix itself: when
+    input_ids is None, there's no token ids to build depth-shifted targets
+    from, so every MTP label position is masked (ignore_index=-100).
+    F.cross_entropy(..., reduction="mean") over an entirely-masked batch
+    divides by zero unmasked elements and silently returns NaN rather than
+    raising -- which would poison the whole loss. The fix must avoid that,
+    so the returned loss has to be finite (not NaN, not crash).
+    """
+    import torch
+    try:
+        from transformers import Gemma3TextConfig
+    except ImportError:
+        pytest.skip("Gemma3TextConfig not available in this transformers version")
+    from modeling_custom import CustomForCausalLM
+
+    hidden = 32
+    config = Gemma3TextConfig(
+        vocab_size=100, hidden_size=hidden, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+    )
+    config.mtp_depths = 2
+    config.mtp_loss_weight = 0.3
+    model = CustomForCausalLM(config)
+
+    batch, seq_len = 2, 8
+    inputs_embeds = torch.randn(batch, seq_len, hidden)
+    labels = torch.randint(0, 100, (batch, seq_len))
+
+    # Must not raise (this is the actual crash the bug report describes).
+    out = model(inputs_embeds=inputs_embeds, labels=labels)
+
+    assert out.loss is not None
+    assert torch.isfinite(out.loss), (
+        f"loss must be finite (not NaN/inf) even though MTP has no token ids "
+        f"to shift against in the inputs_embeds case, got {out.loss}"
+    )
 
 
 def test_modeling_custom_no_mtp_depths_is_a_clean_noop():

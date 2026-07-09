@@ -76,64 +76,51 @@ def format_table(results: list[dict]) -> str:
 
 def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
                       warmup: int, steps: int,
-                      gfx_override: str, hip_alloc_conf: str):
+                      gfx_override: str, hip_alloc_conf: str,
+                      backend_name: str | None = None):
     """Run a generation benchmark: measures prefill latency, decode latency,
     time-to-first-token (TTFT), and time-per-output-token (TPOT).
 
-    Unlike the training benchmark, this uses a single config (no multi-config
-    table) because generation is less parameterizable — the interesting axis is
-    prompt length vs. gen length, which the caller can sweep by re-running.
-
     Returns a result dict.
     """
-    from rocm_env import setup_rocm_env
-    hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
-    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
+    from backends import autodetect_backend, get_backend, BackendDevice
+    from runtime import resolve_dtype
+
+    backend = get_backend(backend_name) if backend_name else autodetect_backend()
+    if backend.name == "rocm":
+        from rocm_env import setup_rocm_env
+        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
     from threading import Thread
     import queue as _queue
 
-    if not torch.cuda.is_available():
-        raise SystemExit("ERROR: no CUDA/ROCm device visible — benchmark needs a GPU.")
+    dev = BackendDevice(backend=backend)
+    if not dev.backend.is_available():
+        raise SystemExit("ERROR: no compute device visible — benchmark needs a device.")
 
-    log(f"loading model for generation benchmark: {model_path}")
+    dtype_str = resolve_dtype(dev, "bf16")
+    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+
+    log(f"loading model for generation benchmark: {model_path} on {dev}")
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-    ).to("cuda")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model_path, torch_dtype=torch_dtype, trust_remote_code=True
+    ).to(dev.torch_device)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
 
-    # Use a fixed prompt (all pad tokens) for reproducibility — the content
-    # doesn't affect throughput, only the length matters.
     input_ids = torch.full((1, prompt_len), tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-                           dtype=torch.long, device="cuda")
+                           dtype=torch.long, device=dev.torch_device)
 
-    # Warmup.
     with torch.inference_mode():
         for _ in range(warmup):
             _ = model.generate(input_ids, max_new_tokens=gen_len, use_cache=True,
                                do_sample=False)
 
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-
-    # Measure. Use a single generate() call per step and split the timing:
-    # TTFT ~ time for the first token (prefill + first decode), TPOT ~ time
-    # per subsequent token. A two-call approach (generate 1 token, then
-    # continue with past_key_values) is broken: HF's prepare_inputs_for_generation
-    # skips the input slice when past_length >= input_ids length, so the second
-    # call re-prefills the full prompt with wrong cache positions.
-    #
-    # NOTE: torch.inference_mode() is THREAD-LOCAL (per PyTorch docs). The
-    # generate() call runs on a background thread (for the streamer), so the
-    # inference_mode context must be entered INSIDE the thread, not on the
-    # main thread. Without this, the forward passes run with grad tracking
-    # enabled, inflating peak VRAM and biasing the measurement.
-    from transformers import TextIteratorStreamer
-    from threading import Thread
-    import queue as _queue
+    dev.synchronize()
+    dev.reset_peak_memory_stats()
 
     total_times = []
     first_token_times = []
@@ -141,7 +128,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     for _ in range(steps):
         streamer = TextIteratorStreamer(
             tokenizer, skip_prompt=True, skip_special_tokens=True,
-            timeout=30.0)  # long enough for prefill on large models
+            timeout=30.0)
         gen_kwargs = {
             "input_ids": input_ids, "max_new_tokens": gen_len,
             "use_cache": True, "do_sample": False, "streamer": streamer,
@@ -150,31 +137,28 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
         def _gen():
             with torch.inference_mode():
                 model.generate(**gen_kwargs)
-        # daemon=True so a stuck generate() doesn't block process exit.
         thread = Thread(target=_gen, daemon=True)
-        torch.cuda.synchronize()
+        dev.synchronize()
         t0 = time.perf_counter()
         thread.start()
-        # Drain the streamer; record the time of the FIRST token.
         first_token_time = None
         try:
             for _ in streamer:
                 if first_token_time is None:
-                    torch.cuda.synchronize()
+                    dev.synchronize()
                     first_token_time = time.perf_counter() - t0
         except _queue.Empty:
-            pass  # timeout — generate may have failed or is still in prefill
+            pass
         thread.join(timeout=30.0)
-        torch.cuda.synchronize()
+        dev.synchronize()
         t1 = time.perf_counter()
         total_times.append(t1 - t0)
         first_token_times.append(first_token_time if first_token_time else (t1 - t0))
 
-    peak_vram = torch.cuda.max_memory_allocated() / 1024**3
-    avg_ttft = sum(first_token_times) / len(first_token_times) * 1000  # ms
-    avg_total = sum(total_times) / len(total_times) * 1000             # ms
-    # TPOT = (total - TTFT) / (gen_len - 1) per-token decode time.
-    avg_tpot = ((avg_total - avg_ttft) / max(gen_len - 1, 1))           # ms
+    peak_vram = dev.max_memory_allocated() / 1024**3
+    avg_ttft = sum(first_token_times) / len(first_token_times) * 1000
+    avg_total = sum(total_times) / len(total_times) * 1000
+    avg_tpot = ((avg_total - avg_ttft) / max(gen_len - 1, 1))
     tokens_per_s = gen_len / (sum(total_times) / len(total_times))
 
     result = {
@@ -188,7 +172,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
         f"VRAM: {peak_vram:.1f}GB")
 
     del model
-    torch.cuda.empty_cache()
+    dev.empty_cache()
     return result
 
 
@@ -211,16 +195,24 @@ def format_gen_table(result: dict) -> str:
 
 
 def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
-                  gfx_override: str, hip_alloc_conf: str):
+                  gfx_override: str, hip_alloc_conf: str,
+                  backend_name: str | None = None):
     """Run the benchmark for each config. Returns a list of result dicts."""
-    from rocm_env import setup_rocm_env
-    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
+    from backends import autodetect_backend, get_backend, BackendDevice
+    from runtime import resolve_dtype, resolve_flash_attn, resolve_compile
+
+    backend = get_backend(backend_name) if backend_name else autodetect_backend()
+    if backend.name == "rocm":
+        from rocm_env import setup_rocm_env
+        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if not torch.cuda.is_available():
-        raise SystemExit("ERROR: no CUDA/ROCm device visible — benchmark needs a GPU.")
+    dev = BackendDevice(backend=backend)
+    if not dev.backend.is_available():
+        raise SystemExit("ERROR: no compute device visible — benchmark needs a device.")
 
     results = []
     for i, cfg in enumerate(configs):
@@ -229,36 +221,17 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                  f"{' +compile' if cfg['compile'] else ''}")
         log(f"config {i+1}/{len(configs)}: {label}")
 
-        # Reload model fresh for each config (each fp8 conversion mutates the
-        # model in place, so a stale bf16 model can't be reused across
-        # configs). Always load in bf16 first, same as train_cpt.py — fp8 is
-        # applied after load via torchao's Float8Linear conversion below, not
-        # via torch_dtype at load time.
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-        ).to("cuda")
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        dtype_str = resolve_dtype(dev, cfg["dtype"])
+        torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
 
-        # Apply optimizations. Catch Exception (not just ImportError) so a
-        # ValueError from set_attn_implementation or a conversion failure on an
-        # unsupported architecture falls back gracefully instead of killing the
-        # whole benchmark sweep — mirrors train_cpt.py's _apply_* pattern.
-        if cfg["dtype"] == "fp8":
-            # Arch gate: fp8 training requires gfx942 (MI300X/MI325X). On other
-            # cards the conversion succeeds but the first forward crashes
-            # (torch._scaled_mm has no kernel). Gate before converting so the
-            # benchmark reports "skipped" instead of crashing — mirrors
-            # train_cpt.py's _apply_fp8 capability check.
-            _fp8_ok = False
-            if torch.cuda.is_available():
-                cap = torch.cuda.get_device_capability()
-                # On ROCm, get_device_capability returns (gfx_major, gfx_minor).
-                # gfx942 = MI300X/MI325X (native fp8). NVIDIA H100 = (9, 0) also
-                # has fp8, but this repo targets ROCm.
-                if cap[0] == 9 and cap[1] >= 42:
-                    _fp8_ok = True
-            if not _fp8_ok:
-                log("  WARNING: fp8 requires gfx942 (MI300X/MI325X) — skipping, using bf16")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch_dtype, trust_remote_code=True
+        ).to(dev.torch_device)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+        if dtype_str == "fp8":
+            if not dev.supports_fp8():
+                log("  WARNING: fp8 not supported on this device — using bf16")
             else:
                 try:
                     from torchao.float8 import convert_to_float8_training
@@ -268,9 +241,8 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                     log("  WARNING: torchao not installed, using bf16")
                 except Exception as e:
                     log(f"  WARNING: fp8 conversion failed ({e}), using bf16")
-        if cfg["flash"]:
+        if resolve_flash_attn(dev, bool(cfg["flash"])):
             try:
-                import flash_attn  # noqa: F401
                 if hasattr(model, "set_attn_implementation"):
                     model.set_attn_implementation("flash_attention_2")
                 else:
@@ -278,11 +250,9 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                     if hasattr(model, "text_config"):
                         model.text_config._attn_implementation = "flash_attention_2"
                 log("  flash-attn enabled")
-            except ImportError:
-                log("  WARNING: flash-attn not installed, using standard attn")
             except Exception as e:
                 log(f"  WARNING: flash-attn failed ({e}), using standard attn")
-        if cfg["compile"]:
+        if resolve_compile(dev, bool(cfg["compile"])):
             try:
                 model = torch.compile(model)
                 log("  torch.compile enabled")
@@ -290,13 +260,16 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                 log(f"  WARNING: compile failed ({e}), using eager")
 
         model.train()
-        model.config.use_cache = False  # KV cache incompatible with training
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+        model.config.use_cache = False
+        try:
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=1e-5, fused=True, foreach=False)
+        except (ValueError, RuntimeError):
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-        # Warmup.
         for _ in range(warmup):
             input_ids = torch.randint(0, tokenizer.vocab_size,
-                                      (cfg["batch"], cfg["seqlen"]), device="cuda")
+                                      (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
             labels = input_ids.clone()
             attn = torch.ones_like(input_ids)
             outputs = model(input_ids=input_ids, labels=labels, attention_mask=attn)
@@ -304,13 +277,13 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
             outputs.loss.backward()
             optimizer.step()
 
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
+        dev.synchronize()
+        dev.reset_peak_memory_stats()
         start = time.perf_counter()
 
         for _ in range(steps):
             input_ids = torch.randint(0, tokenizer.vocab_size,
-                                      (cfg["batch"], cfg["seqlen"]), device="cuda")
+                                      (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
             labels = input_ids.clone()
             attn = torch.ones_like(input_ids)
             outputs = model(input_ids=input_ids, labels=labels, attention_mask=attn)
@@ -318,9 +291,9 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
             outputs.loss.backward()
             optimizer.step()
 
-        torch.cuda.synchronize()
+        dev.synchronize()
         elapsed = time.perf_counter() - start
-        peak_vram = torch.cuda.max_memory_allocated() / 1024**3
+        peak_vram = dev.max_memory_allocated() / 1024**3
 
         total_tokens = cfg["batch"] * cfg["seqlen"] * steps
         tps = total_tokens / elapsed
@@ -333,21 +306,6 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         log(f"  tokens/s: {tps:,.0f}  peak_VRAM: {peak_vram:.1f}GB  "
             f"step: {step_ms:.1f}ms")
 
-        # Free model + orphaned logits before next config (outputs.logits can
-        # be ~1GB on a 15B model and isn't freed by empty_cache while referenced).
-        # Guard against --steps 0 (loop never ran, outputs/input_ids/etc unbound).
-        #
-        # NOTE: `del locals()[name]` is a well-known CPython no-op inside a
-        # function -- locals() returns a snapshot dict of the fast-locals
-        # array; mutating that dict does NOT delete the real local variable
-        # (only module/class-scope locals() is the live namespace; function
-        # scope is not). A prior version of this loop used exactly that
-        # pattern and silently kept `outputs`/`input_ids`/`labels`/`attn`
-        # alive (and their CUDA tensors un-freed) until the next loop
-        # iteration's reassignment overwrote them -- defeating the comment's
-        # stated purpose one config's peak-VRAM measurement early. Real `del`
-        # statements can't take a dynamic name list, so guard each one
-        # explicitly against the --steps/--warmup == 0 unbound case instead.
         if "outputs" in dir():
             del outputs
         if "input_ids" in dir():
@@ -357,7 +315,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         if "attn" in dir():
             del attn
         del model, optimizer
-        torch.cuda.empty_cache()
+        dev.empty_cache()
 
     return results
 
@@ -377,7 +335,7 @@ def main():
                     help="Measured steps (default 10).")
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
-    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
     ap.add_argument("--gen", action="store_true", default=False,
                     help="Run a generation benchmark instead of the training "
@@ -391,6 +349,9 @@ def main():
     ap.add_argument("--gen-len", type=int, default=128,
                     help="Number of tokens to generate in the generation benchmark "
                          "(default 128). Only used with --gen.")
+    ap.add_argument("--backend", type=str, default=None,
+                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    help="Compute backend to use (auto-detected if unset).")
     args = ap.parse_args()
 
     hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
@@ -400,7 +361,8 @@ def main():
             f"gen_len={args.gen_len}, warmup={args.warmup}, steps={args.steps}")
         result = run_gen_benchmark(args.model, args.gen_prompt_len, args.gen_len,
                                    args.warmup, args.steps,
-                                   args.gfx_override, hip_conf)
+                                   args.gfx_override, hip_conf,
+                                   backend_name=args.backend)
         print("\n" + format_gen_table(result))
         return
 
@@ -410,9 +372,9 @@ def main():
                          "not set; use --gen for generation benchmarking).")
     log(f"benchmarking {len(configs)} config(s): warmup={args.warmup}, steps={args.steps}")
 
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
     results = run_benchmark(args.model, configs, args.warmup, args.steps,
-                            args.gfx_override, hip_conf)
+                            args.gfx_override, hip_conf,
+                            backend_name=args.backend)
 
     print("\n" + format_table(results))
 

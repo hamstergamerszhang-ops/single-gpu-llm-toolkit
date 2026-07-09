@@ -225,6 +225,51 @@ def detect_gfx_arch():
     return None
 
 
+def detect_all_gfx_archs():
+    """Probe ALL AMD GPU architectures in the box, without importing torch.
+
+    Returns a list like ['gfx1100', 'gfx1030', ...] or an empty list if no
+    AMD GPUs / no rocm-smi / no /sys/class/kfd. This is used to detect
+    heterogeneous nodes and warn/refuse rather than applying a single global
+    HSA_OVERRIDE_GFX_VERSION that may be wrong for some GPUs.
+    """
+    archs = []
+
+    # 1. rocm-smi --showproductname often lists one product line per GPU.
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "--showproductname"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            m = GFX_RE.search(line)
+            if m:
+                archs.append(f"gfx{m.group(1)}")
+    except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
+
+    if archs:
+        return archs
+
+    # 2. /sys/class/kfd topology: one properties file per node.
+    kfd_nodes = "/sys/class/kfd/topology/nodes"
+    if os.path.isdir(kfd_nodes):
+        for entry in sorted(os.listdir(kfd_nodes)):
+            props_path = os.path.join(kfd_nodes, entry, "properties")
+            try:
+                with open(props_path) as f:
+                    for line in f:
+                        if line.startswith("gfx_target_version"):
+                            arch = parse_kfd_gfx_target_version(line.split()[-1])
+                            if arch:
+                                archs.append(arch)
+                                break
+            except (OSError, IOError):
+                continue
+
+    return archs
+
+
 def get_torch_arch_list():
     """Import torch and return its compiled-in arch list (e.g.
     ['sm_90', 'gfx900', 'gfx1100', ...]). Returns None if torch can't import
@@ -345,11 +390,12 @@ def _set_hip_alloc_conf(conf, verbose=True):
     it after init has no effect, which is why this runs at the top of
     setup_rocm_env rather than after torch import.
 
-    max_split_size_mb limits how large a single block the allocator will split
-    for a smaller request. Without it, a large block gets fragmented into pieces
-    that can't be recombined — the classic "I have 20GB free but OOM on a 2GB
-    allocation" symptom on long training runs. The default 128MB is conservative
-    and matches what most ROCm training guides recommend."""
+    expandable_segments:True grows arena segments on demand instead of
+    pre-reserving per-size pools — dramatically reduces the "20GB free but OOM
+    on 2GB" failures on large-buffer workloads (a 15B model's logits/activations
+    are multi-GB contiguous). This directly attacks the repo's central OOM theme.
+    The older max_split_size_mb:128 knob is kept as a fallback option but
+    expandable_segments is the modern ROCm recommendation."""
     if conf is None:
         return
     if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
@@ -364,7 +410,7 @@ def _set_hip_alloc_conf(conf, verbose=True):
                   f"'{existing}' by user — not overriding")
 
 
-def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
+def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
                    verbose=True):
     """Main entry point. Call BEFORE importing torch in a training script.
 
@@ -373,7 +419,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
     - Otherwise: detect the GPU arch, import torch, get its compiled arch list,
       and override ONLY if the detected arch isn't already supported.
     - Sets PYTORCH_HIP_ALLOC_CONF to `hip_alloc_conf` (default
-      'max_split_size_mb:128') if it isn't already set. This prevents the ROCm
+      'expandable_segments:True') if it isn't already set. This prevents the ROCm
       caching allocator from splitting large blocks into fragments that can't
       be recombined, which is the #1 cause of "phantom OOM" on long training
       runs where VRAM is actually available but fragmented. Pass None to skip.
@@ -388,7 +434,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
          'detected': 'gfx1100' or None,
          'torch_arch_list': [...],
          'override_value': 'gfx1030' or None,
-         'hip_alloc_conf': 'max_split_size_mb:128' or None,
+         'hip_alloc_conf': 'expandable_segments:True' or None,
          'reason': '...'}
     """
     # Set PYTORCH_HIP_ALLOC_CONF early (before torch import) so the allocator
@@ -413,7 +459,13 @@ def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
         return info
 
     detected = detect_gfx_arch()
+    all_archs = detect_all_gfx_archs()
     torch_arch_list = get_torch_arch_list()
+
+    # HSA_OVERRIDE_GFX_VERSION is a single global value. If the box has
+    # heterogeneous gfx architectures, a single override is unsafe.
+    unique_archs = sorted(set(all_archs))
+    heterogeneous = len(unique_archs) > 1
 
     if detected is None:
         info = {
@@ -471,6 +523,24 @@ def setup_rocm_env(override=None, hip_alloc_conf="max_split_size_mb:128",
         return info
 
     # Detected arch is NOT in torch's list — find a family-compatible override.
+    if heterogeneous:
+        info = {
+            "action": "skip",
+            "detected": detected,
+            "torch_arch_list": torch_arch_list,
+            "override_value": None,
+            "hip_alloc_conf": hip_alloc_conf,
+            "reason": f"heterogeneous GPUs detected: {unique_archs}. "
+                      f"HSA_OVERRIDE_GFX_VERSION is a single global setting, so "
+                      f"auto-overriding across different architectures is unsafe. "
+                      f"Use --gfx-override explicitly if you want to proceed.",
+        }
+        if verbose:
+            print(f"[rocm_env] WARNING: heterogeneous GPUs detected: {unique_archs}. "
+                  f"Not auto-setting HSA_OVERRIDE_GFX_VERSION because it is a single "
+                  f"global value. Use --gfx-override to set one explicitly.", flush=True)
+        return info
+
     target = find_override_target(detected, torch_arch_list)
     if target is None:
         info = {
@@ -628,7 +698,7 @@ def _self_test():
     info = setup_rocm_env(override="gfx1030", verbose=False)
     assert "PYTORCH_HIP_ALLOC_CONF" in os.environ, \
         "setup_rocm_env should set PYTORCH_HIP_ALLOC_CONF"
-    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == "max_split_size_mb:128"
+    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == "expandable_segments:True"
     os.environ.pop("PYTORCH_HIP_ALLOC_CONF", None)
     # User-set value should NOT be overridden.
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.5"
@@ -653,9 +723,9 @@ def main():
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. "
                          "gfx1100), skipping auto-detection.")
-    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
                     help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator "
-                         "config). Default 'max_split_size_mb:128' prevents "
+                         "config). Default 'expandable_segments:True' prevents "
                          "fragmentation OOMs. Pass 'none' to skip.")
     args = ap.parse_args()
     if args.selftest:

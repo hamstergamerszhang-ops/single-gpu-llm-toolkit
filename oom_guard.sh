@@ -1,49 +1,11 @@
 #!/bin/bash
-# Preemptive OOM guard for a single-GPU training process: poll free memory,
-# warn under a soft threshold, SIGTERM the training process under a hard
-# emergency threshold -- so it dies BEFORE the OS/driver hits an
+# Preemptive OOM guard for a training process: poll free system RAM and ALL
+# visible GPUs, warn under a soft threshold, and SIGTERM the training process
+# under a hard emergency threshold -- so it dies BEFORE the OS/driver hits an
 # unrecoverable OOM state, not after.
 #
-# Ported from a Mac/Metal version (mem_watcher.sh) built after a real
-# kernel panic: concurrent GPU-memory pressure from two processes on the
-# same box (a training run and a separate inference server that wasn't
-# supposed to wake mid-run) corrupted the GPU driver's memory refcounting
-# badly enough to panic the kernel. This script's job is to make sure that
-# never gets the chance to happen again -- not by predicting the exact
-# failure, but by killing the trainer early whenever memory gets
-# dangerously tight, on the assumption that a hard kill now is always
-# cheaper than an OS-level crash later.
-#
-# What changed porting Mac -> generic single-GPU (AMD ROCm included):
-#   - System-RAM check: the Mac original parsed `top -l 1`'s "PhysMem" line
-#     (a macOS-only command/format). That's swapped below for a read of
-#     /proc/meminfo's MemAvailable field, which exists on any Linux box
-#     (the realistic target for an AMD ROCm training server) and is a
-#     better number than MemFree alone -- MemAvailable already accounts for
-#     reclaimable cache/buffers, so it doesn't cry wolf over memory the
-#     kernel would happily hand back under real pressure.
-#   - GPU-side (VRAM) check: IMPLEMENTED via `rocm-smi --showmeminfo vram`.
-#     The earlier version of this script left VRAM polling as a commented-out
-#     extension point because it hadn't been verified against real ROCm
-#     hardware. It now parses rocm-smi's JSON output (preferred, structured)
-#     with a text-output fallback, converts bytes->MB, and applies the same
-#     warn/emergency-threshold pattern as the system-RAM check. If rocm-smi
-#     isn't on PATH or parsing fails, it logs once and skips VRAM checks
-#     (keeps the system-RAM check working on non-ROCm boxes) rather than
-#     crashing the guard.
-#
-# What's unchanged from the original (still true, still intentional): the
-# wrapped training process is assumed to have NO SIGTERM handler wired to
-# anything smarter than "exit" (train_cpt.py in this repo actually DOES
-# install a SIGTERM handler that checkpoints before exiting cleanly -- see
-# its _on_sigterm -- so pairing this guard with train_cpt.py gets you a
-# real clean-save-then-exit, not just a hard kill). For a process with no
-# such handler, this is a hard, immediate kill, not a clean save. That's
-# accepted deliberately: the goal is to stop BEFORE memory pressure drives
-# the OS/driver into an unrecoverable state, not to guarantee a graceful
-# shutdown after the fact. Worst-case loss is bounded by however often you
-# checkpoint (e.g. train_cpt.py's --checkpoint-every), which is cheap
-# insurance against a full crash.
+# Supports AMD GPUs via `rocm-smi` and NVIDIA GPUs via `nvidia-smi`. If neither
+# is available, the guard falls back to system-RAM-only monitoring.
 #
 # Usage: nohup bash oom_guard.sh <training_pid> [warn_free_mb] [emergency_free_mb] \
 #                                   [poll_sec] [vram_warn_mb] [vram_emergency_mb] \
@@ -60,13 +22,8 @@ VRAM_EMERGENCY_MB="${6:-512}"
 
 echo "[oom_guard] watching PID $TRAIN_PID, poll ${POLL_SEC}s"
 echo "[oom_guard] system-RAM: warn<${WARN_FREE_MB}MB, emergency<${EMERGENCY_FREE_MB}MB (via /proc/meminfo)"
-echo "[oom_guard] GPU-VRAM:   warn<${VRAM_WARN_MB}MB, emergency<${VRAM_EMERGENCY_MB}MB (via rocm-smi, if available)"
 
 read_available_mb() {
-    # /proc/meminfo's MemAvailable is in kB; convert to whole MB. Falls back to
-    # MemFree if MemAvailable isn't present (older kernels), which is more
-    # conservative (MemFree ignores reclaimable cache, so it under-reports
-    # truly available memory -- safer direction to be wrong in for an OOM guard).
     local kb
     kb=$(awk '/^MemAvailable:/ {print $2; found=1} END {if (!found) print ""}' /proc/meminfo 2>/dev/null)
     if [ -z "$kb" ]; then
@@ -79,54 +36,116 @@ read_available_mb() {
     echo $((kb / 1024))
 }
 
-# Check rocm-smi availability ONCE in the parent shell (not in a subshell).
-# read_vram_free_mb is called via $(...) which runs in a subshell, so a flag
-# set inside it is lost. Instead, we skip VRAM polling entirely if rocm-smi
-# is absent, and warn once here.
-ROCM_SMI_AVAILABLE=0
+# ---------------------------------------------------------------------------
+# GPU backend detection and per-GPU free-VRAM polling.
+# ---------------------------------------------------------------------------
+GPU_BACKEND="none"
 if command -v rocm-smi >/dev/null 2>&1; then
-    ROCM_SMI_AVAILABLE=1
+    GPU_BACKEND="rocm"
+    echo "[oom_guard] GPU backend: ROCm (rocm-smi)"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_BACKEND="cuda"
+    echo "[oom_guard] GPU backend: NVIDIA (nvidia-smi)"
 else
-    echo "[oom_guard] rocm-smi not on PATH -- GPU-VRAM checks skipped (system-RAM only)." >&2
+    echo "[oom_guard] no rocm-smi or nvidia-smi found -- GPU-VRAM checks skipped (system-RAM only)."
 fi
 
-read_vram_free_mb() {
-    # Returns free VRAM in MB via rocm-smi, or empty string if unavailable.
-    # Tries JSON output first (structured, robust), falls back to text parsing.
-    # rocm-smi --showmeminfo vram --json emits e.g.:
-    #   { "card0": { "VRAM Total Memory (B)": 17163091968, "VRAM Total Used Memory (B)": 1234567, "VRAM Free Memory (B)": 17141857401 } }
-    # The text variant prints lines like "VRAM Free Memory (B): 17141857401".
-    if [ "$ROCM_SMI_AVAILABLE" -eq 0 ]; then
-        echo ""
-        return
+read_all_vram_free_mb() {
+    # Prints one line per GPU: "<index> <free_mb>". Empty output means unavailable.
+    if [ "$GPU_BACKEND" = "rocm" ]; then
+        _read_rocm_vram
+    elif [ "$GPU_BACKEND" = "cuda" ]; then
+        _read_nvidia_vram
     fi
-
-    # Try JSON first.
-    local json_bytes
-    json_bytes=$(timeout 10 rocm-smi --showmeminfo vram --json 2>/dev/null \
-        | grep -oE '"VRAM Free Memory \(B\)": *[0-9]+' | grep -oE '[0-9]+$' | head -1)
-    if [ -n "$json_bytes" ]; then
-        echo $((json_bytes / 1024 / 1024))
-        return
-    fi
-
-    # Fallback: text output. "VRAM Free Memory (B): <number>" — the byte value
-    # is the LAST number on the line (anchored to end), NOT the first, because
-    # lines often look like "GPU[0] : VRAM Free Memory (B): 17141857401" and
-    # head -1 / first-digit would grab the "0" from "GPU[0]" -> 0 MB -> false
-    # emergency SIGTERM.
-    local text_bytes
-    text_bytes=$(timeout 10 rocm-smi --showmeminfo vram 2>/dev/null \
-        | grep -E "VRAM Free Memory" | grep -oE '[0-9]+$' | head -1)
-    if [ -n "$text_bytes" ]; then
-        echo $((text_bytes / 1024 / 1024))
-        return
-    fi
-
-    # rocm-smi exists but parsing failed — just return empty (skip this poll).
-    echo ""
 }
 
+_read_rocm_vram() {
+    # Try JSON first, then fall back to text. Aggregate free memory per GPU.
+    #
+    # BUG FIX: the previous version piped $json_out / $raw into `python3 -`
+    # while ALSO using a `<<'PY' ... PY` heredoc on the same command. A
+    # heredoc redirects stdin too, and it wins over the pipe -- so the
+    # embedded script's sys.stdin.read() always saw an EMPTY string (verified
+    # directly: `echo "$x" | python3 - <<'PY' ... print(repr(sys.stdin.read()))
+    # PY` prints `''`), json.load()/manual parsing then failed every single
+    # time, and the JSON branch's unconditional `return` meant the (correctly
+    # written) text fallback below was never even reached. Net effect: VRAM
+    # monitoring was silently a permanent no-op on every real ROCm box (where
+    # `rocm-smi --json` always succeeds) -- the emergency SIGTERM this whole
+    # script exists for would never fire from VRAM pressure. Fixed by passing
+    # the captured output as an argv argument instead of over stdin, so it
+    # doesn't collide with the heredoc. Also made the JSON branch fall through
+    # to the text fallback when it produces no rows (e.g. truly malformed
+    # rocm-smi output), instead of returning unconditionally.
+    local json_out
+    json_out=$(timeout 10 rocm-smi --showmeminfo vram --json 2>/dev/null)
+    if [ -n "$json_out" ]; then
+        local json_result
+        json_result=$(python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+for card, info in data.items():
+    idx = int(card.replace("card", "")) if card.startswith("card") else 0
+    free_b = info.get("VRAM Free Memory (B)", 0)
+    if isinstance(free_b, (int, float)) and free_b > 0:
+        print(idx, int(free_b / 1024 / 1024))
+' "$json_out" 2>/dev/null)
+        if [ -n "$json_result" ]; then
+            echo "$json_result"
+            return
+        fi
+        # Fall through to the text fallback if JSON parsed to zero rows.
+    fi
+
+    # Text fallback: each GPU block has "VRAM Free Memory (B): <bytes>".
+    local raw
+    raw=$(timeout 10 rocm-smi --showmeminfo vram 2>/dev/null)
+    if [ -z "$raw" ]; then
+        return
+    fi
+    python3 -c '
+import re, sys
+text = sys.argv[1]
+# Split by GPU headers like "GPU[0]"
+gpus = re.split(r"GPU\[(\d+)\]", text)
+# First element is preamble; then pairs of (index, block).
+for i in range(1, len(gpus), 2):
+    idx = gpus[i]
+    block = gpus[i + 1] if i + 1 < len(gpus) else ""
+    m = re.search(r"VRAM Free Memory \(B\):\s*(\d+)", block)
+    if m:
+        print(idx, int(m.group(1)) // 1024 // 1024)
+' "$raw"
+}
+
+_read_nvidia_vram() {
+    # nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits
+    timeout 10 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
+        while IFS=',' read -r idx free_mb; do
+            idx=$(echo "$idx" | tr -d ' ')
+            free_mb=$(echo "$free_mb" | tr -d ' ')
+            if [ -n "$idx" ] && [ -n "$free_mb" ]; then
+                echo "$idx $free_mb"
+            fi
+        done
+}
+
+lowest_vram_free_mb() {
+    local min_free=""
+    while read -r idx free_mb; do
+        if [ -z "$min_free" ] || [ "$free_mb" -lt "$min_free" ]; then
+            min_free="$free_mb"
+        fi
+    done < <(read_all_vram_free_mb)
+    echo "$min_free"
+}
+
+# ---------------------------------------------------------------------------
+# Main poll loop.
+# ---------------------------------------------------------------------------
 while true; do
     if ! kill -0 "$TRAIN_PID" 2>/dev/null; then
         echo "[oom_guard] $(date '+%H:%M:%S') training PID $TRAIN_PID no longer exists -- exiting guard."
@@ -147,18 +166,15 @@ while true; do
         echo "[oom_guard] $(date '+%H:%M:%S') WARNING: ${free_mb}MB system RAM available -- getting tight."
     fi
 
-    # GPU-side (VRAM) check via rocm-smi. Skips silently (after one warning)
-    # if rocm-smi isn't available -- keeps the system-RAM check working on
-    # non-ROCm boxes. This is the failure mode that actually matters for GPU
-    # training: VRAM OOM kills the process or corrupts the driver, and the
-    # system-RAM check alone can't see it coming.
-    vram_free_mb=$(read_vram_free_mb)
-    if [ -n "$vram_free_mb" ]; then
-        if [ "$vram_free_mb" -lt "$VRAM_EMERGENCY_MB" ]; then
-            echo "[oom_guard] $(date '+%H:%M:%S') EMERGENCY: only ${vram_free_mb}MB VRAM free -- sending SIGTERM to $TRAIN_PID."
-            kill -TERM "$TRAIN_PID" 2>/dev/null
-        elif [ "$vram_free_mb" -lt "$VRAM_WARN_MB" ]; then
-            echo "[oom_guard] $(date '+%H:%M:%S') WARNING: ${vram_free_mb}MB VRAM free -- getting tight."
+    if [ "$GPU_BACKEND" != "none" ]; then
+        vram_free_mb=$(lowest_vram_free_mb)
+        if [ -n "$vram_free_mb" ]; then
+            if [ "$vram_free_mb" -lt "$VRAM_EMERGENCY_MB" ]; then
+                echo "[oom_guard] $(date '+%H:%M:%S') EMERGENCY: only ${vram_free_mb}MB VRAM free across GPUs -- sending SIGTERM to $TRAIN_PID."
+                kill -TERM "$TRAIN_PID" 2>/dev/null
+            elif [ "$vram_free_mb" -lt "$VRAM_WARN_MB" ]; then
+                echo "[oom_guard] $(date '+%H:%M:%S') WARNING: ${vram_free_mb}MB VRAM free across GPUs -- getting tight."
+            fi
         fi
     fi
 

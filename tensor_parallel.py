@@ -62,25 +62,30 @@ def log(msg: str):
     print(f"[tp] {msg}", flush=True)
 
 
-def detect_gpu_count():
-    """Detect how many AMD GPUs are available. Returns (count, arch_names).
-    Uses torch.cuda.device_count() after rocm_env setup. On CPU-only boxes
-    returns (0, [])."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return 0, []
-        count = torch.cuda.device_count()
-        archs = []
-        for i in range(count):
-            try:
-                props = torch.cuda.get_device_properties(i)
-                archs.append(getattr(props, "gcnArchName", f"gpu{i}"))
-            except Exception:
-                archs.append(f"gpu{i}")
-        return count, archs
-    except ImportError:
+def detect_gpu_count(backend_name: str | None = None):
+    """Detect how many GPUs are available. Returns (count, arch_names).
+
+    Uses the backend abstraction (rocm, cuda, xpu) instead of torch.cuda
+    directly. On CPU-only boxes returns (0, []).
+    """
+    from backends import autodetect_backend, get_backend
+
+    if backend_name is not None:
+        backend = get_backend(backend_name)
+    else:
+        backend = autodetect_backend()
+
+    if not backend.is_available():
         return 0, []
+    count = backend.get_device_count()
+    archs = []
+    for i in range(count):
+        arch = backend.get_arch_tag(i)
+        if not arch:
+            props = backend.get_device_properties(i)
+            arch = getattr(props, "name", f"gpu{i}") if props else f"gpu{i}"
+        archs.append(arch)
+    return count, archs
 
 
 def get_model_info_from_config(cfg_path: str) -> dict:
@@ -214,21 +219,26 @@ def plan_sharding(num_gpus: int, model_info: dict) -> dict:
     }
 
 
-def report_vram_per_gpu():
+def report_vram_per_gpu(backend_name: str | None = None):
     """Print peak VRAM usage per GPU after model load. Helps verify the
     pipeline split is balanced — if one GPU is at 70GB and another at 10GB,
     the device map is wrong and you should use --device-map auto."""
-    import torch
-    if not torch.cuda.is_available():
+    from backends import autodetect_backend, get_backend
+
+    if backend_name is not None:
+        backend = get_backend(backend_name)
+    else:
+        backend = autodetect_backend()
+
+    if not backend.is_available():
         return
-    n = torch.cuda.device_count()
+    n = backend.get_device_count()
     for i in range(n):
-        # Reset on first call so we measure the load, then report current peak.
-        alloc = torch.cuda.memory_allocated(i) / 1024**3
-        peak = torch.cuda.max_memory_allocated(i) / 1024**3
-        props = torch.cuda.get_device_properties(i)
-        total = props.total_memory / 1024**3
-        arch = getattr(props, "gcnArchName", f"gpu{i}")
+        info = backend.memory_info(i)
+        alloc = info.get("allocated_bytes", 0) / 1024**3
+        peak = backend.max_memory_allocated(i) / 1024**3
+        total = info.get("total_bytes", 0) / 1024**3
+        arch = backend.get_arch_tag(i) or f"gpu{i}"
         log(f"GPU {i} ({arch}, {total:.0f}GB total): "
             f"alloc={alloc:.1f}GB  peak={peak:.1f}GB")
 
@@ -236,27 +246,32 @@ def report_vram_per_gpu():
 def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
                         prompt: str, max_new_tokens: int, temperature: float,
                         top_p: float, gfx_override: str, hip_alloc_conf: str,
-                        device_map_mode: str, flash_attn: bool):
+                        device_map_mode: str, flash_attn: bool,
+                        backend_name: str | None = None):
     """Run the model with pipeline parallelism across num_gpus GPUs.
 
     device_map_mode: "explicit" (use build_explicit_device_map), "auto" (use
     HF's device_map="auto"), or "single" (force single-GPU even if multiple
     are detected)."""
-    from rocm_env import setup_rocm_env
-    hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
-    setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
+    from backends import autodetect_backend, get_backend, BackendDevice
+    from runtime import resolve_dtype, resolve_flash_attn
+
+    backend = get_backend(backend_name) if backend_name else autodetect_backend()
+    if backend.name == "rocm":
+        from rocm_env import setup_rocm_env
+        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
-    if flash_attn:
-        try:
-            import flash_attn  # noqa: F401
-            load_kwargs["attn_implementation"] = "flash_attention_2"
-            log("flash attention 2 enabled at load")
-        except ImportError:
-            log("WARNING: --flash-attn but flash-attn not installed; using standard attn")
+    dtype_str = resolve_dtype(BackendDevice(backend=backend), "bf16")
+    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+
+    load_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
+    if resolve_flash_attn(BackendDevice(backend=backend), flash_attn):
+        load_kwargs["attn_implementation"] = "flash_attention_2"
+        log("flash attention 2 enabled at load")
 
     # Determine the device map.
     if num_gpus <= 1 or device_map_mode == "single":
@@ -266,7 +281,6 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
         log(f"multi-GPU mode — HF device_map='auto' across {num_gpus} GPUs: {archs}")
         device_map = "auto"
     else:
-        # Explicit: load config to get num_layers, build balanced map.
         cfg_path = os.path.join(model_path, "config.json")
         model_info = {}
         if os.path.exists(cfg_path):
@@ -275,8 +289,7 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
         layer_prefix = model_info.get("layer_prefix", "model.layers")
         device_map = build_explicit_device_map(num_layers, num_gpus, layer_prefix)
         if not device_map:
-            log("WARNING: could not build explicit device map (num_layers=0 in "
-                "config); falling back to device_map='auto'")
+            log("WARNING: could not build explicit device map; falling back to device_map='auto'")
             device_map = "auto"
         else:
             gpu_layers = {}
@@ -291,35 +304,28 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
         load_kwargs["device_map"] = device_map
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs).to("cuda")
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        model.to(torch.device(backend.name, 0))
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = True
     model.eval()
 
-    # Report the actual distribution + per-GPU VRAM.
     if hasattr(model, "hf_device_map") and model.hf_device_map:
         devices = sorted(set(str(v) for v in model.hf_device_map.values()))
         log(f"model distributed across devices: {devices}")
-    report_vram_per_gpu()
+    report_vram_per_gpu(backend_name)
 
     # Determine the first device (where embed_tokens lives) for input placement.
-    # Ask the model directly rather than inferring from hf_device_map (which may
-    # have int, str, or torch.device values).
-    first_device = "cuda:0"
+    first_device = torch.device(backend.name, 0)
     try:
         embed_device = model.get_input_embeddings().weight.device
-        first_device = f"cuda:{embed_device.index}" if embed_device.index is not None else "cuda:0"
+        first_device = embed_device
     except Exception:
         pass
 
-    # Reuse generate.py's stream_generate — it has the robust pattern:
-    # streamer timeout (prevents deadlock if generate() raises), thread
-    # exception capture (so errors surface instead of being swallowed), and
-    # daemon thread + join(timeout). Reimplementing it here would risk
-    # dropping one of those hardening measures.
     from generate import stream_generate
     stream_generate(model, tokenizer, prompt, max_new_tokens,
                     temperature, top_p, repetition_penalty=1.0,
@@ -341,7 +347,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
-    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
     ap.add_argument("--device-map", type=str, default="auto",
                     choices=["explicit", "auto", "single"],
@@ -360,17 +366,23 @@ def main():
     ap.add_argument("--flash-attn", action="store_true", default=False,
                     help="Use Flash Attention 2 at load (requires flash-attn built "
                          "for ROCm). Falls back to standard attention if not installed.")
+    ap.add_argument("--backend", type=str, default=None,
+                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    help="Compute backend to use (auto-detected if unset).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Detect GPUs + print sharding plan, don't run.")
     args = ap.parse_args()
 
-    # ROCm env setup BEFORE torch import.
-    from rocm_env import setup_rocm_env
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-    setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+    # ROCm env setup BEFORE torch import (only for the ROCm backend).
+    from backends import get_backend
+    backend = get_backend(args.backend) if args.backend else None
+    if backend is None or backend.name == "rocm":
+        from rocm_env import setup_rocm_env
+        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
+        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
 
-    # Detect GPUs.
-    num_gpus, archs = detect_gpu_count()
+    # Detect GPUs via the backend abstraction.
+    num_gpus, archs = detect_gpu_count(backend_name=args.backend)
     if args.num_gpus is not None:
         num_gpus = min(args.num_gpus, num_gpus) if num_gpus > 0 else args.num_gpus
         archs = archs[:num_gpus] if archs else []
@@ -404,23 +416,24 @@ def main():
         return
 
     if num_gpus == 0:
-        raise SystemExit("ERROR: no CUDA/ROCm GPUs detected. This tool needs at least 1 GPU.")
+        raise SystemExit("ERROR: no GPUs detected. This tool needs at least 1 GPU.")
 
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             prompts = [line.strip() for line in f if line.strip()]
         for p in prompts:
             log(f"prompt: {p[:80]}{'...' if len(p) > 80 else ''}")
-            # NOTE: model is reloaded per prompt; for many prompts, refactor to load once.
             run_tensor_parallel(args.model, num_gpus, archs, p,
                                args.max_new_tokens, args.temperature, args.top_p,
                                args.gfx_override, args.hip_alloc_conf,
-                               args.device_map, args.flash_attn)
+                               args.device_map, args.flash_attn,
+                               backend_name=args.backend)
     else:
         run_tensor_parallel(args.model, num_gpus, archs, args.prompt,
                            args.max_new_tokens, args.temperature, args.top_p,
                            args.gfx_override, args.hip_alloc_conf,
-                           args.device_map, args.flash_attn)
+                           args.device_map, args.flash_attn,
+                           backend_name=args.backend)
 
 
 def _self_test():

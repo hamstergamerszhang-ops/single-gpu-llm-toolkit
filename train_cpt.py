@@ -804,6 +804,10 @@ def _wrap_fsdp(model, sharding_strategy: str, local_rank: int):
         # for a layer can be large. PyTorch 2.0+ default is True but we set it
         # explicitly for clarity and older versions.
         limit_all_gathers=True,
+        # forward_prefetch=True: overlaps the NEXT layer's all-gather with the
+        # CURRENT layer's forward compute — real multi-GPU throughput win on
+        # MI300X by hiding all-gather latency behind compute.
+        forward_prefetch=True,
     )
     return model
 
@@ -1053,9 +1057,9 @@ def main():
                          "for AMD consumer/older cards whose arch isn't in the ROCm "
                          "torch wheel's compiled list. When unset, rocm_env auto-detects "
                          "the GPU arch and overrides only if needed. See rocm_env.py.")
-    ap.add_argument("--hip-alloc-conf", type=str, default="max_split_size_mb:128",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
                     help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator). "
-                         "Default 'max_split_size_mb:128' prevents the fragmentation "
+                         "Default 'expandable_segments:True' prevents the fragmentation "
                          "OOMs that hit long training runs. Pass 'none' to disable.")
     ap.add_argument("--flash-attn", action="store_true", default=False,
                     help="Use Flash Attention 2 (via flash_attn package) for the "
@@ -1174,6 +1178,11 @@ def main():
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
+    # Use TF32 (TensorFloat-32) for fp32 matmuls — free throughput win on
+    # MI300X (bf16 is the primary dtype, but some ops fall back to fp32).
+    # "high" = allow TF32 for matmuls (not for reductions). No-op on GPUs
+    # without TF32 support.
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(args.seed)  # per-rank seeding added below after ddp_rank is set
     if not torch.cuda.is_available():
         print("[cpt] WARNING: no CUDA/ROCm device visible -- this script is built for "
@@ -1384,19 +1393,34 @@ def main():
         #
         # NOTE for MTP checkpoints (mtp_head.py + modeling_custom.py) under
         # full-model --ddp (windowed_freeze=False here): modeling_custom.py's
-        # CustomForCausalLM is an explicitly-unfinished stub whose forward()
-        # does NOT add an MTP loss term (see that file's docstring) -- if you
-        # use it as-is, the MTP params (enorm/eh_proj/block/lnorm/norm) never
-        # receive gradients, and find_unused_parameters=False will make DDP
-        # raise. Once you extend forward() to actually include the MTP loss
-        # (the whole point of extending it), every param participates and
-        # False is correct. If you need to run DDP against the unmodified
-        # stub for some reason, pass windowed --start/--end (even a no-op
-        # window covering all layers) to force find_unused_parameters=True,
-        # or use --fsdp instead (FSDP doesn't have this hazard).
+        # CustomForCausalLM.forward() DOES add a real MTP loss term (weighted
+        # sum of per-depth cross-entropy, see _compute_mtp_total_loss) whenever
+        # `labels` is passed. This training loop always includes "labels" in
+        # every batch (the collator sets labels = input_ids.clone(), and the
+        # step loop raises RuntimeError if outputs.loss is None) -- so in
+        # practice every MTP param (enorm/eh_proj/block/lnorm/norm) always
+        # participates in backward whenever mtp_depths > 0, and
+        # find_unused_parameters=False (i.e. windowed_freeze=False, the branch
+        # we're in) is correct for that reason alone, independent of MTP.
+        # find_unused_parameters here is really gating on whether *base model*
+        # params are frozen by windowed --start/--end (apply_window_freeze
+        # below), not on MTP. If a future caller ever invokes forward()
+        # without labels under DDP with mtp_depths > 0 and full-model (no
+        # window) training, the MTP branch wouldn't touch mtp_layers'
+        # gradients that step and find_unused_parameters=False could raise --
+        # that's not a path this script exercises today, but worth
+        # re-checking if forward() is ever called label-less mid-training.
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank] if torch.cuda.is_available() else None,
             find_unused_parameters=windowed_freeze,
+            # bucket_cap_mb: larger buckets = fewer all-reduce calls = better
+            # compute/comm overlap on MI300X. Default 25MB is too small for a
+            # 15B model. 128MB is a good balance between overlap and memory.
+            bucket_cap_mb=128,
+            # static_graph=True: when not windowed (full-model training), DDP
+            # can optimize the backward schedule by assuming the same params
+            # participate every iteration. Must be False for windowed training.
+            static_graph=not windowed_freeze,
         )
         if is_main:
             print(f"[cpt] model wrapped in DistributedDataParallel "
