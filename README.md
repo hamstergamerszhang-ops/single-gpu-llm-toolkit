@@ -111,6 +111,76 @@ own. `benchmark.py` sits outside this chain entirely — run it against any
 checkpoint, at any point, to measure a config rather than train or generate
 from it.
 
+## Why I built this
+
+It started from a single-GPU constraint — one card, no orchestrator, no
+failover — but that's the origin, not the scope. The actual goal is that
+none of this should care how many GPUs you point it at. There's no
+GPU-count branch anywhere in this codebase: the same `train_cpt.py`
+handles one card via windowed layer-freezing, or a cluster via `--ddp`
+(replicate the model, `torch.distributed` gradient sync) or `--fsdp`
+(shard the model itself across ranks, for when it doesn't fit replicated),
+launched with plain `torchrun --nproc_per_node=N`. `tensor_parallel.py`
+does the same for inference. Scaling up or down is a flag and a launch
+command, not a different tool or a rewrite.
+
+What stays constant across every one of those configurations is full
+parameter training — no LoRA, no adapters, at any GPU count. A low-rank
+approximation of the weights isn't actually training the model, it's
+training a cheaper stand-in for it, and that tradeoff doesn't get better
+just because you added more GPUs. Windowed layer-freezing plus gradient
+checkpointing is how full-parameter training fits in constrained VRAM on
+one card; FSDP's sharding is the equivalent move for a model too large to
+replicate across many. Same principle, different lever depending on what
+hardware is actually in front of you.
+
+The other constant is surviving failure, because that risk doesn't
+disappear at scale either — it just changes shape. One GPU has no
+failover at all; a multi-GPU job has more ways to fail (one bad rank can
+take the whole collective down) even if any single card matters less on
+its own. The checkpoint atomicity, the auto-resume-with-no-flags
+behavior, and `catch_and_resume.sh`'s supervisor loop are how this stops
+losing entire runs to things that are just going to happen on rented
+hardware sooner or later, regardless of how many cards that hardware is.
+
+The ROCm side specifically came out of actually running this on an AMD
+MI300X rather than assuming CUDA-first tooling would just work if you
+swapped the backend. It doesn't, reliably — I hit a real, silent GPU
+architecture misdetection bug in the process (the KFD `gfx_target_version`
+decoder was using the wrong encoding scheme entirely; it read MI300X's real
+hardware ID and confidently reported the wrong architecture back), which is
+exactly the kind of failure that doesn't throw an error, it just quietly
+gives you wrong behavior on hardware you're trusting to be handled
+correctly. That bug is fixed and covered by a test that pins the known-good
+decode. I'd rather ship one narrow, verifiably-correct architecture
+detector than a broader one I'm not sure about.
+
+None of this was built by writing it once and assuming it was right. Every
+claim in this README that describes a fix — the checkpoint corruption
+window, the GQA-expansion crash on non-Gemma checkpoints, the DDP
+evaluation deadlock, the FSDP tied-weight duplication — started as
+something I found by actually reading the code path involved and, where
+possible, reproducing it, not by assuming a comment or a docstring was
+telling the truth. A few of those were bugs introduced by a second person
+independently editing this same codebase in parallel; catching them meant
+re-verifying changes I didn't write myself with the same scrutiny as my
+own, every round. That discipline is baked into how this repo got built,
+not a one-time cleanup pass — see [Testing](#testing) for what actually
+gets run before anything here is considered done.
+
+What this buys someone else, concretely: whether you've got one AMD card
+or a cluster of them, you get the same tool — not a single-GPU toy that
+gives up the moment you have more hardware, and not a multi-GPU-only
+framework that's dead weight on one card. Either way it's real
+full-parameter training, not a LoRA adapter standing in for it, verified
+rather than assumed, and honest in the docs about where that verification
+stops. The `--ddp` section below, for one example,
+says plainly that it's been verified on a single GPU plus a CPU-only
+multi-process harness, not on a real multi-GPU cluster — and tells you to
+run your own convergence check the first time you point it at one. I'd
+rather tell you where the edge of my testing is than let you find out the
+hard way.
+
 ## Table of Contents
 
 - [Installation](#installation)
