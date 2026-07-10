@@ -151,10 +151,14 @@ def test_gradient_accumulation_matches_single_larger_batch():
 # ── Compute backends (backends/) ────────────────────────────────────────────
 
 def test_list_backends_includes_expected():
+    """This toolkit targets AMD ROCm -- CPU is registered as the universal
+    fallback (every other tool in this repo already degrades to it for
+    testing/dev without real hardware), not a second accelerator vendor."""
     from backends import list_backends
     names = list_backends()
-    for expected in ("rocm", "cuda", "xpu", "mps", "cpu"):
+    for expected in ("rocm", "cpu"):
         assert expected in names, f"missing backend {expected} in {names}"
+    assert len(names) == 2, f"expected exactly rocm+cpu, got {names}"
 
 
 def test_get_backend_unknown_raises():
@@ -196,7 +200,7 @@ def test_backend_prefer_unavailable_falls_back():
     from backends import default_device
     # ROCm is unavailable on macOS/CPU test runners; this should still succeed.
     dev = default_device(prefer="rocm")
-    assert dev.name in ("cpu", "mps", "cuda", "xpu")
+    assert dev.name == "cpu"
 
 
 # ── Distributed strategies (distributed/) ───────────────────────────────────
@@ -295,12 +299,12 @@ def test_detect_from_state_dict_keys():
 
 # ── Config recipes and presets (config/) ────────────────────────────────────
 
-def test_list_presets_includes_cpu_and_mps():
+def test_list_presets_includes_cpu_and_amd_cards():
     from config import list_presets
     presets = list_presets()
     assert "cpu" in presets
-    assert "mps" in presets
     assert "mi300x-80g" in presets
+    assert "rx7900-24g" in presets
 
 
 def test_get_preset_cpu_is_fp32():

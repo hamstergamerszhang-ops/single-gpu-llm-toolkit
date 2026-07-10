@@ -3,8 +3,8 @@
 
 Loads a checkpoint, runs generation with streaming token output, and supports
 optimization flags (--flash-attn, --dtype fp8, --compile, --gfx-override,
---hip-alloc-conf). Works on AMD ROCm, NVIDIA CUDA, Intel XPU, Apple MPS, or CPU
-(though CPU generation is very slow).
+--hip-alloc-conf). Targets AMD ROCm, with CPU as the fallback for testing/dev
+without real hardware (CPU generation is very slow).
 
 KV-cache is ENABLED by default here — essential for autoregressive decoding.
 
@@ -145,7 +145,7 @@ def main():
 
     # Hardware / backend selection.
     ap.add_argument("--backend", type=str, default=None,
-                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    choices=["rocm", "cpu"],
                     help="Compute backend to use (auto-detected if unset).")
     ap.add_argument("--device-index", type=int, default=0,
                     help="Device index within the selected backend.")

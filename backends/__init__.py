@@ -3,7 +3,7 @@
 Public API:
     from backends import autodetect_backend, get_backend, default_device, BackendDevice
 
-Backends are registered by name: rocm, cuda, xpu, mps, cpu.
+Backends are registered by name: rocm (the target), cpu (universal fallback).
 """
 
 from backends.base import ComputeBackend

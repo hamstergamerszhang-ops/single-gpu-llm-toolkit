@@ -108,7 +108,7 @@ def resolve_dtype(device: BackendDevice, requested: str | None) -> str:
         requested = "bf16"
 
     if requested in ("bf16", "fp16"):
-        if requested == "bf16" and not torch.cuda.is_bf16_supported() and device.name in ("cuda", "rocm"):
+        if requested == "bf16" and not torch.cuda.is_bf16_supported() and device.name == "rocm":
             warnings.warn("bf16 not supported on this device; falling back to fp16")
             return "fp16"
         return requested

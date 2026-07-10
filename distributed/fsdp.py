@@ -44,7 +44,7 @@ class FSDPStrategy(DistributedStrategy):
                 "FSDP requested but world_size <= 1; use --distributed single instead."
             )
 
-        if self.backend.name in ("rocm", "cuda") and dist.is_nccl_available():
+        if self.backend.name == "rocm" and dist.is_nccl_available():
             self._pg_backend = "nccl"
         else:
             self._pg_backend = "gloo"
@@ -64,7 +64,7 @@ class FSDPStrategy(DistributedStrategy):
         self._is_main = self._rank == 0
         self._initialized = True
 
-        if self.backend.name in ("rocm", "cuda"):
+        if self.backend.name == "rocm":
             torch.cuda.set_device(self._local_rank)
 
     def configure(self, sharding_strategy: str = "full") -> None:
@@ -91,7 +91,7 @@ class FSDPStrategy(DistributedStrategy):
             self._sharding_strategy_name, "FULL_SHARD"
         )
 
-        device_id = self._local_rank if self.backend.name in ("rocm", "cuda") else None
+        device_id = self._local_rank if self.backend.name == "rocm" else None
 
         wrapped = FSDP(
             model,

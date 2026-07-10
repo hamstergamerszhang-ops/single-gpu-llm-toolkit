@@ -1,8 +1,10 @@
 """Backend registry and auto-detection.
 
-Order matters for auto-detection: we prefer ROCm and CUDA accelerators first,
-then Intel XPU, then Apple MPS, and fall back to CPU. Users can always pin a
-backend with `--backend rocm`, `--backend cpu`, etc.
+This toolkit targets AMD ROCm. The only two registered backends are ROCm
+(the real target) and CPU (the universal fallback every other tool in this
+repo already degrades to for testing/dev without real hardware — not a
+competing accelerator vendor). Users can pin a backend with `--backend rocm`
+or `--backend cpu`.
 """
 
 from __future__ import annotations
@@ -11,16 +13,10 @@ from typing import Type
 
 from backends.base import ComputeBackend
 from backends.cpu import CpuBackend
-from backends.cuda import CudaBackend
-from backends.mps import MpsBackend
 from backends.rocm import RocmBackend
-from backends.xpu import XpuBackend
 
 _BACKEND_CLASSES: tuple[Type[ComputeBackend], ...] = (
     RocmBackend,
-    CudaBackend,
-    XpuBackend,
-    MpsBackend,
     CpuBackend,
 )
 

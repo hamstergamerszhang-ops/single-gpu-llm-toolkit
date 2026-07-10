@@ -2,8 +2,8 @@
 """Compress (quantize) any model checkpoint.
 
 Takes any HuggingFace-format checkpoint and produces a quantized version using
-torchao's quantization APIs. Works on AMD ROCm, NVIDIA CUDA, Intel XPU, Apple
-MPS, or CPU.
+torchao's quantization APIs. Targets AMD ROCm, with CPU as the fallback for
+testing/dev without real hardware.
 
 Usage:
     python3 compress_model.py --src ./checkpoints/base_15b --dst ./checkpoints/base_15b_int4
@@ -93,7 +93,7 @@ def main():
     ap.add_argument("--gfx-override", type=str, default=None)
     ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True")
     ap.add_argument("--backend", type=str, default=None,
-                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    choices=["rocm", "cpu"],
                     help="Compute backend to use (auto-detected if unset).")
     ap.add_argument("--device-index", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true",

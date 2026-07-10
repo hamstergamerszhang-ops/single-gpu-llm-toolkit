@@ -19,16 +19,6 @@ PRESETS: dict[str, dict] = {
         "fsdp": False,
         "ddp": False,
     },
-    "mps": {
-        "dtype": "bf16",
-        "batch_size": 1,
-        "seq_length": 512,
-        "gradient_accumulation_steps": 4,
-        "compile": False,
-        "flash_attn": False,
-        "fsdp": False,
-        "ddp": False,
-    },
     "rx7900-24g": {
         "dtype": "bf16",
         "batch_size": 1,
@@ -69,44 +59,6 @@ PRESETS: dict[str, dict] = {
         "compile": False,
         "flash_attn": True,
     },
-    "a100-40g": {
-        "dtype": "bf16",
-        "batch_size": 1,
-        "seq_length": 2048,
-        "gradient_accumulation_steps": 4,
-        "start": 0,
-        "end": -1,
-        "compile": True,
-        "flash_attn": True,
-    },
-    "a100-80g": {
-        "dtype": "bf16",
-        "batch_size": 2,
-        "seq_length": 4096,
-        "gradient_accumulation_steps": 2,
-        "start": 0,
-        "end": -1,
-        "compile": True,
-        "flash_attn": True,
-    },
-    "h100-80g": {
-        "dtype": "bf16",
-        "batch_size": 2,
-        "seq_length": 4096,
-        "gradient_accumulation_steps": 2,
-        "start": 0,
-        "end": -1,
-        "compile": True,
-        "flash_attn": True,
-    },
-    "intel-xpu": {
-        "dtype": "bf16",
-        "batch_size": 1,
-        "seq_length": 512,
-        "gradient_accumulation_steps": 4,
-        "compile": False,
-        "flash_attn": False,
-    },
 }
 
 
@@ -126,18 +78,14 @@ def suggest_preset(backend_name: str, total_memory_bytes: int | None = None) -> 
     """Suggest a preset based on detected backend and VRAM, or None if unsure."""
     if backend_name == "cpu":
         return "cpu"
-    if backend_name == "mps":
-        return "mps"
-    if backend_name == "xpu":
-        return "intel-xpu"
-    if backend_name in ("rocm", "cuda") and total_memory_bytes:
+    if backend_name == "rocm" and total_memory_bytes:
         total_gib = total_memory_bytes / (1024 ** 3)
         if total_gib >= 180:
             return "mi300x-192g"
         if total_gib >= 70:
-            return "mi300x-80g" if backend_name == "rocm" else "a100-80g"
+            return "mi300x-80g"
         if total_gib >= 30:
-            return "mi250-128g" if backend_name == "rocm" else "a100-40g"
+            return "mi250-128g"
         if total_gib >= 20:
             return "rx7900-24g"
     return None

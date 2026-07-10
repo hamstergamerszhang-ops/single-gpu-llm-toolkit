@@ -34,7 +34,7 @@ class DDPStrategy(DistributedStrategy):
             )
 
         # Prefer nccl on NVIDIA/ROCm, gloo otherwise.
-        if self.backend.name in ("rocm", "cuda") and dist.is_nccl_available():
+        if self.backend.name == "rocm" and dist.is_nccl_available():
             self._pg_backend = "nccl"
         else:
             self._pg_backend = "gloo"
@@ -54,15 +54,15 @@ class DDPStrategy(DistributedStrategy):
         self._is_main = self._rank == 0
         self._initialized = True
 
-        if self.backend.name in ("rocm", "cuda"):
+        if self.backend.name == "rocm":
             torch.cuda.set_device(self._local_rank)
 
     def wrap_model(self, model: nn.Module, **kwargs) -> nn.Module:
         find_unused = kwargs.get("find_unused_parameters", False)
         return DistributedDataParallel(
             model,
-            device_ids=[self._local_rank] if self.backend.name in ("rocm", "cuda") else None,
-            output_device=self._local_rank if self.backend.name in ("rocm", "cuda") else None,
+            device_ids=[self._local_rank] if self.backend.name == "rocm" else None,
+            output_device=self._local_rank if self.backend.name == "rocm" else None,
             find_unused_parameters=find_unused,
         )
 

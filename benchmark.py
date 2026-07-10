@@ -350,7 +350,7 @@ def main():
                     help="Number of tokens to generate in the generation benchmark "
                          "(default 128). Only used with --gen.")
     ap.add_argument("--backend", type=str, default=None,
-                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    choices=["rocm", "cpu"],
                     help="Compute backend to use (auto-detected if unset).")
     args = ap.parse_args()
 

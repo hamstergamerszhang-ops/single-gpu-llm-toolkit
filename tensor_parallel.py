@@ -367,7 +367,7 @@ def main():
                     help="Use Flash Attention 2 at load (requires flash-attn built "
                          "for ROCm). Falls back to standard attention if not installed.")
     ap.add_argument("--backend", type=str, default=None,
-                    choices=["rocm", "cuda", "xpu", "mps", "cpu"],
+                    choices=["rocm", "cpu"],
                     help="Compute backend to use (auto-detected if unset).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Detect GPUs + print sharding plan, don't run.")

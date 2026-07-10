@@ -1185,10 +1185,10 @@ def main():
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(args.seed)  # per-rank seeding added below after ddp_rank is set
     if not torch.cuda.is_available():
-        print("[cpt] WARNING: no CUDA/ROCm device visible -- this script is built for "
-              "single-GPU hardware (e.g. an AMD MI300X under ROCm, or an NVIDIA "
-              "A100/H100). Running on CPU will be extremely slow; only use this path "
-              "for a tiny --iters smoke test.", file=sys.stderr)
+        print("[cpt] WARNING: no ROCm device visible -- this script targets "
+              "single-GPU AMD hardware (e.g. an MI300X under ROCm). Running on CPU "
+              "will be extremely slow; only use this path for a tiny --iters smoke "
+              "test.", file=sys.stderr)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ── Multi-GPU DDP/FSDP setup ──────────────────────────────────────────────

@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 
 
 class ComputeBackend(ABC):
-    """Capability surface for a single compute backend (ROCm, CUDA, XPU, MPS, CPU).
+    """Capability surface for a single compute backend (ROCm or CPU).
 
     Instances are stateless and cheap to create. They answer questions about the
     backend as a whole; per-device placement is handled by `backends.device`.
