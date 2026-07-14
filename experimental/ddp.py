@@ -11,8 +11,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from backends.base import ComputeBackend
 from backends.device import BackendDevice
-from distributed.base import DistributedStrategy
-from distributed.env import detect_process_group_env
+from experimental.base import DistributedStrategy
+from experimental.env import detect_process_group_env
 
 
 class DDPStrategy(DistributedStrategy):
@@ -33,7 +33,7 @@ class DDPStrategy(DistributedStrategy):
                 "DDP requested but world_size <= 1; use --distributed single instead."
             )
 
-        # Prefer nccl on NVIDIA/ROCm, gloo otherwise.
+        # Prefer nccl on ROCm, gloo otherwise.
         if self.backend.name == "rocm" and dist.is_nccl_available():
             self._pg_backend = "nccl"
         else:

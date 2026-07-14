@@ -14,8 +14,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", required=True, help="Source checkpoint directory.")
     ap.add_argument("--dst", required=True, help="Output directory or .onnx file path.")
-    ap.add_argument("--seq-length", type=int, default=128, help="Dummy input sequence length.")
-    ap.add_argument("--batch-size", type=int, default=1, help="Dummy input batch size.")
+    ap.add_argument("--max-seq-len", "--seq-length", type=int, default=128,
+                    dest="max_seq_len", help="Dummy input sequence length (alias: --seq-length).")
+    ap.add_argument("--batch", "--batch-size", type=int, default=1, dest="batch",
+                    help="Dummy input batch size (alias: --batch-size).")
     ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     args = ap.parse_args()
 
@@ -43,7 +45,7 @@ def main():
 
     device = next(model.parameters()).device
     dummy_input = torch.randint(
-        0, model.config.vocab_size, (args.batch_size, args.seq_length), device=device
+        0, model.config.vocab_size, (args.batch, args.max_seq_len), device=device
     )
 
     dst = args.dst

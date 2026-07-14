@@ -98,6 +98,7 @@ from async_checkpoint import AsyncCheckpointer
 from bnb_optimizer import build_optimizer
 from local_cache_stream import stream_from_cache
 from optimizer_compat_guard import check_optimizer_compat
+from tokenization import build_sft_example, build_cpt_example
 
 
 # ── LR schedule ───────────────────────────────────────────────────────────
@@ -132,6 +133,28 @@ def estimate_step_tflops(n_trainable_params: int, n_tokens: int, step_time_s: fl
 
 
 # ── checkpoint I/O (atomic local write, no cloud dependency) ─────────────────
+
+def write_shard_checksums(shard_dir, verbose=True):
+    """Write a sha256 checksum sidecar (checksums.json) for each safetensors
+    shard in shard_dir. Used by both atomic_save_checkpoint (sync path) and
+    AsyncCheckpointer._write (async path) so resume can detect silent
+    filesystem corruption — NFS hiccup, partial disk write the OS reported
+    as complete, bit-rot. Without this, corrupt weights load silently."""
+    import hashlib
+    import json as _json
+    checksums = {}
+    for f in sorted(Path(shard_dir).glob("*.safetensors")):
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        checksums[f.name] = h.hexdigest()
+    if checksums:
+        with open(Path(shard_dir) / "checksums.json", "w") as f:
+            _json.dump(checksums, f, indent=2)
+        if verbose:
+            print(f"[cpt] wrote {len(checksums)} shard checksums -> checksums.json")
+
 
 def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
                             tokenizer=None, extra_state: dict | None = None,
@@ -187,6 +210,9 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
     }
     torch.save(opt_state, tmp_dir / "training_state.pt")
 
+    # Write sha256 checksums for corruption detection on resume.
+    write_shard_checksums(tmp_dir)
+
     # Retain the previous checkpoint as .prev (a real backup, not deleted) so a
     # crash mid-write or a corrupt new write can be rolled back. The recovery
     # path below (resume) restores .prev if the live save_dir is missing
@@ -226,111 +252,22 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def build_sft_example(row: dict, tokenizer, max_seq_len: int):
-    """Chat-template tokenize with prompt masking: only assistant-turn tokens get a
-    real label, everything else (system/user/special tokens) is -100 (ignored by
-    cross-entropy).
-
-    Implementation note: this tokenizes incrementally, calling
-    apply_chat_template(messages[:i+1]) per turn and diffing against the previous
-    turn's rendered text to isolate the new span. This is O(n_turns^2) in template
-    applications per example, and it assumes the template is strictly appenditive —
-    i.e. apply_chat_template(messages[:i+1]) is a verbatim text prefix of
-    apply_chat_template(messages[:i+2]). This holds for Gemma-4's template (what
-    this pipeline targets) but NOT universally; templates that re-render based on
-    the full message list, or emit a trailing EOS/generation marker only at the
-    end, break the prefix assumption and would silently mis-tokenize/mis-label. We
-    detect that break (the prefix check below) and fall back to a single full
-    tokenization with the whole prompt masked — coarser (loses per-turn assistant
-    labeling, labels only the last assistant turn) and approximate (assumes the
-    prompt tokenization is a token-level prefix of the full text, which isn't
-    guaranteed for non-appenditive templates), rather than silently wrong.
-    """
-    import torch
-
-    messages = row["messages"]
-    input_ids: list[int] = []
-    labels: list[int] = []
-
-    # Tokenize turn-by-turn so we know exactly which spans are assistant output.
-    running_text = ""
-    prefix_assumption_holds = True
-    for i, msg in enumerate(messages):
-        prefix_text = tokenizer.apply_chat_template(
-            messages[: i + 1], tokenize=False, add_generation_prompt=False
-        )
-        # Detect a non-appenditive template: if the new full text doesn't start
-        # with the previous full text, the incremental-diff approach is invalid.
-        if not prefix_text.startswith(running_text):
-            prefix_assumption_holds = False
-            break
-        new_text = prefix_text[len(running_text):]
-        running_text = prefix_text
-        ids = tokenizer(new_text, add_special_tokens=False)["input_ids"]
-        input_ids.extend(ids)
-        if msg["role"] == "assistant":
-            labels.extend(ids)
-        else:
-            labels.extend([-100] * len(ids))
-
-    if not prefix_assumption_holds:
-        # Fallback: tokenize the full conversation once, mask everything before
-        # the last assistant turn, label only the last assistant turn's tokens.
-        # This is APPROXIMATE for non-appenditive templates — it assumes the
-        # prompt-text tokenization is a token-level prefix of the full-text
-        # tokenization, which isn't guaranteed for templates that re-render.
-        # It's safer than the broken incremental diff (which would silently
-        # mis-tokenize), but it only labels the LAST assistant turn, not all
-        # of them. Gemma-4's template is appenditive and takes the primary path
-        # above, so this fallback rarely runs for the targeted model family.
-        full_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        # Build the prompt = everything up to the last assistant turn, to mask it.
-        last_assistant_idx = max(
-            (i for i, m in enumerate(messages) if m["role"] == "assistant"),
-            default=-1,
-        )
-        if last_assistant_idx == -1:
-            return {"input_ids": torch.tensor([], dtype=torch.long),
-                    "labels": torch.tensor([], dtype=torch.long)}
-        prompt_text = tokenizer.apply_chat_template(
-            messages[:last_assistant_idx] if last_assistant_idx >= 0 else [],
-            tokenize=False, add_generation_prompt=True,
-        ) if last_assistant_idx >= 0 else ""
-        full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
-        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-        p_len = len(prompt_ids)
-        input_ids = full_ids
-        labels = [-100] * min(p_len, len(full_ids)) + full_ids[min(p_len, len(full_ids)):]
-        labels = labels[:len(full_ids)]
-
-    input_ids = input_ids[:max_seq_len]
-    labels = labels[:max_seq_len]
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
-    }
-
-
-def build_cpt_example(row: dict, tokenizer, max_seq_len: int):
-    """Raw-text CPT: every token is a label (no masking). Expects packed
-    {"text": "..."} rows."""
-    import torch
-
-    text = row.get("text", "")
-    ids = tokenizer(text, add_special_tokens=False, truncation=True,
-                     max_length=max_seq_len)["input_ids"]
-    t = torch.tensor(ids, dtype=torch.long)
-    return {"input_ids": t, "labels": t.clone()}
-
-
 def collate(batch: list[dict], pad_token_id: int):
     import torch
     max_len = max(b["input_ids"].size(0) for b in batch)
-    input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
-    labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
-    attn = torch.zeros((len(batch), max_len), dtype=torch.long)
+    # pin_memory=True allocates in pinned (page-locked) host memory, enabling
+    # true async H2D copies with non_blocking=True in the training loop.
+    try:
+        input_ids = torch.full((len(batch), max_len), pad_token_id,
+                               dtype=torch.long, pin_memory=True)
+        labels = torch.full((len(batch), max_len), -100,
+                            dtype=torch.long, pin_memory=True)
+        attn = torch.zeros((len(batch), max_len),
+                           dtype=torch.long, pin_memory=True)
+    except (RuntimeError, TypeError):
+        input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
+        labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
+        attn = torch.zeros((len(batch), max_len), dtype=torch.long)
     for i, b in enumerate(batch):
         n = b["input_ids"].size(0)
         input_ids[i, :n] = b["input_ids"]
@@ -413,34 +350,37 @@ def run_eval(model, valid_rows: list[dict], builder, tokenizer, max_seq_len: int
 
 def _apply_fp8(model):
     """Convert linear layers to float8_e4m3fn via torchao's Float8Linear.
-    MI300X/MI300A/MI325X have native fp8 compute — this roughly 2x throughput
-    vs bf16 on those cards. Falls back to bf16 (no-op) with a warning if
-    torchao isn't installed, the GPU lacks fp8 hardware, or the conversion
-    fails."""
+    MI300X/MI300A/MI325X (gfx942) and MI350 (gfx950) have native fp8 compute
+    — this roughly 2x throughput vs bf16 on those cards. Falls back to bf16
+    (no-op) with a warning if torchao isn't installed, the GPU lacks fp8
+    hardware, or the conversion fails."""
     import torch
-    # Runtime capability gate: fp8 matmul (torch._scaled_mm) requires gfx942
-    # (MI300X/MI300A/MI325X). On other AMD cards (e.g. gfx1100 / RX 7900 XTX),
-    # the conversion would succeed but the first forward pass would crash with
-    # no kernel. Check up front so the user gets a clear message instead.
+    # Runtime capability gate: use the canonical supports_fp8() from
+    # backends/rocm.py so there's ONE source of truth for which archs have
+    # native fp8. This avoids the drift between train_cpt.py's cap-only gate
+    # and rocm.py's gcnArchName-based gate.
     if torch.cuda.is_available():
-        cap = torch.cuda.get_device_capability()
-        # On ROCm, get_device_capability returns (gfx_major, gfx_minor).
-        # MI300X, MI300A, AND MI325X are all gfx942 -- verified directly
-        # against AMD's own current gpu-arch-specs docs (all three list
-        # "CDNA3" / "gfx942"; there is no separate gfx940/gfx941 target for
-        # MI300A/MI325X as an earlier version of this comment claimed).
-        # gfx940/gfx941 appear in some early/internal ROCm references but are
-        # not real, currently-shipping distinct architectures -- don't
-        # reintroduce a "gfx940=MI300A, gfx941=MI325X" mapping. The `>= 40`
-        # bound below is intentionally a little loose (accepts the whole
-        # gfx940-94f range) as a defensive margin, not because those other
-        # values correspond to real distinct chips.
-        if not (cap[0] == 9 and cap[1] >= 40):
-            arch = f"gfx{cap[0]}{cap[1]}"
-            print(f"[cpt] WARNING: --dtype fp8 but GPU arch {arch} lacks native "
-                  f"fp8 compute (needs gfx942: MI300X/MI300A/MI325X). Falling "
-                  f"back to bf16. Use --dtype fp8 only on gfx942 CDNA3 hardware.",
-                  file=sys.stderr)
+        try:
+            from backends.rocm import RocmBackend
+            if not RocmBackend().supports_fp8():
+                props = torch.cuda.get_device_properties(0)
+                arch = getattr(props, "gcnArchName", "unknown")
+                print(f"[cpt] WARNING: --dtype fp8 but GPU arch {arch} lacks native "
+                      f"fp8 compute (needs gfx942: MI300X/MI300A/MI325X, or gfx950: "
+                      f"MI350). Falling back to bf16. Use --dtype fp8 only on "
+                      f"gfx94x/gfx95x CDNA3+ hardware.",
+                      file=sys.stderr)
+                return model
+        except Exception:
+            # If the backend abstraction isn't available, fall back to the
+            # cap-based check (same logic as rocm.py's fallback path).
+            cap = torch.cuda.get_device_capability()
+            if not (cap[0] == 9 and cap[1] >= 40):
+                arch = f"gfx{cap[0]}{cap[1]}"
+                print(f"[cpt] WARNING: --dtype fp8 but GPU arch {arch} lacks native "
+                      f"fp8 compute. Falling back to bf16.",
+                      file=sys.stderr)
+                return model
             return model
     try:
         from torchao.float8 import convert_to_float8_training
@@ -786,14 +726,28 @@ def _wrap_fsdp(model, sharding_strategy: str, local_rank: int):
 
     from functools import partial
     from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+    from torch.distributed.fsdp import MixedPrecision
 
     layer_policy = partial(lambda_auto_wrap_policy, lambda_fn=_is_decoder_layer)
+
+    # MixedPrecision: the canonical MI300X FSDP recipe. Compute and reduce in
+    # bf16 (halves collective traffic on multi-GPU), keep params/grads in bf16
+    # (the model loads as bf16 so this is a no-op for param dtype, but it
+    # guarantees reduce-scatter stays bf16 even if a future change casts grads
+    # to fp32). This is a throughput win, not a quality tradeoff — bf16 has
+    # fp32 exponent range so no GradScaler is needed.
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
 
     model = FSDP(
         model,
         sharding_strategy=strategy,
         auto_wrap_policy=layer_policy,
         device_id=local_rank if torch.cuda.is_available() else None,
+        mixed_precision=mp_policy,
         # use_orig_params=True: keeps parameter names stable so the optimizer
         # state_dict keys match across save/resume. Without this, FSDP flattens
         # params into "FlatParamHandle" groups and the optimizer state keys
@@ -815,7 +769,18 @@ def _wrap_fsdp(model, sharding_strategy: str, local_rank: int):
 def find_decoder_layers(model):
     """Locate the transformer's layer list across a handful of HF model-class
     shapes a Gemma-4-family checkpoint might load as. Unwraps DDP/FSDP
-    (whose wrapped model is at .module) before walking attributes."""
+    (whose wrapped model is at .module) before walking attributes.
+
+    Tries three strategies in order:
+      1. The model family's declared decoder_layers_path, looked up from the
+         model's config via models.registry (auto-detected from model_type).
+         This covers families the hardcoded path list below doesn't (Falcon's
+         transformer.h, MPT's transformer.blocks, GPT-NeoX's gpt_neox.layers).
+      2. A hardcoded list of common paths (the original four Gemma-4/Llama
+         variants, plus transformer.h / transformer.blocks / gpt_neox.layers
+         for the non-Llama architectures the registry knows about).
+      3. Raises AttributeError with the full tried-paths list.
+    """
     # Unwrap DDP/FSDP: both expose the wrapped model as .module, and neither
     # forwards attribute access to it (hasattr(ddp, "model") is False).
     # Without this, find_decoder_layers fails on every --ddp/--fsdp run.
@@ -823,11 +788,52 @@ def find_decoder_layers(model):
     # function (same convention unwrap_ddp uses).
     if type(model).__name__ in ("DistributedDataParallel", "FullyShardedDataParallel"):
         model = model.module
+
+    tried_paths = []
+
+    # Strategy 1: registry-driven path from the model's config. The registry
+    # knows the canonical decoder_layers_path per family (e.g. Falcon ->
+    # transformer.h, MPT -> transformer.blocks, GPT-NeoX -> gpt_neox.layers),
+    # which the hardcoded list below would otherwise miss or mis-order. Any
+    # failure here (no config, no model_type match, registry not importable)
+    # is non-fatal -- we fall through to the hardcoded list.
+    config = getattr(model, "config", None)
+    if config is not None:
+        try:
+            from models.registry import resolve_model_family
+            cfg_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+            family = resolve_model_family(cfg_dict)
+            reg_path = family.decoder_layers_path
+            tried_paths.append(reg_path)
+            obj = model
+            ok = True
+            for attr in reg_path.split("."):
+                if hasattr(obj, attr):
+                    obj = getattr(obj, attr)
+                else:
+                    ok = False
+                    break
+            if ok and obj is not None:
+                return obj
+        except (ImportError, ValueError, AttributeError, TypeError):
+            # Registry unavailable, family not detectable, or config not a
+            # real PretrainedConfig -- fall through to the hardcoded list.
+            pass
+
+    # Strategy 2: hardcoded path list. The original four Gemma-4/Llama
+    # variants are kept first (so the common case resolves in the same order
+    # it always did -- backward compat), then the additional paths the
+    # registry declares for non-Llama architectures (transformer.h covers
+    # GPT-2/GPT-J/Falcon/BLOOM, transformer.blocks covers MPT, gpt_neox.layers
+    # covers GPT-NeoX). 'layers' alone covers the bare-attribute case some
+    # custom modeling classes expose.
     for path in ["model.layers", "language_model.model.layers", "model.model.layers",
-                "model.language_model.layers"]:  # the path used by custom multi-token-
-                # prediction subclasses that wrap Gemma4ForConditionalGeneration --
-                # its .model is a Gemma4Model, whose .language_model is the
-                # Gemma4TextModel holding the actual decoder layer stack.
+                 "model.language_model.layers",  # the path used by custom multi-token-
+                 # prediction subclasses that wrap Gemma4ForConditionalGeneration --
+                 # its .model is a Gemma4Model, whose .language_model is the
+                 # Gemma4TextModel holding the actual decoder layer stack.
+                 "transformer.h", "transformer.blocks", "gpt_neox.layers", "layers"]:
+        tried_paths.append(path)
         obj = model
         ok = True
         for attr in path.split("."):
@@ -836,9 +842,12 @@ def find_decoder_layers(model):
             else:
                 ok = False
                 break
-        if ok:
+        if ok and obj is not None:
             return obj
-    raise AttributeError("Cannot find transformer decoder layers on this model.")
+    raise AttributeError(
+        "Cannot find transformer decoder layers on this model "
+        f"(tried paths: {tried_paths})."
+    )
 
 
 def apply_window_freeze(model, start: int, end: int):
@@ -1170,11 +1179,24 @@ def main():
     # --gfx-override forces a specific value. No-op on non-ROCm / already-
     # supported cards. See rocm_env.py for the detection + family-matching logic.
     from rocm_env import setup_rocm_env
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-    setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+    from rocm_env import setup_rocm_env_from_args
+    setup_rocm_env_from_args(args)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    # Runtime version guard: Gemma4Config model_type registration differs
+    # across transformers versions. This repo pins 5.7.0 in requirements.txt
+    # — warn if the installed version doesn't match so the user gets a clear
+    # message instead of silent wrong model_type registration.
+    try:
+        import transformers
+        if not transformers.__version__.startswith("5.7"):
+            print(f"[cpt] WARNING: transformers {transformers.__version__} is "
+                  f"installed, but this repo was tested against 5.7.0. "
+                  f"Gemma4Config model_type registration may differ — if you "
+                  f"get a model_type KeyError, install transformers==5.7.0.")
+    except Exception:
+        pass  # version check is advisory, not critical
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
@@ -1217,6 +1239,11 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = f"cuda:{local_rank}"
+        # Auto-set sane NCCL defaults for ROCm multi-GPU. These are env vars
+        # (not torch.distributed args) and must be set before init_process_group.
+        # Users can override any of these by setting them in the environment.
+        os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+        os.environ.setdefault("NCCL_DEBUG", "WARN")
         torch.distributed.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
             rank=ddp_rank,
@@ -1241,6 +1268,44 @@ def main():
         # restarting from --model and discarding a perfectly good checkpoint.
         resumed = True
         print(f"[cpt] found existing local checkpoint at {save_dir} -- resuming from it")
+        # Verify checkpoint integrity: compare sha256 of each safetensors
+        # shard against the checksums.json sidecar written at save time.
+        # Silent filesystem corruption (NFS, partial disk) would otherwise
+        # load garbage weights with no error.
+        ckpt_checksums_path = save_dir / "checksums.json"
+        if ckpt_checksums_path.exists():
+            import hashlib
+            import json as _json
+            with open(ckpt_checksums_path) as f:
+                expected = _json.load(f)
+            corrupted = []
+            for fname, expected_hash in expected.items():
+                fpath = save_dir / fname
+                if not fpath.exists():
+                    corrupted.append(f"{fname} (missing)")
+                    continue
+                h = hashlib.sha256()
+                with open(fpath, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                if h.hexdigest() != expected_hash:
+                    corrupted.append(fname)
+            if corrupted:
+                print(f"[cpt] WARNING: checkpoint corruption detected! "
+                      f"{len(corrupted)} file(s) failed sha256 verification: "
+                      f"{corrupted[:5]}{'...' if len(corrupted) > 5 else ''}. "
+                      f"Attempting .prev recovery...")
+                # Try .prev recovery (same crash-window path below).
+                prev_dir = save_dir.parent / (save_dir.name + ".prev")
+                if prev_dir.exists() and (prev_dir / "training_state.pt").exists():
+                    shutil.rmtree(save_dir)
+                    os.replace(prev_dir, save_dir)
+                    print(f"[cpt] recovered from .prev (checksum failure)")
+                else:
+                    raise SystemExit(
+                        f"ERROR: checkpoint corruption detected and no .prev "
+                        f"backup available. Remove {save_dir} and restart from "
+                        f"--model, or restore from an external backup.")
     else:
         # Crash-window recovery: if a kill -9 / OOM-kill hit BETWEEN the two
         # os.replace() calls in atomic_save_checkpoint / AsyncCheckpointer._write
@@ -1324,21 +1389,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # ── AMD-specific model optimizations (all opt-in, all with graceful fallback) ──
-    # Order matters: fp8 weight conversion first (compile then fuses the fp8
-    # ops), then flash-attn attn_implementation (independent), then torch.compile
-    # (fuses whatever's there). Each is a no-op if the flag isn't set or the
-    # dependency is missing, so the default path (bf16, eager, standard attn)
-    # is unchanged.
+    # Order: fp8 weight conversion first, then flash-attn attn_implementation.
+    # torch.compile is applied AFTER FSDP/DDP wrapping (below) so inductor
+    # sees the wrapper's collectives and can fuse them — compiling before
+    # wrap means the compiled graph is discarded by FSDP's param flattening.
     if args.dtype == "fp8":
         model = _apply_fp8(model)
     if args.flash_attn:
         _apply_flash_attn(model)
-    if args.compile:
-        # dynamic=False avoids recompilation thrash when --pack gives fixed-length
-        # sequences; leave it dynamic only if the user is not packing (variable
-        # length inputs will still work, just with more compile overhead).
-        compile_dynamic = not args.pack
-        model = _apply_compile(model, mode=args.compile_mode, dynamic=compile_dynamic)
 
     # ── Distributed wrapping: DDP or FSDP ─────────────────────────────────────
     # Both wrap the model after all modifications (fp8, flash-attn, compile) but
@@ -1428,6 +1486,14 @@ def main():
 
     n_layers, end_idx = apply_window_freeze(model, args.start, args.end)
 
+    # torch.compile AFTER FSDP/DDP wrapping so inductor sees the wrapper's
+    # collectives (all-gather, reduce-scatter) and can fuse them. Compiling
+    # before wrap means the compiled graph is discarded by FSDP's param
+    # flattening, making --compile --fsdp a near-no-op.
+    if args.compile:
+        compile_dynamic = not args.pack
+        model = _apply_compile(model, mode=args.compile_mode, dynamic=compile_dynamic)
+
     # For DDP, use the underlying model's parameters (DDP wraps but doesn't
     # change param objects). find_decoder_layers unwraps DDP via its
     # type-name check before walking attributes.
@@ -1514,6 +1580,33 @@ def main():
                              f"train on an empty dataset.")
         if is_main:
             print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
+        # Pre-tokenize all rows ONCE at startup instead of re-tokenizing every
+        # micro-batch in the training loop. build_sft_example is O(n_turns²) in
+        # apply_chat_template calls per example — calling it every epoch wastes
+        # CPU cycles that stall the GPU. This one-time pass takes seconds for
+        # thousands of rows and eliminates the per-step tokenization bottleneck.
+        if is_main:
+            print(f"[cpt] pre-tokenizing {len(rows):,} rows (one-time cost, "
+                  f"avoids re-tokenizing every epoch)...")
+        tokenized = [builder(r, tokenizer, args.max_seq_len) for r in rows]
+        del rows  # free the raw text — we only need the tokenized version now
+        if is_main:
+            print(f"[cpt] pre-tokenization done ({len(tokenized):,} examples)")
+        # Length-bucketed sampling: sort examples by token length and group
+        # into buckets of ~batch*accum examples each. Sampling within a random
+        # bucket reduces padding waste — a 2048-token and a 12-token example
+        # in the same batch waste 2036 pad tokens.
+        bucket_size = max(args.batch * args.accum, 1)
+        _len_sorted_idx = sorted(
+            range(len(tokenized)),
+            key=lambda i: tokenized[i]["input_ids"].size(0))
+        _buckets = [_len_sorted_idx[i:i + bucket_size]
+                    for i in range(0, len(_len_sorted_idx), bucket_size)]
+        if len(_buckets) > 1 and is_main:
+            avg_lens = [sum(tokenized[i]["input_ids"].size(0) for i in b) / len(b)
+                        for b in _buckets[:5]]
+            print(f"[cpt] length-bucketed sampling: {len(_buckets)} buckets of "
+                  f"~{bucket_size} examples (avg lens: {[f'{l:.0f}' for l in avg_lens]}...)")
 
     # Held-out validation set: load valid.jsonl if present in the --data dir and
     # eval isn't disabled. This makes the --data help string's valid.jsonl promise
@@ -1622,14 +1715,25 @@ def main():
                 "DistributedDataParallel", "FullyShardedDataParallel")
             for micro in range(args.accum):
                 if stream_gen is not None:
+                    # --cpt-cache path: the cache is infinite, so we can't
+                    # pre-tokenize it. Tokenize on-the-fly (cache is in RAM).
                     batch_rows = [next(stream_gen) for _ in range(args.batch)]
+                    examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
                 else:
-                    batch_rows = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
-                examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
+                    # Pre-tokenized + length-bucketed path: pick a random
+                    # bucket (similar-length examples), then sample batch
+                    # examples from within it. No tokenizer call in the hot
+                    # loop — eliminates the O(n_turns²) SFT template cost.
+                    bucket = _buckets[rng.randrange(len(_buckets))]
+                    examples = [tokenized[bucket[rng.randrange(len(bucket))]]
+                                for _ in range(args.batch)]
                 if args.pack:
                     examples = pack_examples(examples, args.max_seq_len)
                 batch = collate(examples, tokenizer.pad_token_id)
-                batch = {k: v.to(device) for k, v in batch.items()}
+                # non_blocking=True lets the H2D copy overlap with the next
+                # micro-batch's CPU work (pinned memory enables true async).
+                batch = {k: v.to(device, non_blocking=True)
+                         for k, v in batch.items()}
                 step_tokens += batch["input_ids"].numel()
 
                 # DDP optimization: skip the gradient all-reduce on every
@@ -1754,7 +1858,14 @@ def main():
                         # the next training step (eval allocates different-sized
                         # tensors than training, leaving fragmentation).
                         torch.cuda.empty_cache()
-    
+            # Post-eval barrier: under --ddp, non-rank-0 ranks skip run_eval
+            # (gated by is_main above) and race ahead to the next step's
+            # backward all-reduce, where they block waiting for rank 0.
+            # A barrier here keeps them synchronized. Under --fsdp the
+            # summon_full_params context above is already collective, so
+            # this barrier is redundant-but-harmless there.
+            if is_distributed and is_eval_step:
+                torch.distributed.barrier()
             # DDP/FSDP barrier: ensure all ranks are at the same step before
             # checkpointing.
             # NOTE: _SHOULD_STOP is intentionally NOT in this condition. The flag is

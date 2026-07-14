@@ -203,10 +203,10 @@ def test_backend_prefer_unavailable_falls_back():
     assert dev.name == "cpu"
 
 
-# ── Distributed strategies (distributed/) ───────────────────────────────────
+# ── Distributed strategies (experimental/) ───────────────────────────────────
 
 def test_process_group_env_defaults(monkeypatch):
-    from distributed.env import detect_process_group_env
+    from experimental.env import detect_process_group_env
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     monkeypatch.delenv("LOCAL_RANK", raising=False)
@@ -218,7 +218,7 @@ def test_process_group_env_defaults(monkeypatch):
 
 
 def test_process_group_env_torchrun(monkeypatch):
-    from distributed.env import detect_process_group_env
+    from experimental.env import detect_process_group_env
     monkeypatch.setenv("RANK", "2")
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setenv("LOCAL_RANK", "1")
@@ -233,7 +233,7 @@ def test_process_group_env_torchrun(monkeypatch):
 
 
 def test_create_single_strategy_falls_back_when_not_distributed():
-    from distributed import create_strategy
+    from experimental import create_strategy
     from backends import get_backend, default_device
     dev = default_device(prefer="cpu")
     strategy = create_strategy("ddp", get_backend("cpu"), dev)
@@ -243,7 +243,7 @@ def test_create_single_strategy_falls_back_when_not_distributed():
 
 
 def test_single_strategy_no_sync_is_no_op():
-    from distributed import create_strategy
+    from experimental import create_strategy
     from backends import get_backend, default_device
     dev = default_device(prefer="cpu")
     strategy = create_strategy("single", get_backend("cpu"), dev)
@@ -311,25 +311,25 @@ def test_get_preset_cpu_is_fp32():
     from config.presets import get_preset
     preset = get_preset("cpu")
     assert preset["dtype"] == "fp32"
-    assert preset["batch_size"] == 1
+    assert preset["batch"] == 1
 
 
 def test_apply_preset_does_not_override_explicit():
     from config import apply_preset
-    config = {"dtype": "bf16", "batch_size": 16}
+    config = {"dtype": "bf16", "batch": 16}
     merged = apply_preset(config, "cpu")
     assert merged["dtype"] == "bf16"
-    assert merged["batch_size"] == 16
+    assert merged["batch"] == 16
     assert merged["compile"] is False  # filled in from preset
 
 
 def test_resolve_toml_recipe(tmp_path):
     from config import resolve_recipe
     recipe = tmp_path / "test.toml"
-    recipe.write_text('batch_size = 8\nseq_length = 512\n')
-    cfg = resolve_recipe(recipe, base_defaults={"dtype": "bf16", "batch_size": 1})
-    assert cfg["batch_size"] == 8
-    assert cfg["seq_length"] == 512
+    recipe.write_text('batch = 8\nmax_seq_len = 512\n')
+    cfg = resolve_recipe(recipe, base_defaults={"dtype": "bf16", "batch": 1})
+    assert cfg["batch"] == 8
+    assert cfg["max_seq_len"] == 512
     assert cfg["dtype"] == "bf16"
 
 
@@ -338,11 +338,11 @@ def test_resolve_recipe_extends_chain(tmp_path):
     base = tmp_path / "base.toml"
     base.write_text('dtype = "bf16"\ncompile = true\n')
     child = tmp_path / "child.toml"
-    child.write_text(f'extends = "base.toml"\nbatch_size = 4\n')
-    cfg = resolve_recipe(child, base_defaults={"batch_size": 1})
+    child.write_text(f'extends = "base.toml"\nbatch = 4\n')
+    cfg = resolve_recipe(child, base_defaults={"batch": 1})
     assert cfg["dtype"] == "bf16"
     assert cfg["compile"] is True
-    assert cfg["batch_size"] == 4
+    assert cfg["batch"] == 4
 
 
 # ── Runtime capability probes (runtime/) ────────────────────────────────────

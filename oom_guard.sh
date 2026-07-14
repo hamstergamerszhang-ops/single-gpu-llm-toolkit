@@ -4,8 +4,8 @@
 # under a hard emergency threshold -- so it dies BEFORE the OS/driver hits an
 # unrecoverable OOM state, not after.
 #
-# Supports AMD GPUs via `rocm-smi` and NVIDIA GPUs via `nvidia-smi`. If neither
-# is available, the guard falls back to system-RAM-only monitoring.
+# Supports AMD GPUs via `rocm-smi`. If rocm-smi is not available, the guard
+# falls back to system-RAM-only monitoring.
 #
 # Usage: nohup bash oom_guard.sh <training_pid> [warn_free_mb] [emergency_free_mb] \
 #                                   [poll_sec] [vram_warn_mb] [vram_emergency_mb] \
@@ -43,19 +43,14 @@ GPU_BACKEND="none"
 if command -v rocm-smi >/dev/null 2>&1; then
     GPU_BACKEND="rocm"
     echo "[oom_guard] GPU backend: ROCm (rocm-smi)"
-elif command -v nvidia-smi >/dev/null 2>&1; then
-    GPU_BACKEND="cuda"
-    echo "[oom_guard] GPU backend: NVIDIA (nvidia-smi)"
 else
-    echo "[oom_guard] no rocm-smi or nvidia-smi found -- GPU-VRAM checks skipped (system-RAM only)."
+    echo "[oom_guard] no rocm-smi found -- GPU-VRAM checks skipped (system-RAM only)."
 fi
 
 read_all_vram_free_mb() {
     # Prints one line per GPU: "<index> <free_mb>". Empty output means unavailable.
     if [ "$GPU_BACKEND" = "rocm" ]; then
         _read_rocm_vram
-    elif [ "$GPU_BACKEND" = "cuda" ]; then
-        _read_nvidia_vram
     fi
 }
 
@@ -119,18 +114,6 @@ for i in range(1, len(gpus), 2):
     if m:
         print(idx, int(m.group(1)) // 1024 // 1024)
 ' "$raw"
-}
-
-_read_nvidia_vram() {
-    # nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits
-    timeout 10 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
-        while IFS=',' read -r idx free_mb; do
-            idx=$(echo "$idx" | tr -d ' ')
-            free_mb=$(echo "$free_mb" | tr -d ' ')
-            if [ -n "$idx" ] && [ -n "$free_mb" ]; then
-                echo "$idx $free_mb"
-            fi
-        done
 }
 
 lowest_vram_free_mb() {

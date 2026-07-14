@@ -39,7 +39,7 @@ Until that's done, treat this package as a parallel design sketch, not live
 infrastructure.
 """
 
-from distributed.base import DistributedStrategy
-from distributed.registry import create_strategy
+from experimental.base import DistributedStrategy
+from experimental.registry import create_strategy
 
 __all__ = ["DistributedStrategy", "create_strategy"]

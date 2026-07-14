@@ -1,16 +1,19 @@
 # single-gpu-llm-toolkit
 
-Nineteen independently-runnable tools (seventeen Python + two shell) for
-adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
-multi-node cluster, no distributed training framework. The pipeline covers
+Over twenty independently-runnable tools for adapting an LLM checkpoint on a
+**single AMD GPU** under ROCm/PyTorch — no multi-node cluster, no distributed
+training framework. The pipeline covers
 the full path from a base checkpoint to a trained one: shrink a tokenizer,
 grow a model's width and depth, continue-pretrain or fine-tune it, and
 survive the specific ways a single GPU fails you along the way — OOM,
 crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
 `benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
 data in, compare configs before committing to a long run, and actually talk
-to the model you just trained. Every tool ships its own `--selftest` or
-pytest coverage (the two shell scripts, `catch_and_resume.sh` and `oom_guard.sh`, are not covered by selftests or pytest — their logic is exercised manually; see [Testing](#testing)) and is independently runnable —
+to the model you just trained. Tools with testable logic ship their own
+`--selftest` or pytest coverage; thin wrappers around external scripts
+(e.g. `export_gguf.py`, `export_onnx.py`) do not (the two shell scripts,
+`catch_and_resume.sh` and `oom_guard.sh`, are likewise exercised manually; see
+[Testing](#testing)). Each tool is independently runnable —
 use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
@@ -111,76 +114,6 @@ own. `benchmark.py` sits outside this chain entirely — run it against any
 checkpoint, at any point, to measure a config rather than train or generate
 from it.
 
-## Why I built this
-
-It started from a single-GPU constraint — one card, no orchestrator, no
-failover — but that's the origin, not the scope. The actual goal is that
-none of this should care how many GPUs you point it at. There's no
-GPU-count branch anywhere in this codebase: the same `train_cpt.py`
-handles one card via windowed layer-freezing, or a cluster via `--ddp`
-(replicate the model, `torch.distributed` gradient sync) or `--fsdp`
-(shard the model itself across ranks, for when it doesn't fit replicated),
-launched with plain `torchrun --nproc_per_node=N`. `tensor_parallel.py`
-does the same for inference. Scaling up or down is a flag and a launch
-command, not a different tool or a rewrite.
-
-What stays constant across every one of those configurations is full
-parameter training — no LoRA, no adapters, at any GPU count. A low-rank
-approximation of the weights isn't actually training the model, it's
-training a cheaper stand-in for it, and that tradeoff doesn't get better
-just because you added more GPUs. Windowed layer-freezing plus gradient
-checkpointing is how full-parameter training fits in constrained VRAM on
-one card; FSDP's sharding is the equivalent move for a model too large to
-replicate across many. Same principle, different lever depending on what
-hardware is actually in front of you.
-
-The other constant is surviving failure, because that risk doesn't
-disappear at scale either — it just changes shape. One GPU has no
-failover at all; a multi-GPU job has more ways to fail (one bad rank can
-take the whole collective down) even if any single card matters less on
-its own. The checkpoint atomicity, the auto-resume-with-no-flags
-behavior, and `catch_and_resume.sh`'s supervisor loop are how this stops
-losing entire runs to things that are just going to happen on rented
-hardware sooner or later, regardless of how many cards that hardware is.
-
-The ROCm side specifically came out of actually running this on an AMD
-MI300X rather than assuming CUDA-first tooling would just work if you
-swapped the backend. It doesn't, reliably — I hit a real, silent GPU
-architecture misdetection bug in the process (the KFD `gfx_target_version`
-decoder was using the wrong encoding scheme entirely; it read MI300X's real
-hardware ID and confidently reported the wrong architecture back), which is
-exactly the kind of failure that doesn't throw an error, it just quietly
-gives you wrong behavior on hardware you're trusting to be handled
-correctly. That bug is fixed and covered by a test that pins the known-good
-decode. I'd rather ship one narrow, verifiably-correct architecture
-detector than a broader one I'm not sure about.
-
-None of this was built by writing it once and assuming it was right. Every
-claim in this README that describes a fix — the checkpoint corruption
-window, the GQA-expansion crash on non-Gemma checkpoints, the DDP
-evaluation deadlock, the FSDP tied-weight duplication — started as
-something I found by actually reading the code path involved and, where
-possible, reproducing it, not by assuming a comment or a docstring was
-telling the truth. A few of those were bugs introduced by a second person
-independently editing this same codebase in parallel; catching them meant
-re-verifying changes I didn't write myself with the same scrutiny as my
-own, every round. That discipline is baked into how this repo got built,
-not a one-time cleanup pass — see [Testing](#testing) for what actually
-gets run before anything here is considered done.
-
-What this buys someone else, concretely: whether you've got one AMD card
-or a cluster of them, you get the same tool — not a single-GPU toy that
-gives up the moment you have more hardware, and not a multi-GPU-only
-framework that's dead weight on one card. Either way it's real
-full-parameter training, not a LoRA adapter standing in for it, verified
-rather than assumed, and honest in the docs about where that verification
-stops. The `--ddp` section below, for one example,
-says plainly that it's been verified on a single GPU plus a CPU-only
-multi-process harness, not on a real multi-GPU cluster — and tells you to
-run your own convergence check the first time you point it at one. I'd
-rather tell you where the edge of my testing is than let you find out the
-hard way.
-
 ## Table of Contents
 
 - [Installation](#installation)
@@ -233,6 +166,43 @@ wheel's compiled list (common on RDNA1/2, older cards), `train_cpt.py` calls
 `rocm_env.py` automatically at startup to detect and set
 `HSA_OVERRIDE_GFX_VERSION`. See [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
 below. You can also force it with `--gfx-override gfx1100`.
+
+## Quickstart
+
+Verify your install and GPU detection in 30 seconds — no model or dataset
+needed, every self-test is CPU-only:
+
+```bash
+python3 train_cpt.py --selftest && python3 generate.py --selftest && pytest tests/ -q
+```
+
+Your first real training run (CPT on a local JSONL cache):
+
+```bash
+python3 train_cpt.py --model ./checkpoints/base_expanded_15b \
+    --cpt-cache ./cpt_cache/cache.jsonl --cpt \
+    --save ./checkpoints/model_cpt_1 \
+    --iters 1000 --batch 4 --lr 5e-7 --max-seq-len 2048
+```
+
+Then generate from the trained checkpoint:
+
+```bash
+python3 generate.py --model ./checkpoints/model_cpt_1 \
+    --flash-attn --dtype bf16
+```
+
+## Package layout
+
+The repo ships five importable packages alongside the CLI tools:
+
+| Package | Purpose | Used by |
+|---|---|---|
+| `backends/` | Device abstraction (ROCm, CPU). Maps `torch.cuda` namespace, arch detection, capability gates (fp8, flash-attn, bf16). | benchmark, compress_model, generate, serve, tensor_parallel, distributed |
+| `experimental/` | DDP/FSDP/SingleDevice strategy abstraction. Design sketch — `train_cpt.py` has its own inline wrappers; this package is tested but not yet wired in. | tests |
+| `models/` | Model-family registry (Llama, Gemma, Phi3, Falcon, GPT-2, etc.). Maps architecture-specific tensor suffixes and config layouts. | expand_model, mtp_head, tests |
+| `runtime/` | Runtime capability probing. Runs a tiny `torch._scaled_mm` / `flash_attn_func` to verify fp8/flash-attn actually work, not just that the import succeeded. | benchmark, compress_model, generate, serve, tensor_parallel |
+| `config/` | Recipe/preset system. TOML/YAML recipe files + hardware presets (mi300x-80g, rx7900-24g, etc.). | generate, mtp_head, models |
 
 ## `prune_vocab.py` — shrink a tokenizer you don't need in full
 
@@ -423,9 +393,11 @@ is for:
   kernel-level profiling beyond torch.profiler, wrap the run with
   `rocprof --stats python3 train_cpt.py ...`.
 - **`--hip-alloc-conf`** — sets `PYTORCH_HIP_ALLOC_CONF` (default
-  `max_split_size_mb:128`) to prevent the caching allocator fragmentation that
-  causes phantom OOMs on long runs. Handled by `rocm_env.py` alongside the gfx
-  override.
+  `expandable_segments:True`) to prevent the caching allocator fragmentation
+  that causes phantom OOMs on long runs. `expandable_segments` grows arena
+  segments on demand — dramatically reduces the "20GB free but OOM on 2GB"
+  failures on large-buffer workloads. Handled by `rocm_env.py` alongside the
+  gfx override.
 - **`--ddp`** — multi-GPU training via `torch.distributed` +
   `DistributedDataParallel`. Launch with `torchrun --nproc_per_node=N
   train_cpt.py --ddp ...`. Only rank 0 writes checkpoints/logs and runs
@@ -630,6 +602,22 @@ still works on everything else). Auto-detects nested (Gemma-4) vs flat
 python3 compress_model.py --src ./checkpoints/base_15b --dst ./checkpoints/base_15b_int4
 ```
 
+### `train_cpt.py` flag reference
+
+| Flag | Default | Fallback | Notes |
+|---|---|---|---|
+| `--flash-attn` | off | standard attention | Requires `flash-attn` built for ROCm |
+| `--dtype fp8` | bf16 | bf16 (with warning) | Runtime gfx94x gate; needs `torchao` |
+| `--compile` | off | eager mode | `--compile-mode` selects mode |
+| `--compile-mode` | max-autotune | — | `default`/`reduce-overhead`/`max-autotune` |
+| `--ddp` | off | — | Launch via `torchrun --nproc_per_node=N` |
+| `--fsdp` | off | — | Shards params across ranks; `--ddp` mutually exclusive |
+| `--sharding-strategy` | full | — | `full`/`shard-grad-op`/`no-shard` (FSDP only) |
+| `--accum N` | 1 | — | Effective batch = `batch * accum * world_size` |
+| `--hip-alloc-conf` | expandable_segments:True | — | `PYTORCH_HIP_ALLOC_CONF` value |
+| `--gfx-override` | auto-detect | — | Force `HSA_OVERRIDE_GFX_VERSION` |
+| `--profile <dir>` | off | — | `torch.profiler` trace (Perfetto) |
+
 ## `tensor_parallel.py` — auto-detect multi-GPU, run with pipeline parallelism
 
 Detects how many AMD GPUs are available and distributes the model across them
@@ -826,6 +814,85 @@ python3 rocm_env.py --selftest
 python3 rocm_env.py --gfx-override gfx1100
 ```
 
+## `pretokenize.py` — offline tokenization cache
+
+Pre-tokenizes JSONL data into sharded `.pt` files of ready-to-stack
+`input_ids`/`labels` tensors, so the training loop can skip per-step
+tokenization entirely (the biggest single-GPU throughput win for SFT —
+`build_sft_example` is O(n_turns²) in `apply_chat_template` calls). Supports
+SFT (chat-template masking) and CPT (raw-text, no masking) modes.
+
+```
+python3 pretokenize.py --src ./data/train.jsonl --tokenizer ./checkpoints/base \
+    --dst ./cpt_cache/tokenized --mode sft --shard-size 10000 --max-seq-len 2048
+```
+
+## `serve.py` — OpenAI-compatible inference server
+
+An OpenAI-compatible FastAPI server exposing `/v1/chat/completions` with SSE
+streaming. Loads a checkpoint with the same optimization flags as
+`generate.py` (`--flash-attn`, `--dtype`, `--compile`). Supports
+`--static-cache` and `--speculative` (MTP head draft model). Requires
+`fastapi`, `uvicorn`, and `pydantic` (installed in the Docker image; listed
+as optional in `requirements.txt`).
+
+```
+python3 serve.py --model ./checkpoints/model_cpt_1 --port 8000 --flash-attn
+# Then: curl http://localhost:8000/v1/chat/completions ...
+```
+
+## `evaluate.py` — batch perplexity evaluation
+
+Computes mean cross-entropy loss and perplexity on a JSONL evaluation set.
+Loads the model with the same ROCm bootstrap as every other GPU tool
+(`--gfx-override`, `--hip-alloc-conf`). Skips malformed JSONL lines with a
+warning instead of crashing. Uses `torch.inference_mode()` and passes
+`attention_mask` to avoid attending to pad tokens.
+
+```
+python3 evaluate.py --model ./checkpoints/model_cpt_1 --data ./data/valid.jsonl \
+    --batch 4 --max-seq-len 2048 --dtype bf16
+```
+
+## `rocprof_trace.py` — AMD rocprof profiling wrapper
+
+Wraps AMD's `rocprof --stats --hip-trace` and parses the resulting
+`*.stats.csv` to report per-HIP-kernel durations, GPU utilization, and HBM
+bandwidth estimates. This is the tool an AMD engineer asks for first when a
+training run is slower than expected — it gives the kernel-level breakdown
+that `torch.profiler` cannot.
+
+```
+python3 rocprof_trace.py -- python3 train_cpt.py --model ... --iters 10
+python3 rocprof_trace.py --report ./rocprof_output
+```
+
+## `vram_log.py` — VRAM time-series logger
+
+A background process that polls `rocm-smi` + `torch.cuda.memory_allocated`
+at a fixed interval and writes a CSV time-series of per-GPU VRAM usage.
+Read-only sibling of `oom_guard.sh` — useful for post-hoc analysis of
+when/why VRAM spiked during a training run.
+
+```
+nohup python3 vram_log.py --output vram.csv --interval 5 > vram_log.out 2>&1 &
+```
+
+## Export tools
+
+Three thin wrappers for exporting a trained checkpoint to other formats:
+
+- **`export_safetensors.py`** — consolidates a sharded checkpoint into a single
+  `model.safetensors` file (useful for inference servers that expect one file).
+- **`export_onnx.py`** — exports to ONNX format for cross-framework deployment.
+- **`export_gguf.py`** — exports to GGUF format for `llama.cpp` / Ollama.
+
+```
+python3 export_safetensors.py --src ./checkpoints/model_cpt_1 --dst ./model.safetensors
+python3 export_onnx.py --src ./checkpoints/model_cpt_1 --dst ./model.onnx
+python3 export_gguf.py --src ./checkpoints/model_cpt_1 --dst ./model.gguf
+```
+
 ## Tips
 
 - **Reinstall `bitsandbytes` explicitly on every fresh container.** It's easy
@@ -943,7 +1010,9 @@ for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          local_cache_stream.py optimizer_compat_guard.py \
          rocm_env.py mtp_head.py train_sft.py \
          preprocess_data.py benchmark.py generate.py \
-         compress_model.py tensor_parallel.py smart_hipify.py; do
+         compress_model.py tensor_parallel.py smart_hipify.py \
+         pretokenize.py serve.py rocprof_trace.py vram_log.py \
+         evaluate.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v
@@ -998,6 +1067,34 @@ constants go in CLI flags, not new hardcoded branches. If you add a tool,
 give it a `--selftest` (or, if it's a transformation tool that needs a real
 checkpoint to run, pytest coverage of its logic instead — see `tests/`
 above for what that looks like in practice).
+
+## Design rationale
+
+This toolkit started from a single-GPU constraint but was designed to scale
+without changing tools. The same `train_cpt.py` handles one card (windowed
+layer-freezing + gradient checkpointing) or a cluster (`--ddp`/`--fsdp` via
+`torchrun`). Scaling is a flag, not a rewrite.
+
+**Full-parameter training only** — no LoRA, no adapters. A low-rank
+approximation isn't training the model; it's training a cheaper stand-in.
+That tradeoff doesn't improve with more GPUs.
+
+**Failure survival is a first-class concern.** Checkpoint atomicity (two-phase
+`os.replace`), auto-resume with no flags, and `catch_and_resume.sh`'s
+supervisor loop exist because rented hardware fails. The `--ddp`/`--fsdp`
+SIGTERM broadcast ensures all ranks checkpoint together on preemption.
+
+**ROCm-specific, not CUDA-assumed.** The `rocm_env.py` gfx arch detector was
+written after hitting a real, silent KFD `gfx_target_version` misdetection on
+MI300X. The FP8 capability gate (`get_device_capability` check) prevents
+`_scaled_mm` crashes on non-gfx94x cards. The flash-attn gate excludes
+gfx8xx/gfx900 where ROCm wheels don't ship kernels.
+
+**Verified, not assumed.** Every fix described in this README — the checkpoint
+corruption window, the GQA-expansion crash, the DDP eval deadlock, the FSDP
+tied-weight duplication — was found by reading the code path and reproducing
+the failure, not by trusting comments. See [Testing](#testing) for what
+actually runs before anything here is considered done.
 
 ## License
 

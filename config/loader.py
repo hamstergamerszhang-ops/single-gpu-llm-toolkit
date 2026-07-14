@@ -15,7 +15,14 @@ from config.presets import get_preset
 
 
 def _load_toml(path: str | os.PathLike) -> dict:
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            f"TOML recipes require Python 3.11+ (tomllib is stdlib since 3.11). "
+            f"Your Python is {__import__('sys').version_info[0]}.{__import__('sys').version_info[1]}. "
+            f"Either upgrade to 3.11+ or use a YAML recipe (.yaml/.yml) instead."
+        )
     with open(path, "rb") as f:
         return tomllib.load(f)
 

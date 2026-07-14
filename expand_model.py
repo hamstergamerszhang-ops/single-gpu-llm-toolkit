@@ -144,6 +144,16 @@ INIT_SCALE = 0.02
 MAX_SHARD_BYTES = 5 * 1024**3
 DEFAULT_GQA_KV_HEADS = 8  # matches sliding-attention layers' existing kv head count
 
+# Default MLP/attention submodule suffixes -- the historical hardcoded values
+# (Llama-derived: gate_proj/up_proj/down_proj, q/k/v/o_proj). Used as the
+# fallback when no ModelFamily is passed to width_expand_layer /
+# gqa_expand_kv / clone_layer_tensors, preserving backward compatibility for
+# direct callers (including mtp_head.py's clone_layer_tensors import). The
+# per-family overrides live in models.registry.ModelFamily.mlp_suffixes /
+# attn_suffixes, wired in via the `family` parameter added to those functions.
+_DEFAULT_MLP_SUFFIXES = {"gate": "gate_proj", "up": "up_proj", "down": "down_proj"}
+_DEFAULT_ATTN_SUFFIXES = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj"}
+
 
 def log(msg: str, prefix: str = "expand_model"):
     """Prints a `[prefix] msg` line. `prefix` defaults to this module's own
@@ -200,11 +210,35 @@ def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows
 
 
 def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
-                       new_intermediate: int):
+                       new_intermediate: int, family=None):
     n_new = new_intermediate - old_intermediate
-    gate_key = f"{layer_prefix}.mlp.gate_proj.weight"
-    up_key = f"{layer_prefix}.mlp.up_proj.weight"
-    down_key = f"{layer_prefix}.mlp.down_proj.weight"
+    # Suffixes come from the resolved ModelFamily when wired in by main()
+    # (so non-Llama MLP layouts -- Phi-3's fused gate_up_proj, MPT's
+    # up_proj/down_proj -- get their real tensor keys), or fall back to the
+    # historical Llama-derived defaults when called without a family
+    # (preserving backward compat for direct callers).
+    mlp = family.mlp_suffixes if family is not None else _DEFAULT_MLP_SUFFIXES
+    # This function implements the Llama-style 3-matrix gated MLP width
+    # expansion (pad gate+up input dim, pad down output dim). Architectures
+    # without a separate gate (Falcon/BLOOM/GPT-NeoX use dense/down, GPT-2
+    # uses c_fc/c_proj, Phi-3 fuses gate+up into gate_up_proj) need a
+    # different expansion strategy -- fail clearly rather than silently doing
+    # the wrong thing. The module docstring already documents this as a
+    # known limitation requiring real code changes for non-Llama MLP layouts.
+    if not all(k in mlp for k in ("gate", "up", "down")):
+        raise SystemExit(
+            f"ERROR: width_expand_layer requires a Llama-style gated MLP "
+            f"(gate/up/down suffixes), but model family "
+            f"{family.name if family is not None else 'unknown'!r} uses "
+            f"mlp_suffixes={mlp}. Non-gated or fused-gate MLP layouts need "
+            f"a different expansion strategy -- width expansion is currently "
+            f"only implemented for Llama-derived architectures. Pass "
+            f"--width-step 0 to skip width expansion, or implement a "
+            f"family-specific branch here."
+        )
+    gate_key = f"{layer_prefix}.mlp.{mlp['gate']}.weight"
+    up_key = f"{layer_prefix}.mlp.{mlp['up']}.weight"
+    down_key = f"{layer_prefix}.mlp.{mlp['down']}.weight"
     hidden = tensors[gate_key].shape[1]
 
     for key in (gate_key, up_key):
@@ -218,7 +252,7 @@ def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
 
 
 def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_prefix: str,
-                                 head_dim: int, old_kv_heads: int) -> tuple:
+                                 head_dim: int, old_kv_heads: int, family=None) -> tuple:
     """Checks whether this checkpoint's full-attention layers actually match the
     specific MQA layout gqa_expand_kv() assumes ("1 shared KV head, V literally
     reuses K, no separate v_proj key exists at all"), instead of assuming every
@@ -248,8 +282,12 @@ def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_pref
 
     for old_idx in full_attn_idxs:
         prefix = f"{layer_prefix}.{old_idx}"
-        v_key = f"{prefix}.self_attn.v_proj.weight"
-        k_key = f"{prefix}.self_attn.k_proj.weight"
+        # Suffixes from the resolved family (fused-QKV families have no
+        # separate k/v and will simply not match this layout -- the same clean
+        # skip path the detection logic already takes for any mismatch).
+        attn = family.attn_suffixes if family is not None else _DEFAULT_ATTN_SUFFIXES
+        v_key = f"{prefix}.self_attn.{attn['v']}.weight"
+        k_key = f"{prefix}.self_attn.{attn['k']}.weight"
 
         if v_key in tensors:
             return False, (f"layer {old_idx}: found a real {v_key!r} tensor -- this checkpoint "
@@ -275,7 +313,7 @@ def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_pref
 
 
 def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads: int,
-                  new_kv_heads: int, hidden: int, init_scale: float):
+                  new_kv_heads: int, hidden: int, init_scale: float, family=None):
     """Some full-attention layers ship with an extreme MQA setup: a single shared
     KV head with V literally reusing K (v_proj doesn't exist at all — confirmed
     via the real checkpoint's safetensors header, only k_proj/k_norm/q_proj/q_norm
@@ -288,8 +326,15 @@ def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads:
     the same shape (genuinely fresh orthogonal init — there's no existing V data
     to pad from, since V never existed as its own matrix before).
     """
-    k_key = f"{layer_prefix}.self_attn.k_proj.weight"
-    v_key = f"{layer_prefix}.self_attn.v_proj.weight"
+    # Suffixes from the resolved family when provided (so non-Llama attention
+    # layouts use their real k/v keys), else the historical Llama-derived
+    # defaults. Fused-QKV families (no separate k/v) will KeyError here -- the
+    # same clean failure mode this pass already documents for non-Llama
+    # architectures; the layout check in detect_mqa_v_shares_k_layout skips
+    # them before reaching this point when family is wired through.
+    attn = family.attn_suffixes if family is not None else _DEFAULT_ATTN_SUFFIXES
+    k_key = f"{layer_prefix}.self_attn.{attn['k']}.weight"
+    v_key = f"{layer_prefix}.self_attn.{attn['v']}.weight"
     old_out = old_kv_heads * head_dim
     new_out = new_kv_heads * head_dim
     n_new = new_out - old_out
@@ -323,15 +368,26 @@ def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads:
 
 
 def clone_layer_tensors(tensors: dict, src_prefix: str, dst_prefix: str,
-                        zero_output_projections: bool):
+                        zero_output_projections: bool, family=None):
     prefix_dot = src_prefix + "."
+    # The output projections to zero on duplicate layers are family-specific
+    # (Llama: self_attn.o_proj + mlp.down_proj; GPT-2: c_attn + c_proj; etc.).
+    # Resolve the suffixes from the family when provided, else fall back to the
+    # historical Llama-derived defaults so direct callers (mtp_head.py imports
+    # this helper) keep working unchanged.
+    attn = family.attn_suffixes if family is not None else _DEFAULT_ATTN_SUFFIXES
+    mlp = family.mlp_suffixes if family is not None else _DEFAULT_MLP_SUFFIXES
+    zero_suffixes = (
+        f"self_attn.{attn['o']}.weight",
+        f"mlp.{mlp['down']}.weight",
+    )
     new_entries = {}
     for key, val in tensors.items():
         if not key.startswith(prefix_dot):
             continue
         suffix = key[len(prefix_dot):]
         new_key = f"{dst_prefix}.{suffix}"
-        if zero_output_projections and suffix in ("self_attn.o_proj.weight", "mlp.down_proj.weight"):
+        if zero_output_projections and suffix in zero_suffixes:
             new_entries[new_key] = torch.zeros(val.shape, dtype=val.dtype)
         else:
             # .clone() is required, not cosmetic: without it, a duplicated layer's
@@ -400,6 +456,17 @@ def main():
     ap.add_argument("--dst", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Override model-family auto-detection. One of: "
+                         "llama, gemma, phi3, falcon, mpt, gpt2, gpt_neox, "
+                         "gptj, bloom. When omitted, the family is auto-"
+                         "detected from config.json (+ safetensors keys once "
+                         "they're loaded) via models.registry. When provided, "
+                         "the family's decoder_layers_path / mlp_suffixes / "
+                         "attn_suffixes / config field names are used in place "
+                         "of the historical Llama-derived defaults. Without "
+                         "this flag the existing defaults still apply "
+                         "(backward compat).")
     ap.add_argument("--width-step", type=int, default=DEFAULT_WIDTH_STEP)
     ap.add_argument("--depth-step", type=int, default=DEFAULT_DEPTH_STEP)
     ap.add_argument("--gqa-kv-heads", type=int, default=DEFAULT_GQA_KV_HEADS,
@@ -438,6 +505,11 @@ def main():
                          "hardcoded module constant; now a flag with the same default.")
     args = ap.parse_args()
 
+    # Guard against src == dst (in-place overwrite would corrupt the source).
+    if os.path.abspath(args.src) == os.path.abspath(args.dst):
+        raise SystemExit("ERROR: --src and --dst must differ (in-place "
+                         "expansion would overwrite the source checkpoint).")
+
     np.random.seed(args.seed)
 
     src_cfg_path = os.path.join(args.src, "config.json")
@@ -449,9 +521,51 @@ def main():
     # config layouts. mtp_head.py uses the same .get() fallback pattern.
     tc = cfg.get("text_config", cfg)
 
-    orig_layers = tc["num_hidden_layers"]
-    orig_intermediate = tc["intermediate_size"]
-    hidden = tc["hidden_size"]
+    # Resolve the model family up front. Auto-detection from config alone can
+    # fail on architectures whose model_type isn't in the registry but whose
+    # safetensors keys are unambiguous (e.g. a re-exported checkpoint whose
+    # config.json lost the model_type) -- so detection is retried AFTER the
+    # tensors load below, once state_dict_keys are available. When an explicit
+    # --model-family override is passed, resolve_model_family returns it
+    # immediately and the retry below is a no-op (same family back). On any
+    # ValueError from auto-detect, `family` stays None and the historical
+    # Llama-derived defaults apply (backward compat) -- the only thing that
+    # depends on family here is the layer-prefix default + the mlp/attn
+    # suffixes, both of which have working defaults.
+    family = None
+    try:
+        from models.registry import resolve_model_family
+        try:
+            family = resolve_model_family(cfg, override=args.model_family)
+        except ValueError:
+            # model_type alone didn't match -- defer to the state-dict-key
+            # retry after the shards load.
+            family = None
+    except ImportError:
+        # models.registry not importable (running outside the repo root).
+        # Fall back to the historical defaults -- same behavior as before
+        # this pass wired the registry in.
+        family = None
+
+    # Config field names are family-specific (num_hidden_layers vs. n_layer,
+    # intermediate_size vs. n_inner, hidden_size vs. n_embd). Read them through
+    # the family's *_key attributes when a family was resolved, falling back to
+    # the canonical HF Llama-style names (which is what every architecture in
+    # the registry ultimately maps to via .get fallbacks) so the historical
+    # default behavior is unchanged when no family is resolved.
+    num_layers_key = family.num_hidden_layers_key if family is not None else "num_hidden_layers"
+    intermediate_key = family.intermediate_size_key if family is not None else "intermediate_size"
+    hidden_key = family.hidden_size_key if family is not None else "hidden_size"
+    orig_layers = tc.get(num_layers_key, tc.get("num_hidden_layers"))
+    orig_intermediate = tc.get(intermediate_key, tc.get("intermediate_size"))
+    hidden = tc.get(hidden_key, tc.get("hidden_size"))
+    if orig_layers is None or orig_intermediate is None or hidden is None:
+        raise SystemExit(
+            f"ERROR: config.json missing one of "
+            f"{num_layers_key!r}/{intermediate_key!r}/{hidden_key!r} "
+            f"(or the canonical num_hidden_layers/intermediate_size/hidden_size "
+            f"fallbacks) -- is this a supported checkpoint?"
+        )
     # layer_types is Gemma-4-specific (full_attention/sliding_attention). Most
     # architectures don't have it — default to all "full_attention" so the
     # depth-plan and GQA logic treats every layer uniformly.
@@ -510,6 +624,40 @@ def main():
         tensors.update(loaded)
     log(f"  loaded {len(tensors)} tensors")
 
+    # Retry family detection now that the safetensors keys are available --
+    # detect_model_family falls back to inspecting tensor names when the
+    # config's model_type alone didn't match (see the comment at family
+    # resolution above). Only runs if auto-detect was used (no --model-family
+    # override) AND the config-only attempt returned nothing.
+    if family is None and args.model_family is None:
+        try:
+            from models.registry import resolve_model_family
+            family = resolve_model_family(
+                cfg, override=None, state_dict_keys=list(tensors.keys())
+            )
+            log(f"  auto-detected model family: {family.name} "
+                f"(decoder_layers_path={family.decoder_layers_path!r})")
+        except (ValueError, ImportError):
+            family = None
+
+    # When the user passed --model-family explicitly, use the family's declared
+    # decoder_layers_path as the layer prefix (overriding the historical
+    # default). This is what makes the script work on non-Gemma-4 checkpoints
+    # without the user having to know the family's internal layer-path naming.
+    # When --model-family was NOT passed (auto-detect), the family is still
+    # resolved above for its mlp/attn suffixes and config field names (which
+    # are identical to the defaults for Llama-derived families, so safe), but
+    # the layer PREFIX stays at its historical default -- backward compat.
+    # The prefix can't be safely auto-overridden because a checkpoint's real
+    # tensor-key prefix depends on how it was wrapped/exported (e.g. Gemma-4
+    # multimodal uses model.language_model.layers, standard Llama uses
+    # model.layers), which the family's canonical decoder_layers_path can't
+    # tell apart without inspecting the actual keys.
+    if family is not None and args.model_family is not None:
+        args.layer_prefix = family.decoder_layers_path
+        log(f"  using family decoder_layers_path as layer prefix: "
+            f"{args.layer_prefix!r}")
+
     gqa_applied = False
     if args.gqa_kv_heads > 0:
         old_kv_heads = tc.get("num_global_key_value_heads", tc.get("num_key_value_heads", 1))
@@ -532,7 +680,7 @@ def main():
             )
         else:
             matches, reason = detect_mqa_v_shares_k_layout(tensors, full_attn_idxs, args.layer_prefix,
-                                                           global_head_dim, old_kv_heads)
+                                                           global_head_dim, old_kv_heads, family=family)
         if not matches and not args.force_gqa_fix:
             log(f"Pass 1/3: SKIPPED -- checkpoint doesn't match the assumed MQA layout ({reason}). "
                 f"This fix is a narrow, Gemma-4-specific optimization for checkpoints that ship "
@@ -567,7 +715,7 @@ def main():
             for old_idx in full_attn_idxs:
                 prefix = f"{args.layer_prefix}.{old_idx}"
                 gqa_expand_kv(tensors, prefix, global_head_dim, old_kv_heads, args.gqa_kv_heads,
-                             hidden, INIT_SCALE)
+                             hidden, INIT_SCALE, family=family)
             log("  GQA fix done")
             gqa_applied = True
     else:
@@ -578,7 +726,7 @@ def main():
             f"on {orig_layers} layers ...")
         for old_idx in range(orig_layers):
             prefix = f"{args.layer_prefix}.{old_idx}"
-            width_expand_layer(tensors, prefix, orig_intermediate, new_intermediate)
+            width_expand_layer(tensors, prefix, orig_intermediate, new_intermediate, family=family)
             if (old_idx + 1) % 12 == 0:
                 log(f"  widened {old_idx + 1}/{orig_layers} layers")
         log("  width expansion done")
@@ -595,7 +743,7 @@ def main():
         src_prefix = f"{args.layer_prefix}.{old_idx}"
         dst_prefix = f"{args.layer_prefix}.{new_idx}"
         cloned = clone_layer_tensors(tensors, src_prefix, dst_prefix,
-                                     zero_output_projections=is_dup)
+                                     zero_output_projections=is_dup, family=family)
         final_tensors.update(cloned)
         tag = "DUPLICATE (o_proj+down_proj zeroed)" if is_dup else "original"
         log(f"  layer {new_idx:2d} <- old layer {old_idx:2d} [{tag}]")
@@ -607,9 +755,14 @@ def main():
 
     # Write through tc (which is either cfg["text_config"] or cfg itself,
     # depending on whether the config was nested or flat). This avoids creating
-    # a spurious text_config dict on flat configs (Llama/Mistral/Qwen).
-    tc["intermediate_size"] = new_intermediate
-    tc["num_hidden_layers"] = new_layers
+    # a spurious text_config dict on flat configs (Llama/Mistral/Qwen). Write
+    # under the family's declared field names when a family was resolved (so
+    # e.g. a GPT-2-family checkpoint updates n_inner/n_layer rather than
+    # silently gaining unrelated intermediate_size/num_hidden_layers keys),
+    # else the canonical HF Llama-style names -- unchanged from before this
+    # pass wired the registry in.
+    tc[intermediate_key] = new_intermediate
+    tc[num_layers_key] = new_layers
     # Only write layer_types back if the original config had it — don't create
     # a spurious Gemma-4-specific field on flat (Llama/Mistral/Qwen) configs.
     if "layer_types" in tc:

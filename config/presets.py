@@ -1,8 +1,16 @@
 """Hardware presets.
 
 A preset is a bundle of sensible defaults for a given device class. It is
-applied *before* explicit CLI overrides, so `--batch-size 8` always beats the
+applied *before* explicit CLI overrides, so `--batch 8` always beats the
 preset's batch size.
+
+Keys match train_cpt.py CLI flag `dest` names exactly:
+  batch_size -> --batch (dest="batch")
+  seq_length -> --max-seq-len (dest="max_seq_len")
+  gradient_accumulation_steps -> --accum (dest="accum")
+
+The generate.py recipe-merge code at main() line ~189 maps these via
+`hasattr(args, key)`, so the dest names must match what argparse stores.
 """
 
 from __future__ import annotations
@@ -11,9 +19,9 @@ from __future__ import annotations
 PRESETS: dict[str, dict] = {
     "cpu": {
         "dtype": "fp32",
-        "batch_size": 1,
-        "seq_length": 128,
-        "gradient_accumulation_steps": 8,
+        "batch": 1,
+        "max_seq_len": 128,
+        "accum": 8,
         "compile": False,
         "flash_attn": False,
         "fsdp": False,
@@ -21,9 +29,9 @@ PRESETS: dict[str, dict] = {
     },
     "rx7900-24g": {
         "dtype": "bf16",
-        "batch_size": 1,
-        "seq_length": 2048,
-        "gradient_accumulation_steps": 4,
+        "batch": 1,
+        "max_seq_len": 2048,
+        "accum": 4,
         "start": 0,
         "end": -1,
         "compile": False,
@@ -31,9 +39,9 @@ PRESETS: dict[str, dict] = {
     },
     "mi300x-80g": {
         "dtype": "bf16",
-        "batch_size": 2,
-        "seq_length": 4096,
-        "gradient_accumulation_steps": 2,
+        "batch": 2,
+        "max_seq_len": 4096,
+        "accum": 2,
         "start": 0,
         "end": -1,
         "compile": True,
@@ -41,9 +49,9 @@ PRESETS: dict[str, dict] = {
     },
     "mi300x-192g": {
         "dtype": "bf16",
-        "batch_size": 4,
-        "seq_length": 4096,
-        "gradient_accumulation_steps": 1,
+        "batch": 4,
+        "max_seq_len": 4096,
+        "accum": 1,
         "start": 0,
         "end": -1,
         "compile": True,
@@ -51,9 +59,9 @@ PRESETS: dict[str, dict] = {
     },
     "mi250-128g": {
         "dtype": "bf16",
-        "batch_size": 2,
-        "seq_length": 2048,
-        "gradient_accumulation_steps": 2,
+        "batch": 2,
+        "max_seq_len": 2048,
+        "accum": 2,
         "start": 0,
         "end": -1,
         "compile": False,

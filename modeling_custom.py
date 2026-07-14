@@ -34,20 +34,25 @@ import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Base class selection. Try the common transformers CausalLM classes in turn.
+# Gemma4 is tried FIRST because this repo targets Gemma-4-family checkpoints
+# (the repo pins transformers==5.7.0 specifically for Gemma4Config support).
 # ---------------------------------------------------------------------------
 try:
-    from transformers import Gemma3ForCausalLM as _BaseForCausalLM
+    from transformers import Gemma4ForCausalLM as _BaseForCausalLM
 except ImportError:
     try:
-        from transformers import Gemma2ForCausalLM as _BaseForCausalLM
+        from transformers import Gemma3ForCausalLM as _BaseForCausalLM
     except ImportError:
         try:
-            from transformers import Qwen2ForCausalLM as _BaseForCausalLM
+            from transformers import Gemma2ForCausalLM as _BaseForCausalLM
         except ImportError:
             try:
-                from transformers import Phi3ForCausalLM as _BaseForCausalLM
+                from transformers import Qwen2ForCausalLM as _BaseForCausalLM
             except ImportError:
-                from transformers import LlamaForCausalLM as _BaseForCausalLM
+                try:
+                    from transformers import Phi3ForCausalLM as _BaseForCausalLM
+                except ImportError:
+                    from transformers import LlamaForCausalLM as _BaseForCausalLM
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +133,19 @@ def _compute_mtp_total_loss(
 # Layer-path detection (duplicated here so the file is self-contained).
 # ---------------------------------------------------------------------------
 def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
-    for path in ("layers", "language_model.layers", "text_model.layers"):
+    """Locate the decoder-layer ModuleList across HF model-class shapes.
+
+    Tries the common attribute paths the registry knows about (the bare
+    'layers' attribute plus the Llama/Gemma 'model.layers', the multimodal
+    'language_model.layers' / 'text_model.layers', and the non-Llama
+    architectures' 'transformer.h' / 'transformer.blocks' / 'gpt_neox.layers'
+    that Falcon, MPT, GPT-2/GPT-J, BLOOM, and GPT-NeoX use). Kept as a flat
+    hardcoded list (not a registry import) because this file is copied
+    alongside a checkpoint outside the repo root and must stay self-contained.
+    """
+    for path in ("layers", "language_model.layers", "text_model.layers",
+                 "model.layers", "transformer.h", "transformer.blocks",
+                 "gpt_neox.layers"):
         obj = model
         found = True
         for attr in path.split("."):
@@ -141,7 +158,38 @@ def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
             return obj
     raise AttributeError(
         "Could not locate a decoder-layer ModuleList on the base model "
-        "(tried .layers, .language_model.layers, .text_model.layers)."
+        "(tried .layers, .language_model.layers, .text_model.layers, "
+        ".model.layers, .transformer.h, .transformer.blocks, "
+        ".gpt_neox.layers)."
+    )
+
+
+def _find_embed_tokens(model: nn.Module) -> nn.Module:
+    """Locate the input-embedding layer generically across HF architectures.
+
+    `self.model.embed_tokens` is the Llama/Gemma/Qwen/Phi-3 convention, but
+    GPT-2/GPT-J use `wte`, GPT-NeoX and BLOOM use `word_embeddings`, and
+    Falcon uses `word_embeddings` under `transformer`. Try each in turn so
+    the MTP forward pass can recover the token embedding for the eh_proj
+    concatenation regardless of family, instead of hardcoding the Llama
+    attribute name (which would AttributeError on every other architecture).
+    """
+    # Walk the most common nesting: try attributes directly on `model`, then
+    # one level down under `model.model` (Llama-style) and `model.transformer`
+    # (GPT-2/Falcon/BLOOM-style).
+    candidates = ("embed_tokens", "wte", "word_embeddings", "embed_in")
+    for root in (model, getattr(model, "model", None),
+                 getattr(model, "transformer", None)):
+        if root is None:
+            continue
+        for name in candidates:
+            mod = getattr(root, name, None)
+            if isinstance(mod, nn.Module):
+                return mod
+    raise AttributeError(
+        "Could not locate an input-embedding module on the base model "
+        "(tried embed_tokens / wte / word_embeddings / embed_in on the "
+        "model and its .model / .transformer submodules)."
     )
 
 
@@ -267,7 +315,14 @@ class CustomForCausalLM(_BaseForCausalLM):
             if inputs_embeds is not None:
                 token_emb = inputs_embeds
             elif input_ids is not None:
-                token_emb = self.model.embed_tokens(input_ids)
+                # Resolve the embedding module generically (Llama's
+                # embed_tokens, GPT-2's wte, BLOOM/GPT-NeoX's word_embeddings
+                # / embed_in) and cache it -- the attribute doesn't change
+                # after construction, and _find_embed_tokens walks several
+                # candidate names every call.
+                if not hasattr(self, "_mtp_embed_tokens"):
+                    self._mtp_embed_tokens = _find_embed_tokens(self.model)
+                token_emb = self._mtp_embed_tokens(input_ids)
             else:
                 token_emb = h
 

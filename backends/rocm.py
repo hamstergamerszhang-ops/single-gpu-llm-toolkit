@@ -32,10 +32,12 @@ class RocmBackend(ComputeBackend):
         arch = getattr(props, "gcnArchName", "")
         if arch and arch.startswith("gfx"):
             return arch
-        # Fallback to capability tuple, which on ROCm is gfx_major/minor.
+        # Fallback to capability tuple. On ROCm this is (gfx_major, gfx_minor)
+        # as decimal integers (e.g. MI300X = (9, 42)). Use decimal formatting
+        # to match gcnArchName (gfx942, not gfx92a from hex).
         cap = torch.cuda.get_device_capability(device_index)
         if cap is not None:
-            return f"gfx{cap[0]}{cap[1]:x}"
+            return f"gfx{cap[0]}{cap[1]}"
         return None
 
     def recommended_dtype(self) -> str:
@@ -44,19 +46,41 @@ class RocmBackend(ComputeBackend):
     def supports_fp8(self) -> bool:
         if not self.is_available():
             return False
-        # gfx942 (MI300X/MI300A/MI325X) and gfx950+ are the AMD families with
-        # native fp8 support. Use the gcnArchName when available.
+        # The entire gfx94x family (gfx940=MI300A, gfx941=MI325X, gfx942=MI300X)
+        # and gfx950 (MI350) have native fp8 matrix compute. RDNA4 (gfx12xx)
+        # does NOT have established native fp8. Use gcnArchName, fall back to cap.
         props = torch.cuda.get_device_properties(0)
         arch = getattr(props, "gcnArchName", "")
         if arch:
-            return arch.startswith(("gfx942", "gfx950", "gfx95", "gfx12"))
+            return arch.startswith(("gfx940", "gfx941", "gfx942", "gfx950", "gfx95"))
         cap = torch.cuda.get_device_capability(0)
         if cap is None:
             return False
+        # gfx940/gfx941/gfx942 (MI300 family) and gfx950 (MI350).
         return cap[0] == 9 and cap[1] >= 40
 
     def supports_flash_attn(self) -> bool:
-        return self.is_available()
+        if not self.is_available():
+            return False
+        # Flash attention kernels are built for CDNA MI100+ (gfx908/gfx90a/
+        # gfx94x/gfx95x) and RDNA2+ (gfx10xx+). gfx8xx (Fiji/Polaris), gfx900
+        # (MI25), and gfx906 (MI50) do NOT have flash-attn kernels in ROCm wheels.
+        props = torch.cuda.get_device_properties(0)
+        arch = getattr(props, "gcnArchName", "")
+        if arch:
+            # CDNA: MI100 (gfx908), MI200 (gfx90a), MI300 (gfx94x), MI350 (gfx95x)
+            if arch.startswith(("gfx908", "gfx90a", "gfx94", "gfx95")):
+                return True
+            # RDNA2+ (gfx10xx, gfx11xx, gfx12xx)
+            return arch.startswith(("gfx10", "gfx11", "gfx12"))
+        cap = torch.cuda.get_device_capability(0)
+        if cap is None:
+            return False
+        # Cap fallback: gfx908 (MI100) = (9,8), gfx90a (MI200) = (9,10),
+        # gfx942 (MI300) = (9,42). Accept gfx908+ in the gfx9 family.
+        if cap[0] == 9:
+            return cap[1] >= 8
+        return cap[0] >= 10
 
     def memory_info(self, device_index: int) -> dict:
         if not self.is_available():

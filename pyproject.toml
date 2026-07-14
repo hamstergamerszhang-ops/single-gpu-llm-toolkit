@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gemma-persona-rocm"
+version = "0.1.0"
+description = "AMD ROCm LLM training + inference toolkit for Gemma-4 models"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+keywords = ["amd", "rocm", "llm", "training", "inference", "gemma", "mi300x"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "safetensors>=0.4.0",
+    "numpy>=1.24.0",
+    "transformers==5.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.4.0"]
+opt = [
+    "bitsandbytes>=0.43.0",
+    "tensorboard>=2.14.0",
+    "torchao>=0.5.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/mymaccrashed12times/gemma_persona"
+
+[tool.setuptools]
+py-modules = [
+    "train_cpt", "train_sft", "generate", "benchmark", "tensor_parallel",
+    "compress_model", "expand_model", "mtp_head", "preprocess_data",
+    "pretokenize", "evaluate", "serve", "rocm_env",
+    "rocprof_trace", "vram_log", "smart_hipify", "async_checkpoint",
+    "bnb_optimizer", "optimizer_compat_guard", "local_cache_stream",
+    "tokenization",
+    "prune_vocab", "prune_embeddings_torch", "export_gguf",
+    "export_onnx", "export_safetensors", "modeling_custom",
+]
+
+[tool.setuptools.packages.find]
+include = ["backends*", "experimental*", "models*", "runtime*", "config*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

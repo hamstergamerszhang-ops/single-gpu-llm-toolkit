@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from backends.base import ComputeBackend
 from backends.device import BackendDevice
-from distributed.base import DistributedStrategy
+from experimental.base import DistributedStrategy
 
 
 class SingleDeviceStrategy(DistributedStrategy):

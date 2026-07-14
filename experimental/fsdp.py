@@ -11,8 +11,8 @@ import torch.nn as nn
 
 from backends.base import ComputeBackend
 from backends.device import BackendDevice
-from distributed.base import DistributedStrategy
-from distributed.env import detect_process_group_env
+from experimental.base import DistributedStrategy
+from experimental.env import detect_process_group_env
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -82,13 +82,15 @@ class FSDPStrategy(DistributedStrategy):
         def _wrap_fn(module):
             return any(module.__class__.__name__.endswith(suffix) for suffix in decoder_layer_classes)
 
+        from torch.distributed.fsdp import ShardingStrategy
+
         sharding_strategy_map = {
-            "full": "FULL_SHARD",
-            "shard-grad-op": "SHARD_GRAD_OP",
-            "no-shard": "NO_SHARD",
+            "full": ShardingStrategy.FULL_SHARD,
+            "shard-grad-op": ShardingStrategy.SHARD_GRAD_OP,
+            "no-shard": ShardingStrategy.NO_SHARD,
         }
         strategy = sharding_strategy_map.get(
-            self._sharding_strategy_name, "FULL_SHARD"
+            self._sharding_strategy_name, ShardingStrategy.FULL_SHARD
         )
 
         device_id = self._local_rank if self.backend.name == "rocm" else None

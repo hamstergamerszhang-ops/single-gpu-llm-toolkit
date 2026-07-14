@@ -40,16 +40,17 @@ def probe_fp8(device: BackendDevice) -> tuple[bool, str]:
 
     # Try a minimal scaled matmul if the op exists.
     if hasattr(torch, "_scaled_mm"):
-        return _quietly(_run_scaled_mm)
+        return _quietly(lambda: _run_scaled_mm(device))
 
     return True, "torchao available; scaled matmul op not present, trusting backend"
 
 
-def _run_scaled_mm() -> tuple[bool, str]:
-    a = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn).cuda()
-    b = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn).cuda().t()
-    scale_a = torch.tensor(1.0, device="cuda")
-    scale_b = torch.tensor(1.0, device="cuda")
+def _run_scaled_mm(device: BackendDevice) -> tuple[bool, str]:
+    dev = device.torch_device
+    a = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn, device=dev)
+    b = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn, device=dev).t()
+    scale_a = torch.tensor(1.0, device=dev)
+    scale_b = torch.tensor(1.0, device=dev)
     out = torch._scaled_mm(a, b, scale_a, scale_b)
     if torch.isnan(out).any():
         return False, "scaled matmul produced NaN"
@@ -108,7 +109,7 @@ def resolve_dtype(device: BackendDevice, requested: str | None) -> str:
         requested = "bf16"
 
     if requested in ("bf16", "fp16"):
-        if requested == "bf16" and not torch.cuda.is_bf16_supported() and device.name == "rocm":
+        if requested == "bf16" and not torch.cuda.is_bf16_supported(device=device.index) and device.name == "rocm":
             warnings.warn("bf16 not supported on this device; falling back to fp16")
             return "fp16"
         return requested
