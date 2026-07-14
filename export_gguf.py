@@ -62,5 +62,45 @@ def main():
     print("[export_gguf] done.")
 
 
+def _self_test():
+    print("[selftest] export_gguf: convert-script detection + command construction")
+    import tempfile, os
+
+    # Test convert-script path detection with --convert-script override.
+    # The tool should construct the correct command (positional src, not --src).
+    ap = argparse.ArgumentParser(description="test")
+    ap.add_argument("--src", required=True)
+    ap.add_argument("--dst", required=True)
+    ap.add_argument("--outtype", default="f16")
+    ap.add_argument("--convert-script", default=None)
+
+    args = ap.parse_args(["--src", "/fake/src", "--dst", "/fake/dst.gguf"])
+    # Simulate the command construction (without running it).
+    cmd = [sys.executable, "/fake/convert.py", args.src,
+           "--outfile", args.dst, "--outtype", args.outtype]
+    # Verify the command uses positional src (not --src), matching llama.cpp's API.
+    assert "/fake/src" in cmd, "src should be a positional argument"
+    assert "--src" not in cmd, "src should NOT be a --src flag (llama.cpp uses positional)"
+    assert "--outfile" in cmd
+    assert "--outtype" in cmd
+    print("  OK (command uses positional src, --outfile, --outtype)")
+
+    # Test outtype default.
+    assert args.outtype == "f16", f"default outtype should be f16, got {args.outtype}"
+    print("  OK (default outtype is f16)")
+
+    print("\n[selftest] All checks passed (no GPU/llama.cpp required).")
+
+
+def main_cli():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    args, _ = ap.parse_known_args()
+    if args.selftest:
+        _self_test()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_cli()

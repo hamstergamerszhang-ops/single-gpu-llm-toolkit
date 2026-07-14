@@ -117,6 +117,8 @@ from it.
 ## Table of Contents
 
 - [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Package layout](#package-layout)
 - [Tools](#prune_vocabpy--shrink-a-tokenizer-you-dont-need-in-full)
   - [`prune_vocab.py`](#prune_vocabpy--shrink-a-tokenizer-you-dont-need-in-full)
   - [`prune_embeddings_torch.py`](#prune_embeddings_torchpy--apply-that-vocab-cut-to-the-actual-weights)
@@ -133,12 +135,19 @@ from it.
   - [`smart_hipify.py`](#smart_hipifypy--intelligent-cudahip-converter)
   - [Standalone utilities](#standalone-utilities)
   - [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
+  - [`pretokenize.py`](#pretokenizepy--offline-tokenization-cache)
+  - [`serve.py`](#servepy--openai-compatible-inference-server)
+  - [`evaluate.py`](#evaluatepy--batch-perplexity-evaluation)
+  - [`rocprof_trace.py`](#rocprof_tracepy--amd-rocprof-profiling-wrapper)
+  - [`vram_log.py`](#vram_logpy--vram-time-series-logger)
+  - [Export tools](#export-tools)
 - [Tips](#tips)
 - [Troubleshooting](#troubleshooting)
 - [Where this hits a real ceiling](#where-this-hits-a-real-ceiling)
 - [Testing](#testing)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
+- [Design rationale](#design-rationale)
 - [License](#license)
 
 ## Installation

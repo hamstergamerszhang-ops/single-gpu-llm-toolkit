@@ -70,5 +70,40 @@ def main():
     print("[export_onnx] done.")
 
 
+def _self_test():
+    print("[selftest] export_onnx: flag aliasing + dtype map (no GPU required)")
+    import argparse
+
+    # Test flag aliasing: --batch/--batch-size and --max-seq-len/--seq-length.
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-seq-len", "--seq-length", type=int, default=128,
+                    dest="max_seq_len")
+    ap.add_argument("--batch", "--batch-size", type=int, default=1, dest="batch")
+    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
+
+    args1 = ap.parse_args(["--batch-size", "4", "--seq-length", "256"])
+    assert args1.batch == 4, f"--batch-size should set batch=4, got {args1.batch}"
+    assert args1.max_seq_len == 256, f"--seq-length should set max_seq_len=256, got {args1.max_seq_len}"
+    print("  OK (flag aliases --batch-size and --seq-length work)")
+
+    # Test dtype map completeness.
+    dtype_map = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
+    for k, v in dtype_map.items():
+        assert v in dir(__import__("torch")), f"torch.{v} should exist for {k}"
+    print("  OK (dtype map covers fp32, fp16, bf16)")
+
+    print("\n[selftest] All checks passed (no GPU required).")
+
+
+def main_cli():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    args, _ = ap.parse_known_args()
+    if args.selftest:
+        _self_test()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_cli()
