@@ -8,7 +8,8 @@
 # Build:  docker build -t single-gpu-llm-toolkit .
 # Run:    docker run --device /dev/kfd --device /dev/dri --group-add video \
 #                 --shm-size 64G -v $(pwd):/work -w /work -it single-gpu-llm-toolkit \
-#                 python3 train_cpt.py --model ... --save ...
+#                 python3 train_cpt.py --model ./checkpoints/base --data ./data/train.jsonl \
+#                 --save ./checkpoints/out --iters 1000 --batch 4 --lr 5e-7
 #
 # The --device /dev/kfd --device /dev/dri --group-add video flags give the
 # container access to the AMD GPU. --shm-size matters because PyTorch's
@@ -37,7 +38,10 @@ RUN pip install --no-cache-dir \
         numpy \
         "transformers==5.7.0" \
         tensorboard \
-        pytest
+        pytest \
+        fastapi \
+        uvicorn \
+        pydantic
 
 # ROCm-specific optional performance deps. These are installed against the
 # ROCm stack in this base image (headers and hipcc are present). If a build

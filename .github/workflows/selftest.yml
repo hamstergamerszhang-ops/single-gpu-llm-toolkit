@@ -36,11 +36,12 @@ jobs:
         run: |
           missing=0
           for f in async_checkpoint.py benchmark.py bnb_optimizer.py \
-                   catch_and_resume.sh compress_model.py expand_model.py \
-                   generate.py local_cache_stream.py mtp_head.py \
-                   oom_guard.sh optimizer_compat_guard.py preprocess_data.py \
-                   prune_embeddings_torch.py prune_vocab.py rocm_env.py \
-                   smart_hipify.py tensor_parallel.py train_cpt.py \
+                   catch_and_resume.sh compress_model.py evaluate.py \
+                   expand_model.py export_gguf.py export_onnx.py \
+                   export_safetensors.py generate.py local_cache_stream.py \
+                   mtp_head.py oom_guard.sh optimizer_compat_guard.py \
+                   preprocess_data.py prune_embeddings_torch.py prune_vocab.py \
+                   rocm_env.py smart_hipify.py tensor_parallel.py train_cpt.py \
                    train_sft.py; do
             if [ ! -x "$f" ]; then
               echo "MISSING +x: $f"
@@ -60,14 +61,16 @@ jobs:
           # Only modules with a --selftest flag (transformation tools like
           # prune_vocab/expand_model need real checkpoints, so they have no
           # self-test — they're covered by the pytest suite's logic tests).
-          # train_sft.py needs transformers installed above -- its selftest
-          # imports build_sft_example to verify the symbol exists (it
-          # delegates the real tests to train_cpt.self_test).
+          # NOTE: CI is CPU-only (no ROCm GPU). Self-tests exercise pure logic
+          # (LR schedule math, config parsing, checkpoint rename, etc.) not
+          # GPU paths. GPU-path testing requires a self-hosted ROCm runner.
           for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
                    local_cache_stream.py optimizer_compat_guard.py \
                    rocm_env.py mtp_head.py train_sft.py \
                    preprocess_data.py benchmark.py generate.py \
-                   compress_model.py tensor_parallel.py smart_hipify.py; do
+                   compress_model.py tensor_parallel.py smart_hipify.py \
+                   pretokenize.py serve.py rocprof_trace.py vram_log.py \
+                   evaluate.py; do
             echo "=== $f --selftest ==="
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done

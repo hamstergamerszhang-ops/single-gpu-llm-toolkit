@@ -40,7 +40,7 @@ QUANT_OPTIONS = {
         "import_name": "float8_weight_only",
         "size_reduction": "~2x",
         "quality": "negligible loss",
-        "hardware": "best on GPUs with native fp8 (MI300X/H100)",
+        "hardware": "best on AMD GPUs with native fp8 (MI300X/MI300A/MI325X/MI350)",
     },
 }
 
@@ -132,8 +132,8 @@ def main():
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+        from rocm_env import setup_rocm_env_from_args
+        setup_rocm_env_from_args(args)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer

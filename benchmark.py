@@ -102,7 +102,8 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
         raise SystemExit("ERROR: no compute device visible — benchmark needs a device.")
 
     dtype_str = resolve_dtype(dev, "bf16")
-    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16,
+                   "bf16": torch.bfloat16, "fp8": torch.bfloat16}[dtype_str]
 
     log(f"loading model for generation benchmark: {model_path} on {dev}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -158,7 +159,12 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     peak_vram = dev.max_memory_allocated() / 1024**3
     avg_ttft = sum(first_token_times) / len(first_token_times) * 1000
     avg_total = sum(total_times) / len(total_times) * 1000
-    avg_tpot = ((avg_total - avg_ttft) / max(gen_len - 1, 1))
+    # TPOT needs at least 2 generated tokens (1 for TTFT, >=1 for decode).
+    # With gen_len < 2, TPOT is meaningless — report 0.
+    if gen_len >= 2:
+        avg_tpot = (avg_total - avg_ttft) / (gen_len - 1)
+    else:
+        avg_tpot = 0.0
     tokens_per_s = gen_len / (sum(total_times) / len(total_times))
 
     result = {
@@ -222,7 +228,8 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         log(f"config {i+1}/{len(configs)}: {label}")
 
         dtype_str = resolve_dtype(dev, cfg["dtype"])
-        torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+        torch_dtype = {"fp32": torch.float32, "fp16": torch.float16,
+                   "bf16": torch.bfloat16, "fp8": torch.bfloat16}[dtype_str]
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=torch_dtype, trust_remote_code=True
@@ -268,7 +275,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
         for _ in range(warmup):
-            input_ids = torch.randint(0, tokenizer.vocab_size,
+            input_ids = torch.randint(0, tokenizer.vocab_size or len(tokenizer) or 1,
                                       (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
             labels = input_ids.clone()
             attn = torch.ones_like(input_ids)
@@ -282,7 +289,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         start = time.perf_counter()
 
         for _ in range(steps):
-            input_ids = torch.randint(0, tokenizer.vocab_size,
+            input_ids = torch.randint(0, tokenizer.vocab_size or len(tokenizer) or 1,
                                       (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
             labels = input_ids.clone()
             attn = torch.ones_like(input_ids)
@@ -354,14 +361,14 @@ def main():
                     help="Compute backend to use (auto-detected if unset).")
     args = ap.parse_args()
 
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
+    from rocm_env import setup_rocm_env_from_args
 
     if args.gen:
         log(f"generation benchmark: prompt_len={args.gen_prompt_len}, "
             f"gen_len={args.gen_len}, warmup={args.warmup}, steps={args.steps}")
         result = run_gen_benchmark(args.model, args.gen_prompt_len, args.gen_len,
                                    args.warmup, args.steps,
-                                   args.gfx_override, hip_conf,
+                                   args.gfx_override, args.hip_alloc_conf,
                                    backend_name=args.backend)
         print("\n" + format_gen_table(result))
         return
@@ -373,7 +380,7 @@ def main():
     log(f"benchmarking {len(configs)} config(s): warmup={args.warmup}, steps={args.steps}")
 
     results = run_benchmark(args.model, configs, args.warmup, args.steps,
-                            args.gfx_override, hip_conf,
+                            args.gfx_override, args.hip_alloc_conf,
                             backend_name=args.backend)
 
     print("\n" + format_table(results))

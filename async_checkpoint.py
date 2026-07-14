@@ -204,6 +204,23 @@ class AsyncCheckpointer:
 
                 torch.save(opt_state_cpu, tmp_dir / "training_state.pt")
 
+                # Write sha256 checksums for corruption detection on resume
+                # (same as the sync path in train_cpt.atomic_save_checkpoint).
+                # Must run BEFORE the os.replace so the checksums.json is
+                # atomically visible with the shards.
+                try:
+                    from train_cpt import write_shard_checksums
+                    write_shard_checksums(tmp_dir, verbose=False)
+                except Exception as ckpt_err:
+                    # Log the error — silent swallowing violates the repo's
+                    # "no bare except: pass" convention. A missing checksums.json
+                    # weakens the corruption-detection guarantee on resume but
+                    # does not make the checkpoint unusable.
+                    print(f"[ckpt-async] WARNING: failed to write checksums.json "
+                          f"({ckpt_err}) — corruption detection disabled for "
+                          f"this checkpoint. Failure: {ckpt_err}",
+                          file=__import__('sys').stderr)
+
                 # Retain the previous checkpoint as .prev (a real backup, not
                 # deleted) so a crash mid-write or a corrupt new write can be
                 # rolled back. The recovery path in train_cpt.py restores .prev

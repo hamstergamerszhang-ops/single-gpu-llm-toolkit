@@ -96,6 +96,11 @@ def log(msg: str):
 DEFAULT_MTP_DEPTHS = 2
 DEFAULT_MTP_LOSS_WEIGHT = 0.3
 DEFAULT_MTP_PREFIX = "model.mtp_layers"
+# Historical default layer prefix (Gemma-4-family). When --model-family is
+# omitted AND auto-detection from config.json fails to resolve a family, this
+# default still applies (backward compat). When a family IS resolved (either
+# via --model-family or via auto-detect), its decoder_layers_path overrides
+# this default at the top of main() -- see the family-resolution block there.
 DEFAULT_LAYER_PREFIX = "model.language_model.layers"
 DEFAULT_MAX_SHARD_BYTES = 5 * 1024**3
 
@@ -206,9 +211,21 @@ def main():
     ap.add_argument("--mtp-prefix", type=str, default=DEFAULT_MTP_PREFIX,
                     help="Safetensors key prefix for MTP modules "
                          f"(default {DEFAULT_MTP_PREFIX!r}).")
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Override model-family auto-detection. One of: "
+                         "llama, gemma, phi3, falcon, mpt, gpt2, gpt_neox, "
+                         "gptj, bloom. When omitted, the family is auto-"
+                         "detected from config.json via models.registry and "
+                         "the family's decoder_layers_path is used as the "
+                         "--layer-prefix default. When provided, overrides "
+                         "auto-detection. Without either, the historical "
+                         "DEFAULT_LAYER_PREFIX applies (backward compat).")
     ap.add_argument("--layer-prefix", type=str, default=DEFAULT_LAYER_PREFIX,
                     help="Decoder-layer key prefix in the base checkpoint, same "
-                         "semantics as expand_model.py --layer-prefix.")
+                         "semantics as expand_model.py --layer-prefix. When "
+                         "--model-family is resolved (explicitly or via auto-"
+                         "detect) and this flag is left at its default, the "
+                         "family's decoder_layers_path overrides it.")
     ap.add_argument("--max-shard-bytes", type=int, default=DEFAULT_MAX_SHARD_BYTES)
     args = ap.parse_args()
 
@@ -227,6 +244,30 @@ def main():
     if "hidden_size" not in tc or "num_hidden_layers" not in tc:
         raise SystemExit("ERROR: config.json missing hidden_size / num_hidden_layers — "
                          "is this an expanded Gemma-family checkpoint?")
+
+    # Resolve the model family. When --model-family is passed EXPLICITLY,
+    # override the --layer-prefix default with the family's
+    # decoder_layers_path (so non-Gemma-4 checkpoints work without the user
+    # knowing the family's internal layer-path naming). When --model-family is
+    # NOT passed (auto-detect), the family is still resolved (so the resolved
+    # family is available for future use), but the layer PREFIX stays at its
+    # historical default -- backward compat. The prefix can't be safely
+    # auto-overridden because a checkpoint's real tensor-key prefix depends on
+    # how it was wrapped/exported (e.g. Gemma-4 multimodal uses
+    # model.language_model.layers, standard Llama uses model.layers), which
+    # the family's canonical decoder_layers_path can't tell apart without
+    # inspecting the actual keys.
+    family = None
+    try:
+        from models.registry import resolve_model_family
+        family = resolve_model_family(cfg, override=args.model_family)
+    except (ImportError, ValueError):
+        family = None
+    if family is not None and args.model_family is not None and \
+            args.layer_prefix == DEFAULT_LAYER_PREFIX:
+        args.layer_prefix = family.decoder_layers_path
+        log(f"  model family {family.name!r}: using decoder_layers_path as "
+            f"layer prefix: {args.layer_prefix!r}")
 
     hidden = tc["hidden_size"]
     num_layers = tc["num_hidden_layers"]

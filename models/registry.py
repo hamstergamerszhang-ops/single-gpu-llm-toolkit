@@ -273,7 +273,7 @@ def detect_model_family(config: dict, state_dict_keys: list[str] | None = None) 
     )
 
 
-def get_config_value(config: dict, family: ModelFamily, key_attr: str) -> any:
+def get_config_value(config: dict, family: ModelFamily, key_attr: str):
     """Read a config value, respecting `text_config` nesting if present."""
     cfg = _resolve_text_config(config)
     key = getattr(family, key_attr)

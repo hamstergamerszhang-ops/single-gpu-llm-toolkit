@@ -427,7 +427,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
       you have many small allocations, or higher if you train with very large
       contiguous buffers. Set unconditionally (before GPU detection) because
       the env var must be set before the allocator initializes and is harmless
-      on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF instead).
+      on non-ROCm hosts (CPU-only builds ignore it).
 
     Returns a dict describing what happened:
         {'action': 'override'|'no-override'|'force-override'|'skip',
@@ -440,7 +440,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
     # Set PYTORCH_HIP_ALLOC_CONF early (before torch import) so the allocator
     # picks it up at init time. Set unconditionally (not gated on GPU detection)
     # because the env var must be set before the allocator initializes and is
-    # harmless on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF).
+    # harmless on non-ROCm hosts (CPU-only builds ignore it).
     _set_hip_alloc_conf(hip_alloc_conf, verbose)
 
     if override is not None:
@@ -578,6 +578,18 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
               f"(closest same-family {_gfx_major(detected)} arch in the build). "
               f"This lets kernels launch on a card the wheel wasn't compiled for.")
     return info
+
+
+def setup_rocm_env_from_args(args, verbose=True):
+    """Convenience wrapper: call setup_rocm_env from an argparse Namespace
+    that has --gfx-override and --hip-alloc-conf attributes. Handles the
+    'none' -> None translation for hip_alloc_conf that every entry point
+    was copy-pasting. Returns the same info dict as setup_rocm_env."""
+    override = getattr(args, "gfx_override", None)
+    hip = getattr(args, "hip_alloc_conf", "expandable_segments:True")
+    if hip and hip.lower() == "none":
+        hip = None
+    return setup_rocm_env(override=override, hip_alloc_conf=hip, verbose=verbose)
 
 
 def _self_test():

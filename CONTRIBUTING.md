@@ -33,7 +33,9 @@ real bugs you hit running these on actual hardware.
            local_cache_stream.py optimizer_compat_guard.py \
            rocm_env.py mtp_head.py train_sft.py \
            preprocess_data.py benchmark.py generate.py \
-           compress_model.py tensor_parallel.py smart_hipify.py; do
+           compress_model.py tensor_parallel.py smart_hipify.py \
+           pretokenize.py serve.py rocprof_trace.py vram_log.py \
+           evaluate.py; do
     python3 "$f" --selftest || { echo "FAILED: $f"; exit 1; }
   done
   ```

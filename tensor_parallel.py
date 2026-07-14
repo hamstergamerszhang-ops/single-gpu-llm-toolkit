@@ -243,16 +243,12 @@ def report_vram_per_gpu(backend_name: str | None = None):
             f"alloc={alloc:.1f}GB  peak={peak:.1f}GB")
 
 
-def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
-                        prompt: str, max_new_tokens: int, temperature: float,
-                        top_p: float, gfx_override: str, hip_alloc_conf: str,
-                        device_map_mode: str, flash_attn: bool,
-                        backend_name: str | None = None):
-    """Run the model with pipeline parallelism across num_gpus GPUs.
-
-    device_map_mode: "explicit" (use build_explicit_device_map), "auto" (use
-    HF's device_map="auto"), or "single" (force single-GPU even if multiple
-    are detected)."""
+def _load_model(model_path: str, num_gpus: int, archs: list,
+                gfx_override: str, hip_alloc_conf: str,
+                device_map_mode: str, flash_attn: bool,
+                backend_name: str | None = None):
+    """Load the model once with pipeline parallelism across num_gpus GPUs.
+    Returns (model, tokenizer, first_device). Call once, reuse for all prompts."""
     from backends import autodetect_backend, get_backend, BackendDevice
     from runtime import resolve_dtype, resolve_flash_attn
 
@@ -305,7 +301,10 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
-        model.to(torch.device(backend.name, 0))
+        # ROCm PyTorch exposes through the "cuda" device namespace, not "rocm".
+        # backends/device.py:46 documents this mapping explicitly.
+        torch_dev = "cuda" if backend.name == "rocm" else backend.name
+        model.to(torch.device(torch_dev, 0))
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -319,18 +318,25 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
     report_vram_per_gpu(backend_name)
 
     # Determine the first device (where embed_tokens lives) for input placement.
-    first_device = torch.device(backend.name, 0)
+    # ROCm exposes through "cuda" namespace, not "rocm" (backends/device.py:46).
+    torch_dev = "cuda" if backend.name == "rocm" else backend.name
+    first_device = torch.device(torch_dev, 0)
     try:
         embed_device = model.get_input_embeddings().weight.device
         first_device = embed_device
     except Exception:
         pass
 
+    return model, tokenizer, first_device
+
+
+def _generate(model, tokenizer, first_device, prompt: str,
+              max_new_tokens: int, temperature: float, top_p: float):
+    """Generate for a single prompt using an already-loaded model."""
     from generate import stream_generate
     stream_generate(model, tokenizer, prompt, max_new_tokens,
                     temperature, top_p, repetition_penalty=1.0,
                     device=first_device)
-    return ""
 
 
 def main():
@@ -378,8 +384,8 @@ def main():
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+        from rocm_env import setup_rocm_env_from_args
+        setup_rocm_env_from_args(args)
 
     # Detect GPUs via the backend abstraction.
     num_gpus, archs = detect_gpu_count(backend_name=args.backend)
@@ -418,22 +424,25 @@ def main():
     if num_gpus == 0:
         raise SystemExit("ERROR: no GPUs detected. This tool needs at least 1 GPU.")
 
+    # Load the model ONCE, then generate for each prompt. Previously the model
+    # was reloaded per prompt in --input mode — a pure inefficiency that made
+    # multi-prompt runs N× slower (each load re-reads all shards from disk).
+    model, tokenizer, first_device = _load_model(
+        args.model, num_gpus, archs,
+        args.gfx_override, args.hip_alloc_conf,
+        args.device_map, args.flash_attn,
+        backend_name=args.backend)
+
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             prompts = [line.strip() for line in f if line.strip()]
         for p in prompts:
             log(f"prompt: {p[:80]}{'...' if len(p) > 80 else ''}")
-            run_tensor_parallel(args.model, num_gpus, archs, p,
-                               args.max_new_tokens, args.temperature, args.top_p,
-                               args.gfx_override, args.hip_alloc_conf,
-                               args.device_map, args.flash_attn,
-                               backend_name=args.backend)
+            _generate(model, tokenizer, first_device, p,
+                     args.max_new_tokens, args.temperature, args.top_p)
     else:
-        run_tensor_parallel(args.model, num_gpus, archs, args.prompt,
-                           args.max_new_tokens, args.temperature, args.top_p,
-                           args.gfx_override, args.hip_alloc_conf,
-                           args.device_map, args.flash_attn,
-                           backend_name=args.backend)
+        _generate(model, tokenizer, first_device, args.prompt,
+                 args.max_new_tokens, args.temperature, args.top_p)
 
 
 def _self_test():

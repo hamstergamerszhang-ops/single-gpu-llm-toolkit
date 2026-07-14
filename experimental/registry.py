@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from backends.base import ComputeBackend
 from backends.device import BackendDevice
-from distributed.base import DistributedStrategy
-from distributed.ddp import DDPStrategy
-from distributed.env import detect_process_group_env
-from distributed.fsdp import FSDPStrategy
-from distributed.single import SingleDeviceStrategy
+from experimental.base import DistributedStrategy
+from experimental.ddp import DDPStrategy
+from experimental.env import detect_process_group_env
+from experimental.fsdp import FSDPStrategy
+from experimental.single import SingleDeviceStrategy
 
 
 def create_strategy(

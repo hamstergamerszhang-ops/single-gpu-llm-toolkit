@@ -39,8 +39,8 @@ class BackendDevice:
         # was breaking every caller that touched .torch_device on the rocm
         # backend (evaluate.py, generate.py, compress_model.py, and
         # runtime/probe.py's probe_flash_attn/probe_compile) on exactly the
-        # hardware this toolkit targets. distributed/ddp.py and
-        # distributed/fsdp.py already do this same "rocm" -> "cuda" mapping
+        # hardware this toolkit targets. experimental/ddp.py and
+        # experimental/fsdp.py already do this same "rocm" -> "cuda" mapping
         # correctly when calling torch.cuda.set_device(); this makes the
         # device-string construction consistent with that.
         device_type = "cuda" if self.backend.name == "rocm" else self.backend.name
