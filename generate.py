@@ -24,7 +24,9 @@ def log(msg: str):
 
 def build_gen_kwargs(input_ids, attention_mask, max_new_tokens: int,
                      temperature: float, top_p: float, repetition_penalty: float,
-                     pad_token_id, eos_token_id, streamer, static_cache: bool = False):
+                     pad_token_id, eos_token_id, streamer,
+                     static_cache: bool = False,
+                     assistant_model=None):
     """Build the kwargs dict for model.generate()."""
     pad_id = pad_token_id if pad_token_id is not None else eos_token_id
     kwargs = dict(
@@ -46,12 +48,18 @@ def build_gen_kwargs(input_ids, attention_mask, max_new_tokens: int,
         # (mode="reduce-overhead") for HIP graph capture of the decode loop —
         # the standard 1.5-3x TPOT improvement on MI300X.
         kwargs["cache_implementation"] = "static"
+    if assistant_model is not None:
+        # Speculative decoding: the assistant model (MTP head) drafts tokens
+        # that the main model verifies in a single forward pass. 2-3x speedup
+        # on accept-rate-friendly workloads.
+        kwargs["assistant_model"] = assistant_model
     return kwargs
 
 
 def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     temperature: float, top_p: float, repetition_penalty: float,
-                    device, static_cache: bool = False):
+                    device, static_cache: bool = False,
+                    assistant_model=None):
     """Generate tokens one at a time, printing decoded text chunks as they're
     produced."""
     import queue
@@ -68,6 +76,7 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
         temperature, top_p, repetition_penalty,
         tokenizer.pad_token_id, tokenizer.eos_token_id, streamer,
         static_cache=static_cache,
+        assistant_model=assistant_model,
     )
 
     thread_exc = []
@@ -336,6 +345,29 @@ def main():
     if args.system_prompt:
         prefix = args.system_prompt + "\n\n"
 
+    # Static cache only works for single-prompt generation (batch=1, fixed
+    # shapes). Disable it in --input batch mode where prompt lengths vary.
+    use_static_cache = args.static_cache and not args.input
+    if args.static_cache and args.input:
+        log("WARNING: --static-cache disabled in --input mode (variable prompt "
+            "lengths require dynamic cache)")
+
+    # Speculative decoding: extract the MTP head as the assistant model.
+    # The MTP head predicts multiple future tokens; the main model verifies
+    # them in a single forward pass — 2-3x speedup on accept-friendly workloads.
+    # MTP layers are on model.model.mtp_layers (the inner Gemma4Model), not on
+    # the top-level CustomForCausalLM — see modeling_custom.py:268.
+    assistant_model = None
+    if args.speculative:
+        inner = getattr(model, "model", model)
+        mtp = getattr(inner, "mtp_layers", None)
+        if mtp is not None:
+            assistant_model = mtp
+            log("speculative decoding enabled (MTP head as assistant model)")
+        else:
+            log("WARNING: --speculative but model has no MTP head "
+                "(mtp_layers not found) — speculative decoding disabled")
+
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             prompts = [line.strip() for line in f if line.strip()]
@@ -351,7 +383,10 @@ def main():
         # call serving all prompts at once — N prompts in ~1/N the time of
         # sequential generation. The outputs are decoded per-sequence and
         # printed with separators. This is the standard batched-inference
-        # speedup (2-4x for multi-prompt --input).
+        # speedup (2-4x for multi-prompt --input). Speculative decoding
+        # (--speculative) is not combined with batching here — batch_generate
+        # is the throughput-focused path; use single-prompt/interactive mode
+        # for speculative decoding.
         full_prompts = [prefix + p for p in prompts]
         log(f"batched generation: {len(full_prompts)} prompts in one forward pass")
         batch_generate(model, tokenizer, full_prompts,
@@ -372,7 +407,8 @@ def main():
             try:
                 stream_generate(model, tokenizer, full_prompt, args.max_new_tokens,
                                 args.temperature, args.top_p, args.repetition_penalty,
-                                dev.torch_device, static_cache=args.static_cache)
+                                dev.torch_device, static_cache=use_static_cache,
+                                assistant_model=assistant_model)
             except KeyboardInterrupt:
                 print("\n[generate] interrupted, back to prompt.")
             print()
@@ -404,6 +440,7 @@ def _self_test():
     assert kwargs["do_sample"] is True
     assert kwargs["temperature"] == 0.8
     assert kwargs["pad_token_id"] == 2
+    assert "cache_implementation" not in kwargs  # static_cache defaults False
     print("  OK (build_gen_kwargs: sampling mode, None pad falls back to eos)")
 
     # static_cache=True adds cache_implementation="static" for pre-allocated
@@ -425,6 +462,17 @@ def _self_test():
     )
     assert "cache_implementation" not in kwargs
     print("  OK (build_gen_kwargs: default (no static_cache) omits cache_implementation)")
+
+    # assistant_model adds speculative decoding support.
+    fake_assistant = object()
+    kwargs = build_gen_kwargs(
+        input_ids="INPUTS", attention_mask="MASK", max_new_tokens=50,
+        temperature=0.8, top_p=0.9, repetition_penalty=1.1,
+        pad_token_id=0, eos_token_id=1, streamer=FakeStreamer(),
+        assistant_model=fake_assistant,
+    )
+    assert kwargs["assistant_model"] is fake_assistant
+    print("  OK (build_gen_kwargs: assistant_model passed through for speculative decoding)")
 
     system_prompt = "You are a helpful assistant."
     user_prompt = "What is ROCm?"

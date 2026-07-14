@@ -33,6 +33,9 @@ def main():
                          "alias for 'rocm' since ROCm reports through the cuda "
                          "namespace.")
     ap.add_argument("--backend", default=None, help="Backend override for environment setup.")
+    ap.add_argument("--gfx-override", type=str, default=None,
+                    help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True")
     ap.add_argument("--max-samples", type=int, default=None)
     # ROCm bootstrap flags, mirroring generate.py / train_cpt.py so consumer
     # AMD cards needing HSA_OVERRIDE_GFX_VERSION are auto-handled here too.
@@ -93,6 +96,10 @@ def main():
 
     import torch
 
+    # ROCm bootstrap (same as every other GPU tool).
+    from rocm_env import setup_rocm_env_from_args
+    setup_rocm_env_from_args(args)
+
     from backends import default_device
     from runtime import DTYPE_MAP, resolve_dtype
 
@@ -151,6 +158,8 @@ def main():
                       file=sys.stderr)
                 continue
             texts.append(obj["text"])
+    if not texts:
+        raise SystemExit("ERROR: no valid samples found in data file")
 
     total_loss = 0.0
     total_tokens = 0
@@ -189,7 +198,6 @@ def main():
                             labels=labels)
             loss = outputs.loss.item()
 
-            # Weight by number of non-ignored tokens.
             n_tokens = (labels != -100).sum().item()
             total_loss += loss * n_tokens
             total_tokens += n_tokens
@@ -202,6 +210,26 @@ def main():
 def _self_test():
     """Self-test: exercise argparse flag aliasing and DTYPE_MAP coverage (no GPU)."""
     print("[selftest] evaluate: flag aliasing + dtype coverage (no GPU required)")
+
+    # Test JSONL error handling: malformed lines are skipped, not fatal.
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write('{"text": "hello world"}\n')
+        f.write('{bad json\n')
+        f.write('{"text": "second valid"}\n')
+        fpath = f.name
+    _texts, _malformed = [], 0
+    with open(fpath) as f:
+        for line in f:
+            try:
+                _obj = json.loads(line)
+                _texts.append(_obj["text"])
+            except json.JSONDecodeError:
+                _malformed += 1
+    os.unlink(fpath)
+    assert len(_texts) == 2, f"expected 2 valid, got {len(_texts)}"
+    assert _malformed == 1, f"expected 1 malformed, got {_malformed}"
+    print("  OK (malformed JSONL skipped, valid rows kept)")
 
     # Flag aliasing: --batch-size and --batch must both set dest=batch_size;
     # --seq-length and --max-seq-len must both set dest=seq_length.
@@ -235,5 +263,15 @@ def _self_test():
     print("\n[selftest] All checks passed.")
 
 
+def main_cli():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    args, _ = ap.parse_known_args()
+    if args.selftest:
+        _self_test()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_cli()

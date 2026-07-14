@@ -82,6 +82,7 @@ py-modules = [
     "local_cache_stream", "optimizer_compat_guard", "preprocess_data",
     "smart_hipify", "prune_vocab", "prune_embeddings_torch",
     "export_gguf", "export_onnx", "export_safetensors",
+    "pretokenize", "serve", "rocprof_trace", "vram_log", "tokenization",
 ]
 
 [tool.pytest.ini_options]

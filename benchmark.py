@@ -157,7 +157,12 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     peak_vram = dev.max_memory_allocated() / 1024**3
     avg_ttft = sum(first_token_times) / len(first_token_times) * 1000
     avg_total = sum(total_times) / len(total_times) * 1000
-    avg_tpot = ((avg_total - avg_ttft) / max(gen_len - 1, 1))
+    # TPOT needs at least 2 generated tokens (1 for TTFT, >=1 for decode).
+    # With gen_len < 2, TPOT is meaningless — report 0.
+    if gen_len >= 2:
+        avg_tpot = (avg_total - avg_ttft) / (gen_len - 1)
+    else:
+        avg_tpot = 0.0
     tokens_per_s = gen_len / (sum(total_times) / len(total_times))
 
     result = {

@@ -62,6 +62,11 @@ HISTORY_KEEP=4
 LOSS_REGRESSION_FACTOR=1.5
 MAX_SAME_POSITION_RETRIES=8
 RETRY_SLEEP_SECS=10
+# Multi-GPU support: set LAUNCHER="torchrun --nproc_per_node=8" and
+# DISTRIBUTED="--fsdp" (or "--ddp") in config.env for multi-GPU training.
+LAUNCHER="python3"
+DISTRIBUTED=""
+NPROC=""
 
 CONFIG_FILE="${1:-config.env}"
 if [ -f "$CONFIG_FILE" ]; then
@@ -172,7 +177,11 @@ while true; do
     else
         CPT_FLAG=(--cpt)
     fi
-    python3 "$SCRIPT" \
+    # Multi-GPU: LAUNCHER defaults to "python3". For --ddp/--fsdp, set
+    # LAUNCHER="torchrun --nproc_per_node=8" and DISTRIBUTED="--fsdp" (or
+    # "--ddp") in config.env. torchrun forwards signals to all ranks, so
+    # the supervisor's crash-restart safety net covers multi-GPU runs.
+    $LAUNCHER "$SCRIPT" \
         --model "$MODEL" \
         --save "$SAVE" \
         "${data_args[@]}" \
@@ -184,6 +193,7 @@ while true; do
         --max-seq-len "$MAX_SEQ_LEN" \
         --checkpoint-every "$CHECKPOINT_EVERY" \
         --async-checkpoint \
+        $DISTRIBUTED \
         > "$log_file" 2>&1
     exit_code=$?
 
