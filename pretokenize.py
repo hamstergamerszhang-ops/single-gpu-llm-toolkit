@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Offline pre-tokenizer: turns JSONL training data into pre-tokenized .pt
-shards so train_cpt.py can skip per-step tokenization entirely.
+shards for downstream consumption.
 
 WHY THIS EXISTS
 ---------------
-In train_cpt.py the data path calls build_cpt_example / build_sft_example on
-every row inside the training loop (or just before it), which means the HF
-tokenizer's Python/Regex frontend runs once per example per epoch. On a
-single-GPU ROCm box that GPU is almost always the bottleneck of the FORWARD
-and BACKWARD passes, but the tokenizer runs on the CPU and serially blocks
-the next batch from being prepared. On long CPT runs (millions of rows) the
-tokenizer's wall-clock is a real fraction of total step time, and it is pure
-waste on epoch 2+ because the token ids never change. Pre-tokenizing once,
-into sharded .pt files of ready-to-stack `input_ids` / `labels` tensors, lets
-the trainer mmap a shard, index a row, and call .to(device) — no tokenizer in
-the hot path at all. This is the single biggest throughput win available on a
-single-GPU box that can't overlap a DataLoader worker pool against the GPU
-without eating VRAM/CPU the trainer also wants.
+In train_cpt.py the data path pre-tokenizes all rows at startup (in-memory),
+which eliminates the O(n_turns^2) SFT template cost per step. This tool
+produces on-disk .pt shards for cases where you want to:
+  - Tokenize on a different machine (CPU box) and copy the shards to the GPU box
+  - Reuse the same tokenized data across multiple training runs
+  - Avoid the startup tokenization cost on very large datasets
+
+train_cpt.py currently does in-memory pre-tokenization at startup and does
+NOT yet have a --pretokenized-dir flag to consume these .pt shards directly.
+The shards are produced in a standard format (list of {input_ids, labels}
+tensors per row) and can be loaded by a custom training loop or a future
+--pretokenized-dir consumer.
 
 WHAT IT PRODUCES
 ----------------
@@ -38,14 +37,10 @@ been truncated shorter than the trainer expects; rows are never longer than
 
 MASKING (SFT mode)
 ------------------
-For {"messages":[...]} rows, assistant-turn-only labels are produced using the
-EXACT same chat-template masking logic as train_cpt.py's build_sft_example:
-incremental apply_chat_template per turn, diff against the running prefix,
-label only assistant spans, -100 on everything else. The two functions below
-(build_sft_example / build_cpt_example) are a VERBATIM copy of the ones in
-train_cpt.py — they MUST be kept in sync if the masking there ever changes.
-See build_sft_example's docstring for the appenditive-template assumption and
-its non-appenditive fallback (both carried over unchanged).
+For {"messages":[...]} rows, assistant-turn-only labels are produced using
+the EXACT same chat-template masking logic as train_cpt.py's
+build_sft_example, imported from the shared tokenization.py module (single
+source of truth — no duplicated code that can diverge).
 
 HONEST CAVEATS
 --------------

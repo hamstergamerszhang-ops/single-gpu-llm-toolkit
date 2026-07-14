@@ -99,31 +99,47 @@ def main():
 
 
 def _self_test():
-    """Self-test: flag aliasing + DTYPE_MAP coverage (no GPU required)."""
-    print("[selftest] export_onnx: flag aliasing + dtype coverage (no GPU required)")
+    print("[selftest] export_onnx: flag aliasing + dtype map (no GPU required)")
 
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--src", required=True)
-    ap.add_argument("--dst", required=True)
-    ap.add_argument("--seq-length", type=int, default=128)
-    ap.add_argument("--batch-size", type=int, default=1)
+    # Test flag aliasing: --batch/--batch-size and --max-seq-len/--seq-length
+    # write to the SAME dest names main() actually reads (args.batch,
+    # args.max_seq_len) -- regression test for the dest-name drift documented
+    # in main()'s argparse block above.
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-seq-len", "--seq-length", type=int, default=128,
+                    dest="max_seq_len")
+    ap.add_argument("--batch", "--batch-size", type=int, default=1, dest="batch")
     ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="fp32")
-    ap.add_argument("--selftest", action="store_true", default=False)
 
-    a = ap.parse_args(["--src", "/m", "--dst", "/o.onnx", "--dtype", "fp8"])
-    assert a.dtype == "fp8"
-    assert a.seq_length == 128
-    assert a.batch_size == 1
-    print("  OK (flags parsed, fp8 dtype accepted)")
+    args1 = ap.parse_args(["--batch-size", "4", "--seq-length", "256"])
+    assert args1.batch == 4, f"--batch-size should set batch=4, got {args1.batch}"
+    assert args1.max_seq_len == 256, f"--seq-length should set max_seq_len=256, got {args1.max_seq_len}"
+    print("  OK (flag aliases --batch-size and --seq-length work)")
 
+    args2 = ap.parse_args(["--dtype", "fp8"])
+    assert args2.dtype == "fp8"
+    print("  OK (fp8 dtype accepted)")
+
+    # DTYPE_MAP is what main() actually uses to resolve --dtype to a torch
+    # dtype (torch_dtype = DTYPE_MAP[args.dtype]).
     from runtime import DTYPE_MAP
     import torch
     assert DTYPE_MAP["fp8"] is torch.bfloat16
     assert DTYPE_MAP["fp32"] is torch.float32
     print("  OK (DTYPE_MAP covers fp8 -> bf16 for export load)")
 
-    print("\n[selftest] All checks passed.")
+    print("\n[selftest] All checks passed (no GPU required).")
+
+
+def main_cli():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    args, _ = ap.parse_known_args()
+    if args.selftest:
+        _self_test()
+    else:
+        main()
 
 
 if __name__ == "__main__":
-    main()
+    main_cli()

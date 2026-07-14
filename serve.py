@@ -577,7 +577,7 @@ def load_model_and_tokenizer(args, dev):
 
 
 def _check_serve_deps():
-    """Raise SystemExit with install instructions if fastapi/uvicorn missing."""
+    """Raise SystemExit with install instructions if fastapi/uvicorn/pydantic missing."""
     missing = []
     try:
         import fastapi  # noqa: F401
@@ -587,6 +587,10 @@ def _check_serve_deps():
         import uvicorn  # noqa: F401
     except ImportError:
         missing.append("uvicorn")
+    try:
+        import pydantic  # noqa: F401
+    except ImportError:
+        missing.append("pydantic")
     if missing:
         raise SystemExit(
             "ERROR: serving requires packages that are not installed: "
