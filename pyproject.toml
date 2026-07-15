@@ -69,8 +69,8 @@ Repository = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit"
 Issues = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit/issues"
 
 [tool.setuptools]
-# The toolkit is a flat collection of CLI scripts + 5 subpackages. We package
-# the subpackages (backends, runtime, config, distributed, models) so they're
+# The toolkit is a flat collection of CLI scripts + 4 subpackages. We package
+# the subpackages (backends, runtime, config, models) so they're
 # importable after `pip install -e .`; the top-level *.py scripts stay as
 # directly-invoked entrypoints (not installed as console_scripts, because the
 # repo's convention is `python3 train_cpt.py ...`).

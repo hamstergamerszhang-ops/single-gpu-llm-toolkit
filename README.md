@@ -382,17 +382,21 @@ not fresh init) + a final RMSNorm. The weights are written as a safetensors
 shard and merged into the checkpoint's index, and `config.json` is updated
 with `mtp_depths` / `mtp_loss_weight` / `auto_map`.
 
-**Modeling code:** `modeling_custom.py` (repo root) is a stub `CustomForCausalLM`
-that loads these weights with zero missing/unexpected keys and runs a
-structurally-correct forward pass — it does NOT implement the real MTP
-training loss (target shifting, weighted loss sum); see that file's own
-docstring for exactly what it does and doesn't do. Copy it alongside the
-checkpoint mtp_head.py writes (config.json's `auto_map` already points at it)
-and extend `forward` for your real train/inference path. It consumes the keys
-`mtp_head.py` documents: `model.mtp_layers.{i}.enorm.weight`, `.eh_proj.weight`,
+**Modeling code:** `modeling_custom.py` (repo root) implements a complete
+`CustomForCausalLM` that loads these weights with zero missing/unexpected keys
+and runs the real MTP training loss: target shifting (each depth predicts
+`input_ids` shifted by `depth+1`), weighted loss sum
+(`base_loss + mtp_loss_weight * sum(per_depth_loss)`), and exposes
+`mtp_logits`/`mtp_hidden_states` for inference. The MTP loss helpers
+(`_shift_labels`, `_compute_mtp_total_loss`) are self-contained in the file
+(so it works when copied alongside a checkpoint outside the repo root).
+Copy it alongside the checkpoint `mtp_head.py` writes (config.json's
+`auto_map` already points at it). It consumes the keys `mtp_head.py`
+documents: `model.mtp_layers.{i}.enorm.weight`, `.eh_proj.weight`,
 `.block.<suffix>`, `.lnorm.weight`, `model.mtp_layers.norm.weight` (the shared
 final norm — note the key lives under `mtp_layers`, not a separate `mtp`
-prefix).
+prefix). The base class is resolved at import time, trying `Gemma4ForCausalLM`
+first (this repo's target), then Gemma3, Gemma2, Qwen2, Phi3, Llama.
 
 ```
 python3 mtp_head.py --src <expanded_checkpoint> --dst <mtp_checkpoint>
