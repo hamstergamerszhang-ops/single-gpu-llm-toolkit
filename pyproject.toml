@@ -23,6 +23,28 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "ruff>=0.4.0"]
+train = [
+    "bitsandbytes>=0.43.0",
+    "tensorboard>=2.14.0",
+    "torchao>=0.5.0",
+]
+serve = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pydantic>=2.0.0",
+]
+infer = [
+    "torchao>=0.5.0",
+]
+all = [
+    "bitsandbytes>=0.43.0",
+    "tensorboard>=2.14.0",
+    "torchao>=0.5.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pydantic>=2.0.0",
+]
+# Backward compat alias
 opt = [
     "bitsandbytes>=0.43.0",
     "tensorboard>=2.14.0",

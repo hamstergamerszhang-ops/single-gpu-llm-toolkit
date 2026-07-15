@@ -16,17 +16,11 @@
 # dataloader/multiprocessing uses /dev/shm; the default 64MB is too small for
 # training and causes "Bus error" crashes on large batches.
 
-# Base image: use the maintainer's "latest" ROCm/PyTorch tag rather than a
-# hand-pinned one. A previous pass in this repo's history pinned
-# "rocm6.2_ubuntu22.04_py3.10_pytorch_2.4" here -- that tag does not exist on
-# Docker Hub (verified directly against the real rocm/pytorch tag list while
-# reviewing this file; the real tags follow a "rocm6.2.x_ubuntuYY.MM_pyZ.W_
-# pytorch_release_A.B.C" pattern, not this one), so that FROM line would have
-# failed the build outright with "manifest not found". If you want a
-# reproducible pin, pick an ACTUAL tag from
-# https://hub.docker.com/r/rocm/pytorch/tags and verify it builds before
-# committing to it -- don't hand-write a plausible-looking one.
-FROM rocm/pytorch:latest
+# Base image: pinned to a specific ROCm/PyTorch tag for reproducibility.
+# :latest drifts and can break the hard transformers==5.7.0 pin.
+# To update: browse https://hub.docker.com/r/rocm/pytorch/tags, pick a tag
+# that matches your ROCm version, and verify the build before committing.
+FROM rocm/pytorch:rocm6.3.4-ubuntu22.04-py3.11-pytorch-stage
 
 # Pin the deps this repo's scripts import. torch + ROCm come from the base
 # image; install the rest explicitly. transformers is pinned to the version

@@ -139,10 +139,22 @@ def _load_model_and_tokenizer(args, dev):
             log(f"WARNING: fp8 inference failed ({e}) — using bf16")
 
     # torch.compile, probed on the target device.
+    # --cuda-graph implies --compile with mode="reduce-overhead" (which enables
+    # HIP/CUDA graph replay) unless the user already set --compile with a
+    # different mode.
+    cuda_graph = getattr(args, "cuda_graph", False)
+    if cuda_graph and not args.compile:
+        args.compile = True
+        args.compile_mode = "reduce-overhead"
+        log("--cuda-graph: auto-enabling --compile --compile-mode reduce-overhead "
+            "(HIP graph capture for decode)")
     if resolve_compile(dev, args.compile, mode=args.compile_mode):
         try:
             model = torch.compile(model, mode=args.compile_mode)
             log(f"torch.compile enabled (mode={args.compile_mode})")
+            if cuda_graph or args.compile_mode == "reduce-overhead":
+                log("HIP/CUDA graph capture enabled — first few decode steps will "
+                    "be slower (graph capture), then faster (graph replay)")
         except Exception as e:
             log(f"WARNING: compile failed ({e}), using eager")
 
@@ -178,11 +190,20 @@ def main():
     ap.add_argument("--compile-mode", type=str, default="max-autotune",
                     choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--static-cache", action="store_true", default=False,
-                    help="Use a static KV cache for decode. Enables CUDA graph "
-                         "capture of the decode step (1.5-3x TPOT improvement on "
-                         "MI300X). Requires fixed batch=1 and known max sequence "
-                         "length — only for single-prompt generation (not --input "
-                         "batch mode). Falls back to dynamic cache if unsupported.")
+                    help="Use a static KV cache for decode. Combined with "
+                         "--cuda-graph, enables HIP graph capture of the decode "
+                         "step (1.5-3x TPOT improvement on MI300X). Requires "
+                         "fixed batch=1 and known max sequence length — only for "
+                         "single-prompt generation (not --input batch mode). "
+                         "Falls back to dynamic cache if unsupported.")
+    ap.add_argument("--cuda-graph", action="store_true", default=False,
+                    help="Capture the decode step as a HIP/CUDA graph for "
+                         "minimal kernel-launch overhead. Requires --static-cache "
+                         "(the cache must be pre-allocated for graph capture). "
+                         "Internally uses torch.compile(mode='reduce-overhead') "
+                         "which enables graph replay. 1.5-3x decode speedup on "
+                         "MI300X. No-op if --compile is already set with "
+                         "--compile-mode reduce-overhead.")
     ap.add_argument("--speculative", action="store_true", default=False,
                     help="Enable speculative decoding using the model's MTP head "
                          "(if present) as the assistant/draft model. The MTP "
