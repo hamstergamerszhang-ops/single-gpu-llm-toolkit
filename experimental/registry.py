@@ -6,7 +6,7 @@ make sense given the detected world size.
 
 NOT CURRENTLY WIRED IN: `train_cpt.py` (the real training entrypoint) does not
 call `create_strategy` -- it has its own inline DDP/FSDP wrapping. See the
-`distributed/__init__.py` module docstring for the full status note and what
+`experimental/__init__.py` module docstring for the full status note and what
 wiring this in would require.
 """
 

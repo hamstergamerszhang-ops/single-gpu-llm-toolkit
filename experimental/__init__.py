@@ -1,7 +1,7 @@
 """Distributed training strategies.
 
 Public API:
-    from distributed import create_strategy, DistributedStrategy
+    from experimental import create_strategy, DistributedStrategy
 
 STATUS (2026-07, verified during code review): this package is NOT wired into
 the actual training entrypoint. `train_cpt.py` -- the real training script --

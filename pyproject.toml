@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gemma-persona-rocm"
@@ -30,7 +30,7 @@ opt = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/mymaccrashed12times/gemma_persona"
+"Homepage" = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit"
 
 [tool.setuptools]
 py-modules = [
