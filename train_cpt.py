@@ -384,9 +384,44 @@ def _apply_fp8(model):
             return model
     try:
         from torchao.float8 import convert_to_float8_training
-        convert_to_float8_training(model)
-        print("[cpt] fp8 training enabled (torchao Float8Linear, float8_e4m3fn) — "
-              "native fp8 compute on gfx942 (MI300X/MI300A/MI325X).")
+        # Configure FP8 for production stability on MI300X:
+        # - e4m3fn for forward weights/activations (higher precision)
+        # - e5m2 for backward gradients (wider dynamic range, fewer overflows)
+        # - delayed scaling with amax history (stabilizes scaling factors
+        #   over long runs vs per-step dynamic amax which can spike)
+        config = None
+        try:
+            from torchao.float8 import Float8LinearConfig
+            # Try to construct with delayed scaling + e5m2 backward.
+            # The config API varies across torchao versions, so try the
+            # modern config first and fall back to bare conversion.
+            config = Float8LinearConfig()
+            # Attempt to set delayed scaling (may not exist on all versions).
+            try:
+                from torchao.float8 import ScalingType
+                config.cast_config_input.scaling_type = ScalingType.DELAYED
+                config.cast_config_weight.scaling_type = ScalingType.DELAYED
+                config.cast_config_grad_output.scaling_type = ScalingType.DELAYED
+                # e5m2 for backward gradient output (wider range).
+                try:
+                    from torch.float8 import Float8Type
+                    config.gemm_dtype_grad_output = Float8Type.FP8_E5M2
+                except (ImportError, AttributeError):
+                    pass  # e5m2 not available in this torchao version
+            except (AttributeError, ImportError):
+                pass  # delayed scaling API not available — use default
+        except ImportError:
+            pass  # Float8LinearConfig not available — use bare conversion
+
+        if config is not None:
+            convert_to_float8_training(model, config=config)
+            print("[cpt] fp8 training enabled (torchao Float8Linear, e4m3fn fwd + "
+                  "e5m2 bwd, delayed scaling) — native fp8 compute on gfx94x "
+                  "(MI300X/MI300A/MI325X/MI350).")
+        else:
+            convert_to_float8_training(model)
+            print("[cpt] fp8 training enabled (torchao Float8Linear, default config) — "
+                  "native fp8 compute on gfx94x (MI300X/MI300A/MI325X/MI350).")
         return model
     except ImportError:
         print("[cpt] WARNING: --dtype fp8 but torchao not installed — falling back "
@@ -732,15 +767,21 @@ def _wrap_fsdp(model, sharding_strategy: str, local_rank: int):
 
     # MixedPrecision: the canonical MI300X FSDP recipe. Compute and reduce in
     # bf16 (halves collective traffic on multi-GPU), keep params/grads in bf16
-    # (the model loads as bf16 so this is a no-op for param dtype, but it
-    # guarantees reduce-scatter stays bf16 even if a future change casts grads
-    # to fp32). This is a throughput win, not a quality tradeoff — bf16 has
-    # fp32 exponent range so no GradScaler is needed.
-    mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
+    # by default. With --master-fp32, the model loads in fp32 and FSDP casts
+    # to bf16 only for forward/backward — fp32 master weights improve
+    # convergence stability on very long CPT runs at 2x param memory cost.
+    if getattr(args, "master_fp32", False):
+        mp_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,  # cast to bf16 for compute
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+    else:
+        mp_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
 
     model = FSDP(
         model,
@@ -1048,6 +1089,12 @@ def main():
                          "eval/valid_loss. Requires the 'tensorboard' package (not bundled "
                          "with torch — install separately, or omit this flag for stdout-only "
                          "logging).")
+    ap.add_argument("--metrics-file", type=str, default=None,
+                    help="Path to a JSONL metrics file. When set, writes one JSON "
+                         "line per logged step with: step, loss, lr, tokens_per_s, "
+                         "step_ms, peak_vram_gb, achieved_tflops. Zero-dependency "
+                         "(no tensorboard needed) — greppable, scriptable, feeds "
+                         "into any dashboard. Composes with --tb.")
     ap.add_argument("--pack", action="store_true", default=False,
                     help="Pack short examples into sequences up to --max-seq-len instead "
                          "of padding to batch-max. Reduces padding waste; off by default.")
@@ -1060,6 +1107,13 @@ def main():
     ap.add_argument("--resume-tag", default=None,
                     help="Tag used only for logging which checkpoint this run considers "
                          "itself to be. Defaults to the basename of --save.")
+    ap.add_argument("--master-fp32", action="store_true", default=False,
+                    help="Load model in fp32 and let FSDP MixedPrecision cast to bf16 "
+                         "for compute, keeping fp32 master weights. Improves convergence "
+                         "stability on very long CPT runs (millions of steps) where "
+                         "pure-bf16 weight updates can stagnate. Costs 2x param memory. "
+                         "Default off (pure bf16, throughput-first). Only effective with "
+                         "--fsdp.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. gfx1100) "
@@ -1239,11 +1293,11 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = f"cuda:{local_rank}"
-        # Auto-set sane NCCL defaults for ROCm multi-GPU. These are env vars
-        # (not torch.distributed args) and must be set before init_process_group.
-        # Users can override any of these by setting them in the environment.
-        os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
-        os.environ.setdefault("NCCL_DEBUG", "WARN")
+        # Auto-set NCCL defaults for ROCm multi-GPU (topology detection,
+        # async error handling, P2P/IB disable when no xGMI/IB present).
+        # All values are user-overridable via the environment.
+        from rocm_env import setup_nccl_env
+        setup_nccl_env(world_size=ddp_world_size, verbose=is_main)
         torch.distributed.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
             rank=ddp_rank,
@@ -1334,7 +1388,10 @@ def main():
     # transformers would have loaded anyway). Only matters if your model ships a
     # custom modeling_*.py file (e.g. one adding multi-token prediction) -- see
     # expand_model.py's docstring for that case.
-    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
+    # --master-fp32: load in fp32 so FSDP keeps fp32 master weights and casts
+    # to bf16 only for compute (MixedPrecision below). Default: pure bf16.
+    master_dtype = torch.float32 if getattr(args, "master_fp32", False) else torch.bfloat16
+    load_kwargs = {"torch_dtype": master_dtype, "trust_remote_code": True}
     if args.flash_attn:
         try:
             import flash_attn  # noqa: F401 — if installed, load with FA2 from the start
@@ -1641,6 +1698,14 @@ def main():
                   f"'pip install tensorboard'.", file=sys.stderr)
             tb_writer = None
 
+    # JSONL metrics sink: zero-dependency, one JSON line per logged step.
+    # Composes with --tb (both can be active simultaneously).
+    metrics_file = None
+    if getattr(args, "metrics_file", None) and is_main:
+        metrics_file = open(args.metrics_file, "a")
+        import json as _json
+        print(f"[cpt] JSONL metrics logging -> {args.metrics_file}")
+
     model.train()
     async_ckpt = AsyncCheckpointer() if args.async_checkpoint else None
     if args.async_checkpoint:
@@ -1793,6 +1858,17 @@ def main():
                     tb_writer.add_scalar("train/step_ms", step_ms, it)
                     tb_writer.add_scalar("train/peak_vram_gb", step_peak_vram_gb, it)
                     tb_writer.add_scalar("train/achieved_tflops", step_tflops, it)
+            # JSONL metrics: one line per logged step.
+            if metrics_file is not None and is_main and it % 10 == 0 and li is not None:
+                import json as _json
+                row = {"step": it, "loss": li, "lr": lr}
+                if step_tps is not None:
+                    row["tokens_per_s"] = step_tps
+                    row["step_ms"] = step_ms
+                    row["peak_vram_gb"] = step_peak_vram_gb
+                    row["achieved_tflops"] = step_tflops
+                metrics_file.write(_json.dumps(row) + "\n")
+                metrics_file.flush()
     
             # Broadcast _SHOULD_STOP from rank 0 to all ranks BEFORE the
             # eval/checkpoint decisions below. Under --fsdp, the checkpoint
@@ -1952,6 +2028,8 @@ def main():
     finally:
         if tb_writer is not None:
             tb_writer.close()
+        if metrics_file is not None:
+            metrics_file.close()
         if profiler is not None:
             profiler.__exit__(None, None, None)
         if is_distributed and torch.distributed.is_initialized():

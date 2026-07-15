@@ -21,12 +21,18 @@ def main():
                     help="Batch size (alias: --batch-size).")
     ap.add_argument("--max-seq-len", "--seq-length", type=int, default=2048,
                     dest="max_seq_len", help="Max sequence length (alias: --seq-length).")
-    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="bf16")
+    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="bf16")
     ap.add_argument("--device", default=None, help="Backend override (rocm, cpu).")
     ap.add_argument("--backend", default=None, help="Backend override for environment setup.")
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
     ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True")
+    ap.add_argument("--flash-attn", action="store_true", default=False,
+                    help="Use Flash Attention 2 for the eval forward pass. Matches "
+                         "the training/inference config so eval numbers are comparable.")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="torch.compile the model for the eval forward pass. "
+                         "First batch is slower (compilation); subsequent batches faster.")
     ap.add_argument("--max-samples", type=int, default=None)
     args = ap.parse_args()
 
@@ -48,15 +54,32 @@ def main():
     dev = default_device(prefer=args.backend or args.device)
     dtype_str = resolve_dtype(dev, args.dtype)
     torch_dtype = {"fp32": torch.float32, "fp16": torch.float16,
-                   "bf16": torch.bfloat16}[dtype_str]
+                   "bf16": torch.bfloat16, "fp8": torch.bfloat16}[dtype_str]
+
+    load_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
+    if args.flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            print("[evaluate] flash attention 2 enabled at load")
+        except ImportError:
+            print("[evaluate] WARNING: --flash-attn but flash-attn not installed")
 
     print(f"[evaluate] loading model from {args.model} ...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        **load_kwargs,
         trust_remote_code=True,
     ).to(dev.torch_device)
     model.eval()
+
+    # Optional torch.compile for the eval forward pass.
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            print("[evaluate] torch.compile enabled")
+        except Exception as e:
+            print(f"[evaluate] WARNING: compile failed ({e}), using eager")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
