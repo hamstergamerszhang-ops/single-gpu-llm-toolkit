@@ -35,7 +35,7 @@ real bugs you hit running these on actual hardware.
            preprocess_data.py benchmark.py generate.py \
            compress_model.py tensor_parallel.py smart_hipify.py \
            pretokenize.py serve.py rocprof_trace.py vram_log.py \
-           evaluate.py; do
+           evaluate.py export_gguf.py export_onnx.py; do
     python3 "$f" --selftest || { echo "FAILED: $f"; exit 1; }
   done
   ```
