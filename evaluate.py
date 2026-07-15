@@ -20,9 +20,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", help="Checkpoint directory.")
     ap.add_argument("--data", help="Input JSONL file.")
-    # --batch-size / --seq-length are kept as the flag names (matching the
-    # other eval/export tools); dest is set explicitly so they can be
-    # overridden by a recipe/preset whose keys use train_cpt's dest names.
+    # dest is batch_size/seq_length (not train_cpt.py's batch/max_seq_len) --
+    # this file's own batching loop below reads args.batch_size/args.seq_length,
+    # so the dest names have to match that, not the other tools' convention.
+    # --batch and --max-seq-len are accepted as aliases either way.
     ap.add_argument("--batch-size", "--batch", type=int, default=1,
                     dest="batch_size")
     ap.add_argument("--seq-length", "--max-seq-len", type=int, default=2048,
@@ -33,9 +34,12 @@ def main():
                          "alias for 'rocm' since ROCm reports through the cuda "
                          "namespace.")
     ap.add_argument("--backend", default=None, help="Backend override for environment setup.")
-    ap.add_argument("--gfx-override", type=str, default=None,
-                    help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True")
+    ap.add_argument("--flash-attn", action="store_true", default=False,
+                    help="Use Flash Attention 2 for the eval forward pass. Matches "
+                         "the training/inference config so eval numbers are comparable.")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="torch.compile the model for the eval forward pass. "
+                         "First batch is slower (compilation); subsequent batches faster.")
     ap.add_argument("--max-samples", type=int, default=None)
     # ROCm bootstrap flags, mirroring generate.py / train_cpt.py so consumer
     # AMD cards needing HSA_OVERRIDE_GFX_VERSION are auto-handled here too.
@@ -91,14 +95,10 @@ def main():
     from backends import get_backend
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
-        from rocm_env import setup_rocm_env
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
+        from rocm_env import setup_rocm_env_from_args
+        setup_rocm_env_from_args(args)
 
     import torch
-
-    # ROCm bootstrap (same as every other GPU tool).
-    from rocm_env import setup_rocm_env_from_args
-    setup_rocm_env_from_args(args)
 
     from backends import default_device
     from runtime import DTYPE_MAP, resolve_dtype
@@ -113,10 +113,23 @@ def main():
     dtype_str = resolve_dtype(dev, args.dtype)
     torch_dtype = DTYPE_MAP[dtype_str]
 
+    # trust_remote_code is passed explicitly at the from_pretrained call below
+    # (matching the tokenizer load), so it's deliberately left out of
+    # load_kwargs -- putting it in both places raises "got multiple values
+    # for keyword argument 'trust_remote_code'".
+    load_kwargs = {"torch_dtype": torch_dtype}
+    if args.flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            print("[evaluate] flash attention 2 enabled at load")
+        except ImportError:
+            print("[evaluate] WARNING: --flash-attn but flash-attn not installed")
+
     print(f"[evaluate] loading model from {args.model} (dtype={dtype_str}) ...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        **load_kwargs,
         trust_remote_code=True,
     ).to(dev.torch_device)
     model.eval()
@@ -138,6 +151,15 @@ def main():
             print("[evaluate] WARNING: torchao not installed, using bf16")
         except Exception as e:
             print(f"[evaluate] WARNING: fp8 inference failed ({e}) — using bf16")
+
+    # Optional torch.compile for the eval forward pass. Runs after fp8
+    # quantization so the compiled graph captures the quantized ops.
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            print("[evaluate] torch.compile enabled")
+        except Exception as e:
+            print(f"[evaluate] WARNING: compile failed ({e}), using eager")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:

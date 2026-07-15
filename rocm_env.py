@@ -612,35 +612,6 @@ def setup_rocm_env_from_args(args, verbose=True):
                           verbose=verbose)
 
 
-def setup_nccl_env(world_size: int, verbose=True):
-    """Set sensible NCCL defaults for multi-GPU ROCm runs.
-
-    Only applies when world_size > 1. These are env-var defaults (setdefault,
-    so user-set values always win). The README documents these but they were
-    never auto-applied -- this fixes that.
-
-    - NCCL_ASYNC_ERROR_HANDLING=1: makes NCCL errors surface as async signals
-      instead of hanging the process group (the default on some ROCm builds
-      is 0, which means a dead GPU hangs the whole training run silently).
-    - NCCL_DEBUG=WARN: enough diagnostics to debug a topology/p2p issue without
-      the full NCCL_DEBUG=INFO firehose.
-    - NCCL_SOCKET_IFNAME: best-effort; tries common ib/eth interfaces. User
-      override wins.
-    """
-    if world_size <= 1:
-        return
-    import os
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("NCCL_DEBUG", "WARN")
-    # Best-effort interface hint. rocm-smi --showtopo would tell us if P2P/IB
-    # is available, but we can't run it here (this runs before torch import in
-    # some paths). Leave it to the user or the topology-aware caller.
-    os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker0")
-    if verbose:
-        print(f"[rocm_env] NCCL defaults set for world_size={world_size} "
-              f"(NCCL_ASYNC_ERROR_HANDLING=1, NCCL_DEBUG=WARN)")
-
-
 def setup_miopen_cache(verbose=True):
     """Enable MIOpen find-cache persistence so the first-step kernel autotune
     stall only happens once (not every cold run).
@@ -662,6 +633,67 @@ def setup_miopen_cache(verbose=True):
     os.environ.setdefault("MIOPEN_FIND_MODE", "3")
     if verbose:
         print(f"[rocm_env] MIOpen find-cache: {cache_dir} (MIOPEN_FIND_MODE=3)")
+
+
+def setup_nccl_env(world_size: int = 1, verbose: bool = True):
+    """Auto-set sane NCCL/RCCL defaults for ROCm multi-GPU.
+
+    Called after setup_rocm_env and before torch.distributed.init_process_group.
+    All values are set via os.environ.setdefault so the user can override any
+    of them by setting the env var before launch.
+
+    On single-GPU (world_size <= 1) this is a no-op — NCCL is not used.
+    """
+    if world_size <= 1:
+        return
+
+    import os
+
+    # Async error handling: surfaces collective failures immediately instead
+    # of hanging until the NCCL timeout (default 30min).
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+
+    # Debug level: WARN prints topology + transport selection on first
+    # collective, which is the first thing to check when multi-GPU is slow.
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
+
+    # Best-effort interface hint, excluding loopback/docker bridge interfaces
+    # that can cause NCCL's OOB bootstrap socket to pick the wrong one.
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker0")
+
+    # Detect interconnect topology via rocm-smi to set transport hints.
+    # On MI300X nodes with xGMI, P2P works out of the box. On PCIe-only
+    # or mixed topologies, NCCL's auto-detection can pick the wrong
+    # transport and silently degrade to 1/10th bandwidth.
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["rocm-smi", "--showtopo", "--json"],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout:
+            topo = result.stdout.lower()
+            # If no xGMI/NVLink links are present, disable P2P (forces
+            # shared-memory transport, which is slower but reliable).
+            if "xgmi" not in topo and "nvlink" not in topo:
+                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+                if verbose:
+                    print("[rocm_env] NCCL_P2P_DISABLE=1 (no xGMI/NVLink detected "
+                          "— using shared-memory transport)")
+            # If InfiniBand is present but misconfigured, disable it.
+            # On MI300X HPC nodes IB is common; on workstation nodes it's not.
+            if "ib" not in topo and "infiniband" not in topo:
+                os.environ.setdefault("NCCL_IB_DISABLE", "1")
+                if verbose:
+                    print("[rocm_env] NCCL_IB_DISABLE=1 (no InfiniBand detected)")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # rocm-smi not available (CPU-only box or minimal container) —
+        # let NCCL auto-detect everything.
+        pass
+
+    if verbose:
+        nccl_vars = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+        if nccl_vars:
+            print(f"[rocm_env] NCCL env: {nccl_vars}")
 
 
 def _self_test():

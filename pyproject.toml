@@ -54,13 +54,20 @@ serve = [
 dev = [
     "pytest>=8.0.0",
     "pytest-xdist>=3.5.0",
+    "ruff>=0.4.0",
 ]
 all = [
     "bitsandbytes>=0.43.0",
     "tensorboard>=2.14.0",
+    "liger-kernel>=0.3.0",
     "flash-attn>=2.5.0",
     "torchao>=0.5.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
     "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",
+    "ruff>=0.4.0",
 ]
 
 [project.urls]

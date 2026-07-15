@@ -18,7 +18,8 @@
 
 # Base image: pinned to a specific ROCm/PyTorch tag for reproducibility. An
 # unpinned :latest would let a new ROCm major version silently break the
-# gfx-override or fp8 paths. This tag was verified to exist on Docker Hub
+# gfx-override or fp8 paths, and could also drift past the hard
+# transformers==5.7.0 pin. This tag was verified to exist on Docker Hub
 # (the real tag format is rocm<X.Y.Z>_ubuntu<YY.MM>_py<Z.W>_pytorch_release_A.B.C,
 # NOT hyphenated — a previous pass used a hyphenated tag that doesn't exist).
 # To upgrade: pick a real tag from https://hub.docker.com/r/rocm/pytorch/tags,
