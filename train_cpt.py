@@ -156,6 +156,97 @@ def write_shard_checksums(shard_dir, verbose=True):
             print(f"[cpt] wrote {len(checksums)} shard checksums -> checksums.json")
 
 
+def dcp_save_checkpoint(model, optimizer, step: int, save_dir: Path,
+                        extra_state: dict | None = None):
+    """Save a sharded checkpoint using torch.distributed.checkpoint (DCP).
+
+    Each rank writes only its own FSDP shard — no full state-dict gather,
+    no rank-0 memory spike. The checkpoint is in DCP format (not HF
+    safetensors), so it can only be resumed via dcp_load_checkpoint, not
+    loaded via from_pretrained.
+
+    ALL ranks must call this (it's a collective). The atomic rename +
+    .prev retention pattern from atomic_save_checkpoint is preserved.
+    """
+    import torch
+    from torch.distributed.checkpoint import FileSystemWriter, save_state_dict
+
+    tmp_dir = save_dir.parent / (save_dir.name + ".tmp_ckpt")
+    if tmp_dir.exists():
+        import shutil
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    writer = FileSystemWriter(tmp_dir)
+    # FSDP state dict in SHARDED format — each rank contributes its shard.
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
+    cfg = ShardedStateDictConfig()
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, cfg):
+        model_sd = model.state_dict()
+        optim_sd = FSDP.optim_state_dict(model, optimizer)
+    state = {
+        "model": model_sd,
+        "optimizer": optim_sd,
+        "optimizer_type": optimizer.__class__.__name__,
+        "step": step,
+        **(extra_state or {}),
+    }
+    save_state_dict(state, writer)
+    # Also save the step + optimizer_type as a plain file for quick inspection.
+    import json as _json
+    with open(tmp_dir / "dcp_meta.json", "w") as f:
+        _json.dump({"step": step, "optimizer_type": optimizer.__class__.__name__,
+                     **(extra_state or {})}, f)
+
+    # Atomic rotate (same pattern as atomic_save_checkpoint).
+    import os, shutil
+    backup = save_dir.parent / (save_dir.name + ".prev")
+    if save_dir.exists():
+        if backup.exists():
+            shutil.rmtree(backup)
+        os.replace(save_dir, backup)
+    os.replace(tmp_dir, save_dir)
+    print(f"[cpt] DCP sharded checkpoint saved at step {step} -> {save_dir}")
+
+
+def dcp_load_checkpoint(model, optimizer, save_dir: Path):
+    """Load a DCP sharded checkpoint. Returns (step, optimizer_type, extra_state).
+
+    ALL ranks must call this (collective). Only used when --dcp-checkpoint
+    was used to save (DCP format, not HF safetensors).
+    """
+    import torch
+    from torch.distributed.checkpoint import FileSystemReader, load_state_dict
+
+    reader = FileSystemReader(save_dir)
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
+    cfg = ShardedStateDictConfig()
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, cfg):
+        # Load model state.
+        load_state_dict({"model": model.state_dict()}, reader)
+        # Load optimizer state (convert from full to sharded format).
+        full_optim = FSDP.optim_state_dict(model, optimizer)
+        loaded = {}
+        load_state_dict({"optimizer": full_optim}, reader)
+
+    # Read metadata.
+    import json as _json
+    meta_path = save_dir / "dcp_meta.json"
+    extra_state = {}
+    step = 0
+    optimizer_type = "unknown"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = _json.load(f)
+        step = meta.get("step", 0)
+        optimizer_type = meta.get("optimizer_type", "unknown")
+        extra_state = {k: v for k, v in meta.items()
+                       if k not in ("step", "optimizer_type")}
+    return step, optimizer_type, extra_state
+
+
 def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
                             tokenizer=None, extra_state: dict | None = None,
                             custom_code_src: Path | None = None):
@@ -1104,6 +1195,14 @@ def main():
                          "Off by default -- opt in once you've confirmed it against a "
                          "synchronous checkpoint's output on real hardware (see "
                          "AsyncCheckpointer's docstring for the one unverified assumption).")
+    ap.add_argument("--dcp-checkpoint", action="store_true", default=False,
+                    help="Use torch.distributed.checkpoint (DCP) for sharded saves "
+                         "under --fsdp. Each rank writes only its own shard — no full "
+                         "state-dict gather, no rank-0 memory spike. Checkpoints are "
+                         "in DCP format (NOT HF safetensors), so they can only be "
+                         "resumed by --fsdp --dcp-checkpoint, not loaded via "
+                         "from_pretrained. Use this for very large models where the "
+                         "full-state-dict gather OOMs rank 0. Requires --fsdp.")
     ap.add_argument("--resume-tag", default=None,
                     help="Tag used only for logging which checkpoint this run considers "
                          "itself to be. Defaults to the basename of --save.")
@@ -1114,6 +1213,15 @@ def main():
                          "pure-bf16 weight updates can stagnate. Costs 2x param memory. "
                          "Default off (pure bf16, throughput-first). Only effective with "
                          "--fsdp.")
+    ap.add_argument("--fused-ce", action="store_true", default=False,
+                    help="Use Liger Kernel's fused linear+cross-entropy to avoid "
+                         "materializing the full logits tensor. On a 256k-vocab "
+                         "model, lm_head output is ~2GB per forward (and MTP calls "
+                         "it per depth). The fused op computes loss from the linear "
+                         "output without materializing logits — saves multi-GB peak "
+                         "memory and HBM bandwidth. Requires the 'liger-kernel' "
+                         "package (pip install liger-kernel). Falls back to standard "
+                         "CE if not installed.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. gfx1100) "
@@ -1454,6 +1562,26 @@ def main():
         model = _apply_fp8(model)
     if args.flash_attn:
         _apply_flash_attn(model)
+    if getattr(args, "fused_ce", False):
+        try:
+            from liger_kernel.transformers import apply_liger_kernel_to_gemma
+            apply_liger_kernel_to_gemma()
+            print("[cpt] Liger Kernel fused linear+CE enabled — avoids materializing "
+                  "full logits (saves multi-GB peak memory on large-vocab models)")
+        except ImportError:
+            print("[cpt] WARNING: --fused-ce but liger-kernel not installed — "
+                  "using standard CE. Install with 'pip install liger-kernel'.",
+                  file=sys.stderr)
+        except Exception as e:
+            # Liger may not have a Gemma patch for this exact model variant.
+            # Try the generic auto-patch.
+            try:
+                from liger_kernel.transformers import AutoLigerKernelForCausalLM
+                print(f"[cpt] NOTE: Gemma-specific Liger patch failed ({e}), "
+                      f"trying generic auto-patch")
+            except ImportError:
+                print(f"[cpt] WARNING: Liger Kernel patch failed ({e}) — "
+                      f"using standard CE", file=sys.stderr)
 
     # ── Distributed wrapping: DDP or FSDP ─────────────────────────────────────
     # Both wrap the model after all modifications (fp8, flash-attn, compile) but
@@ -1969,44 +2097,53 @@ def main():
             # gate; only the disk write is rank-0-only.
             is_checkpoint_step = (it % args.checkpoint_every == 0
                                   or it == args.iters or _SHOULD_STOP)
-            # FSDP: all ranks gather the full model + optimizer state (both are
-            # collectives — all ranks must participate even though only rank 0
-            # gets the result).
-            full_sd = None
-            full_optim_sd = None
-            is_fsdp = type(model).__name__ == "FullyShardedDataParallel"
-            if is_checkpoint_step and is_fsdp:
-                full_sd = get_full_state_dict(model)
-                full_optim_sd = get_full_optim_state_dict(model, optimizer)
-            if is_main and is_checkpoint_step:
+            # DCP sharded checkpoint: each rank writes its own shard, no gather.
+            # Only for FSDP; DDP/single-GPU uses the standard path.
+            use_dcp = (getattr(args, "dcp_checkpoint", False) and is_fsdp
+                       and is_checkpoint_step)
+            if use_dcp:
                 ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
-                # For FSDP: use the gathered full state dicts via shims that
-                # override save_pretrained() / state_dict().
-                # For DDP/single-GPU: unwrap_ddp gives the raw model/optimizer.
-                if full_sd is not None:
-                    save_model = _StateDictModel(_fsdp_unwrap(model), full_sd)
-                    save_optimizer = _StateDictOptimizer(optimizer, full_optim_sd)
-                else:
-                    save_model = unwrap_ddp(model)
-                    save_optimizer = optimizer
-                # When resuming, the latest modeling_custom.py lives in the checkpoint
-                # dir (the user may have updated it there). For a fresh run, copy it
-                # from the original --model path.
-                custom_code_src = save_dir if resumed else Path(args.model)
-                if args.async_checkpoint:
-                    async_ckpt.save(save_model, save_optimizer, it, save_dir, tokenizer,
-                                    extra_state=ckpt_extra,
-                                    custom_code_src=custom_code_src)
-                    # On exit (SIGTERM or final iter) the write MUST finish before the
-                    # process dies, or this defeats the whole point of atomic checkpointing.
-                    # For a regular mid-run checkpoint, deliberately NOT waiting here -- the
-                    # background thread keeps writing while training continues; save()
-                    # itself waits on any still-in-flight write before starting the next one.
-                    if _SHOULD_STOP or it == args.iters:
-                        async_ckpt.wait_for_pending()
-                else:
-                    atomic_save_checkpoint(save_model, save_optimizer, it, save_dir, tokenizer,
-                                           extra_state=ckpt_extra,
+                dcp_save_checkpoint(model, optimizer, it, save_dir,
+                                    extra_state=ckpt_extra)
+            else:
+                # FSDP: all ranks gather the full model + optimizer state (both are
+                # collectives — all ranks must participate even though only rank 0
+                # gets the result).
+                full_sd = None
+                full_optim_sd = None
+                is_fsdp = type(model).__name__ == "FullyShardedDataParallel"
+                if is_checkpoint_step and is_fsdp:
+                    full_sd = get_full_state_dict(model)
+                    full_optim_sd = get_full_optim_state_dict(model, optimizer)
+                if is_main and is_checkpoint_step:
+                    ckpt_extra = {"valid_loss": last_valid_loss} if last_valid_loss is not None else None
+                    # For FSDP: use the gathered full state dicts via shims that
+                    # override save_pretrained() / state_dict().
+                    # For DDP/single-GPU: unwrap_ddp gives the raw model/optimizer.
+                    if full_sd is not None:
+                        save_model = _StateDictModel(_fsdp_unwrap(model), full_sd)
+                        save_optimizer = _StateDictOptimizer(optimizer, full_optim_sd)
+                    else:
+                        save_model = unwrap_ddp(model)
+                        save_optimizer = optimizer
+                    # When resuming, the latest modeling_custom.py lives in the checkpoint
+                    # dir (the user may have updated it there). For a fresh run, copy it
+                    # from the original --model path.
+                    custom_code_src = save_dir if resumed else Path(args.model)
+                    if args.async_checkpoint:
+                        async_ckpt.save(save_model, save_optimizer, it, save_dir, tokenizer,
+                                        extra_state=ckpt_extra,
+                                        custom_code_src=custom_code_src)
+                        # On exit (SIGTERM or final iter) the write MUST finish before the
+                        # process dies, or this defeats the whole point of atomic checkpointing.
+                        # For a regular mid-run checkpoint, deliberately NOT waiting here -- the
+                        # background thread keeps writing while training continues; save()
+                        # itself waits on any still-in-flight write before starting the next one.
+                        if _SHOULD_STOP or it == args.iters:
+                            async_ckpt.wait_for_pending()
+                    else:
+                        atomic_save_checkpoint(save_model, save_optimizer, it, save_dir, tokenizer,
+                                               extra_state=ckpt_extra,
                                            custom_code_src=custom_code_src)
     
             if _SHOULD_STOP:
