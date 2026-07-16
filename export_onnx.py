@@ -12,12 +12,22 @@ import os
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", required=True, help="Source checkpoint directory.")
-    ap.add_argument("--dst", required=True, help="Output directory or .onnx file path.")
+    ap.add_argument("--src", help="Source checkpoint directory.")
+    ap.add_argument("--dst", help="Output directory or .onnx file path.")
     ap.add_argument("--seq-length", type=int, default=128, help="Dummy input sequence length.")
     ap.add_argument("--batch-size", type=int, default=1, help="Dummy input batch size.")
-    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
+    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="fp32")
+    ap.add_argument("--selftest", action="store_true", default=False,
+                    help="Run built-in self-test (no GPU required).")
     args = ap.parse_args()
+
+    if args.selftest:
+        _self_test()
+        return
+
+    # Validate required args AFTER the --selftest check.
+    if not args.src or not args.dst:
+        ap.error("--src and --dst are required (unless --selftest).")
 
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,13 +35,9 @@ def main():
         raise SystemExit("transformers is required for ONNX export") from exc
 
     import torch
+    from runtime import DTYPE_MAP
 
-    dtype_map = {
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-    }
-    torch_dtype = dtype_map[args.dtype]
+    torch_dtype = DTYPE_MAP[args.dtype]
 
     print(f"[export_onnx] loading {args.src} ...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -66,6 +72,33 @@ def main():
             opset_version=14,
         )
     print("[export_onnx] done.")
+
+
+def _self_test():
+    """Self-test: flag aliasing + DTYPE_MAP coverage (no GPU required)."""
+    print("[selftest] export_onnx: flag aliasing + dtype coverage (no GPU required)")
+
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--src", required=True)
+    ap.add_argument("--dst", required=True)
+    ap.add_argument("--seq-length", type=int, default=128)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="fp32")
+    ap.add_argument("--selftest", action="store_true", default=False)
+
+    a = ap.parse_args(["--src", "/m", "--dst", "/o.onnx", "--dtype", "fp8"])
+    assert a.dtype == "fp8"
+    assert a.seq_length == 128
+    assert a.batch_size == 1
+    print("  OK (flags parsed, fp8 dtype accepted)")
+
+    from runtime import DTYPE_MAP
+    import torch
+    assert DTYPE_MAP["fp8"] is torch.bfloat16
+    assert DTYPE_MAP["fp32"] is torch.float32
+    print("  OK (DTYPE_MAP covers fp8 -> bf16 for export load)")
+
+    print("\n[selftest] All checks passed.")
 
 
 if __name__ == "__main__":

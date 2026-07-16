@@ -16,8 +16,23 @@ from distributed.env import detect_process_group_env
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+    # StateDictType / FullStateDictConfig moved between torch versions: the
+    # canonical public path in current PyTorch is torch.distributed.fsdp, but
+    # older builds expose them under torch.distributed.fsdp.api. Try the
+    # modern path first, fall back to .api so neither version silently sets
+    # _FSDP_AVAILABLE=False (which would disable FSDP with a misleading
+    # "not available" error).
+    try:
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+    except ImportError:
+        from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
     from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+    # ShardingStrategy lives at torch.distributed.fsdp in modern PyTorch;
+    # fall back to .api for older builds.
+    try:
+        from torch.distributed.fsdp import ShardingStrategy
+    except ImportError:
+        from torch.distributed.fsdp.api import ShardingStrategy
     _FSDP_AVAILABLE = True
 except Exception:
     _FSDP_AVAILABLE = False
@@ -82,13 +97,16 @@ class FSDPStrategy(DistributedStrategy):
         def _wrap_fn(module):
             return any(module.__class__.__name__.endswith(suffix) for suffix in decoder_layer_classes)
 
+        # Map the string name to the ShardingStrategy enum member. Passing a
+        # raw string ("FULL_SHARD") to FSDP(sharding_strategy=...) raises
+        # TypeError on modern PyTorch -- it requires the enum.
         sharding_strategy_map = {
-            "full": "FULL_SHARD",
-            "shard-grad-op": "SHARD_GRAD_OP",
-            "no-shard": "NO_SHARD",
+            "full": ShardingStrategy.FULL_SHARD,
+            "shard-grad-op": ShardingStrategy.SHARD_GRAD_OP,
+            "no-shard": ShardingStrategy.NO_SHARD,
         }
         strategy = sharding_strategy_map.get(
-            self._sharding_strategy_name, "FULL_SHARD"
+            self._sharding_strategy_name, ShardingStrategy.FULL_SHARD
         )
 
         device_id = self._local_rank if self.backend.name == "rocm" else None

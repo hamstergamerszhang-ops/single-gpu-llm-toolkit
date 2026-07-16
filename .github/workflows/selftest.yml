@@ -4,8 +4,18 @@ name: self-tests
 # All self-tests are CPU-only (no GPU needed) — they exercise the real logic
 # (LR schedule math, atomic checkpoint rename, optimizer compat, cache stream,
 # MTP weight generation, rocm_env family-matching, data preprocessing,
-# benchmark config parsing, generation kwargs construction) against tiny
-# in-memory fixtures, not against real hardware.
+# benchmark config parsing, generation kwargs construction, dtype/flag
+# aliasing) against tiny in-memory fixtures, not against real hardware.
+#
+# NOTE ON TORCH: CI runs on GitHub's ubuntu-latest runners which have no AMD
+# GPU, so the torch installed below is the PyPI (CUDA-built) wheel, NOT a ROCm
+# build. This is fine for the CPU-only selftests (they never touch a GPU), but
+# it means CI cannot catch ROCm-backend-specific regressions (e.g. a
+# torch.version.hip codepath, a gcnArchName parse, an NCCL init). Those are
+# validated by the selftests on real AMD hardware instead. If you have a
+# self-hosted ROCm runner, add a separate job that installs torch from AMD's
+# index (https://pytorch.org/get-started/locally/ -> ROCm) and runs the same
+# suite.
 
 on:
   push:
@@ -36,11 +46,12 @@ jobs:
         run: |
           missing=0
           for f in async_checkpoint.py benchmark.py bnb_optimizer.py \
-                   catch_and_resume.sh compress_model.py expand_model.py \
-                   generate.py local_cache_stream.py mtp_head.py \
-                   oom_guard.sh optimizer_compat_guard.py preprocess_data.py \
-                   prune_embeddings_torch.py prune_vocab.py rocm_env.py \
-                   smart_hipify.py tensor_parallel.py train_cpt.py \
+                   catch_and_resume.sh compress_model.py evaluate.py \
+                   expand_model.py export_gguf.py export_onnx.py \
+                   export_safetensors.py generate.py local_cache_stream.py \
+                   mtp_head.py oom_guard.sh optimizer_compat_guard.py \
+                   preprocess_data.py prune_embeddings_torch.py prune_vocab.py \
+                   rocm_env.py smart_hipify.py tensor_parallel.py train_cpt.py \
                    train_sft.py; do
             if [ ! -x "$f" ]; then
               echo "MISSING +x: $f"
@@ -58,16 +69,17 @@ jobs:
       - name: Run module self-tests
         run: |
           # Only modules with a --selftest flag (transformation tools like
-          # prune_vocab/expand_model need real checkpoints, so they have no
-          # self-test — they're covered by the pytest suite's logic tests).
-          # train_sft.py needs transformers installed above -- its selftest
-          # imports build_sft_example to verify the symbol exists (it
-          # delegates the real tests to train_cpt.self_test).
+          # prune_vocab/expand_model/export_safetensors need real checkpoints,
+          # so they have no self-test — they're covered by the pytest suite's
+          # logic tests). train_sft.py needs transformers installed above --
+          # its selftest imports build_sft_example to verify the symbol exists
+          # (it delegates the real tests to train_cpt.self_test).
           for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
                    local_cache_stream.py optimizer_compat_guard.py \
                    rocm_env.py mtp_head.py train_sft.py \
                    preprocess_data.py benchmark.py generate.py \
-                   compress_model.py tensor_parallel.py smart_hipify.py; do
+                   compress_model.py tensor_parallel.py smart_hipify.py \
+                   evaluate.py export_gguf.py export_onnx.py; do
             echo "=== $f --selftest ==="
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done

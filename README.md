@@ -1,6 +1,6 @@
 # single-gpu-llm-toolkit
 
-Nineteen independently-runnable tools (seventeen Python + two shell) for
+Twenty-two independently-runnable tools (twenty Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
 multi-node cluster, no distributed training framework. The pipeline covers
 the full path from a base checkpoint to a trained one: shrink a tokenizer,
@@ -9,8 +9,13 @@ survive the specific ways a single GPU fails you along the way — OOM,
 crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
 `benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
 data in, compare configs before committing to a long run, and actually talk
-to the model you just trained. Every tool ships its own `--selftest` or
-pytest coverage (the two shell scripts, `catch_and_resume.sh` and `oom_guard.sh`, are not covered by selftests or pytest — their logic is exercised manually; see [Testing](#testing)) and is independently runnable —
+to the model you just trained. `evaluate.py` measures perplexity, the three
+`export_*.py` tools convert a checkpoint to GGUF/ONNX/safetensors, and every
+tool ships its own `--selftest` or pytest coverage — transformation tools
+that need real checkpoints (`prune_vocab.py`, `expand_model.py`,
+`export_safetensors.py`) are covered by pytest logic tests instead, and the
+two shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are exercised
+manually; see [Testing](#testing). Everything is independently runnable —
 use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
@@ -234,6 +239,44 @@ wheel's compiled list (common on RDNA1/2, older cards), `train_cpt.py` calls
 `HSA_OVERRIDE_GFX_VERSION`. See [`rocm_env.py`](#rocm_envpy--amd-gpu-arch-detection--override)
 below. You can also force it with `--gfx-override gfx1100`.
 
+### Supported AMD hardware
+
+This toolkit targets the full AMD ROCm lineup, not just MI300X. The
+gfx-override auto-detection (`rocm_env.py`) handles the arch-mismatch case
+that hits consumer cards most; the arch gates in `backends/rocm.py` advertise
+fp8 / flash-attn only where ROCm actually has kernels. A `--preset` selects
+sane batch / sequence-length / accumulation defaults for each class.
+
+| gfx arch | Product | VRAM | bf16 | flash-attn | fp8 | Preset |
+|----------|---------|------|------|------------|-----|--------|
+| gfx900 | MI25 (Vega 20) | 16GB | ✗ | ✗ | ✗ | `mi25-16g` |
+| gfx908 | MI100 | 32GB | ✓ | ✓ | ✗ | — |
+| gfx90a | MI250 / MI250X (per GCD) | 64GB | ✓ | ✓ | ✗ | `mi250-64g` |
+| gfx940 | MI300A (APU) | ~96GB | ✓ | ✓ | ✓ | `mi300x-80g` |
+| gfx941 | MI325X | 192GB | ✓ | ✓ | ✓ | `mi300x-192g` |
+| gfx942 | MI300X | 192GB | ✓ | ✓ | ✓ | `mi300x-192g` |
+| gfx950 | MI350 | 288GB | ✓ | ✓ | ✓ | `mi300x-192g` |
+| gfx1030/1031 | RX 6800 / 6900 (RDNA2) | 16GB | ✓ | ✓ | ✗ | `rx6800-16g` |
+| gfx1032 | RX 6700 XT (RDNA2) | 12GB | ✓ | ✓ | ✗ | `rx6700xt-12g` |
+| gfx1032 | RX 6600 (RDNA2) | 8GB | ✓ | ✓ | ✗ | `rx6600-8g` |
+| gfx1100/1101/1102 | RX 7900 XTX / XT (RDNA3) | 24/20GB | ✓ | ✓ | ✗ | `rx7900xtx-24g` / `rx7900xt-20g` |
+| gfx1102 | RX 7700 XT (RDNA3) | 12GB | ✓ | ✓ | ✗ | `rx7700xt-12g` |
+| gfx1102 | RX 7600 (RDNA3) | 8GB | ✓ | ✓ | ✗ | `rx7600-8g` |
+| gfx1200/1201 | RX 9070 XT (RDNA4) | 16GB | ✓ | ✓ | ✗ | `rx9070xt-16g` |
+| gfx1103/115x | APU (Phoenix/Hawk Point) | shared | partial | ✗ | ✗ | `apu-2g` |
+| gfx803 | Fiji / Polaris (pre-RDNA) | ≤8GB | ✗ | ✗ | ✗ | — |
+
+Notes:
+- **fp8** is gated to the CDNA3 MI300 family (`gfx940`/`gfx941`/`gfx942`/`gfx950`)
+  only. Consumer RDNA cards (gfx1100, gfx1200) have no working native fp8 in
+  current ROCm wheels — `--dtype fp8` falls back to bf16 with a warning there.
+- **flash-attn** is gated to CDNA `gfx908+` and RDNA2+ `gfx1030+`. Older archs
+  (gfx900/MI25, gfx803, gfx1010/RDNA1) have no flash-attn ROCm kernels.
+- **bf16** on gfx900 (MI25) and gfx803 is not supported by the hardware; those
+  presets use fp16 instead.
+- Archs marked "✗" for a feature simply make the corresponding flag a no-op
+  with a warning — they don't prevent the run.
+
 ## `prune_vocab.py` — shrink a tokenizer you don't need in full
 
 A Gemma-4 tokenizer ships vocabulary for scripts you may never see — CJK,
@@ -397,17 +440,15 @@ is for:
   flash-attn --no-build-isolation`). Falls back to standard attention with a
   warning if not installed.
 - **`--dtype fp8`** — fp8 training via `torchao`'s `Float8Linear`
-  (`float8_e4m3fn`). MI300X, MI300A, AND MI325X all have native fp8 compute —
-  verified directly against AMD's own gpu-arch-specs documentation, all three
-  are `gfx942` (there is no separate `gfx940`/`gfx941` architecture for
-  MI300A/MI325X; those strings appear in some early/internal ROCm references
-  but don't correspond to real, currently-shipping distinct chips — don't
-  reintroduce a "gfx940=MI300A, gfx941=MI325X" mapping in a future pass). A
-  runtime capability gate checks `torch.cuda.get_device_capability()` and
-  gracefully falls back to bf16 with a warning on any card outside gfx942
-  (e.g. gfx1100 / RX 7900 XTX), so `--dtype fp8` is safe to pass on any AMD
-  card — it will just skip fp8 on unsupported hardware. Falls back to bf16 if
-  `torchao` is missing.
+  (`float8_e4m3fn`). Native fp8 compute is available on the CDNA3 MI300
+  family: `gfx940` (MI300A), `gfx941` (MI325X), `gfx942` (MI300X), and the
+  upcoming `gfx950` (MI350). A runtime capability gate
+  (`backends/rocm.py::supports_fp8`) checks the arch and gracefully falls back
+  to bf16 with a warning on any card outside that set — including consumer
+  Radeon (gfx1100 / RX 7900 XTX, gfx1200 / RX 9070 XT), which have no fp8
+  units in current ROCm. So `--dtype fp8` is safe to pass on any AMD card; it
+  just skips fp8 on unsupported hardware. Falls back to bf16 if `torchao` is
+  missing.
 - **`--compile`** — `torch.compile()` with ROCm's inductor backend for kernel
   fusion + graph optimization. First few steps are slower (compilation), then
   faster. Falls back to eager mode if compilation fails. With `--pack` (fixed
@@ -423,9 +464,9 @@ is for:
   kernel-level profiling beyond torch.profiler, wrap the run with
   `rocprof --stats python3 train_cpt.py ...`.
 - **`--hip-alloc-conf`** — sets `PYTORCH_HIP_ALLOC_CONF` (default
-  `max_split_size_mb:128`) to prevent the caching allocator fragmentation that
-  causes phantom OOMs on long runs. Handled by `rocm_env.py` alongside the gfx
-  override.
+  `expandable_segments:True`) to prevent the caching allocator fragmentation
+  that causes phantom OOMs on long runs. Handled by `rocm_env.py` alongside
+  the gfx override.
 - **`--ddp`** — multi-GPU training via `torch.distributed` +
   `DistributedDataParallel`. Launch with `torchrun --nproc_per_node=N
   train_cpt.py --ddp ...`. Only rank 0 writes checkpoints/logs and runs
@@ -474,6 +515,17 @@ is for:
   automatically when `--fsdp` is used); the reentrant variant is
   incompatible with FSDP's forward hooks. `--fsdp` and `--ddp` are mutually
   exclusive.
+- **`--preset <name>`** — apply a hardware preset's defaults (batch /
+  `max_seq_len` / `accum` / `dtype` / `compile` / `flash_attn`) for a device
+  class, so you don't hand-tune per-card. See the
+  [Supported AMD hardware](#supported-amd-hardware) table above for the full
+  list (`cpu`, `rx6800-16g`, `rx7900xtx-24g`, `rx9070xt-16g`, `mi300x-80g`,
+  `mi300x-192g`, `mi250-64g`, `mi25-16g`, `apu-2g`, ...). Explicit CLI flags
+  always override the preset, so `--preset rx7900xtx-24g --batch 2` uses
+  batch=2 and the preset's other defaults.
+- **`--config <path>`** — load a TOML or YAML recipe file of overrides
+  (applied under CLI flags, like `--preset`). Supports `extends =
+  "other.toml"` inheritance. Useful for checked-in per-experiment configs.
 - **`--accum N`** (alias `--gradient-accumulation-steps`) — accumulate
   gradients over `N` micro-batches of size `--batch` before each optimizer
   step, giving an effective batch size of `batch * accum` without the extra
@@ -620,14 +672,62 @@ python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
 
 Takes any HuggingFace-format checkpoint and produces a quantized version using
 torchao. Supports int8 (~2x smaller, negligible loss), int4 (~4x smaller,
-minimal loss), and fp8 (~2x smaller, best on MI300X). All three work on ANY
-AMD card — the weights are dequantized to bf16 for the matmul, so no special
-hardware is required (fp8 gets native-speed matmuls on MI300X/MI325X, but
-still works on everything else). Auto-detects nested (Gemma-4) vs flat
-(Llama/Mistral/Qwen) config layouts.
+minimal loss), and fp8 (~2x smaller, best on AMD CDNA3+: MI300X/MI300A/MI325X/MI350).
+All three work on ANY AMD card — the weights are dequantized to bf16 for the
+matmul, so no special hardware is required (fp8 gets native-speed matmuls on
+the MI300 family, but still works on everything else). Auto-detects nested
+(Gemma-4) vs flat (Llama/Mistral/Qwen) config layouts.
 
 ```
 python3 compress_model.py --src ./checkpoints/base_15b --dst ./checkpoints/base_15b_int4
+```
+
+## `evaluate.py` — batch perplexity evaluation
+
+Computes mean cross-entropy loss and perplexity on a JSONL dataset (each line
+needs a `"text"` field) using a trained checkpoint. Supports all dtypes
+(fp32/fp16/bf16/fp8) via the shared `runtime.DTYPE_MAP` + `resolve_dtype` —
+fp8 falls back to bf16 on hardware without native fp8. Passes
+`attention_mask` so padded positions don't skew the loss. Honors
+`--gfx-override`/`--hip-alloc-conf` for consumer AMD cards, same as
+`generate.py`.
+
+```
+python3 evaluate.py --model ./checkpoints/model_cpt_1 --data eval.jsonl --batch-size 4
+```
+
+## `export_gguf.py` — export to GGUF for llama.cpp
+
+Thin wrapper around llama.cpp's `convert_hf_to_gguf.py`. Auto-detects the
+convert script in common locations; if not found, prints the exact command to
+run manually. Supports all GGUF quant types (`--outtype f16`, `q4_k_m`,
+`q8_0`, ...).
+
+```
+python3 export_gguf.py --src ./checkpoints/model --dst model.gguf --outtype q4_k_m
+```
+
+## `export_onnx.py` — export to ONNX
+
+Exports the base model (not MTP modules) to ONNX for inference runtimes that
+consume it. Supports fp32/fp16/bf16/fp8 (fp8 loads bf16, matching the rest of
+the toolkit). Dynamic batch + sequence axes so the exported graph isn't
+locked to one input shape.
+
+```
+python3 export_onnx.py --src ./checkpoints/model --dst model.onnx --dtype bf16
+```
+
+## `export_safetensors.py` — consolidate sharded checkpoints
+
+Merges a sharded checkpoint (`model.safetensors.index.json` + multiple shards)
+into a single `model.safetensors` file. Copies all non-weight files
+(config.json, tokenizer, chat_template, etc.) from the source so the output
+directory is loadable via `from_pretrained` on its own. Optional
+`--max-shard-bytes` re-shards to a target size.
+
+```
+python3 export_safetensors.py --src ./checkpoints/model_sharded --dst ./checkpoints/model_consolidated
 ```
 
 ## `tensor_parallel.py` — auto-detect multi-GPU, run with pipeline parallelism
@@ -943,7 +1043,8 @@ for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          local_cache_stream.py optimizer_compat_guard.py \
          rocm_env.py mtp_head.py train_sft.py \
          preprocess_data.py benchmark.py generate.py \
-         compress_model.py tensor_parallel.py smart_hipify.py; do
+         compress_model.py tensor_parallel.py smart_hipify.py \
+         evaluate.py export_gguf.py export_onnx.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v

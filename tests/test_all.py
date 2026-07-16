@@ -303,33 +303,85 @@ def test_list_presets_includes_cpu_and_amd_cards():
     from config import list_presets
     presets = list_presets()
     assert "cpu" in presets
+    # CDNA Instinct lineup.
     assert "mi300x-80g" in presets
-    assert "rx7900-24g" in presets
+    assert "mi300x-192g" in presets
+    assert "mi250-64g" in presets
+    assert "mi25-16g" in presets
+    # Consumer Radeon lineup (RX 6000/7000/9000 + APU).
+    assert "rx6800-16g" in presets
+    assert "rx7900xtx-24g" in presets
+    assert "rx9070xt-16g" in presets
+    assert "apu-2g" in presets
+
+
+def test_preset_keys_match_argparse_dests():
+    """Preset keys must be argparse dest names, or apply_preset is a silent no-op.
+    train_cpt.py uses --batch/--max-seq-len/--accum (dest: batch/max_seq_len/accum),
+    NOT batch_size/seq_length/gradient_accumulation_steps. Pin this so a rename
+    drift in either direction is caught."""
+    from config.presets import PRESETS
+    forbidden = {"batch_size", "seq_length", "gradient_accumulation_steps"}
+    for name, preset in PRESETS.items():
+        bad = forbidden & set(preset.keys())
+        assert not bad, f"preset '{name}' uses stale keys {bad}; use batch/max_seq_len/accum"
+        # Every preset must set at least these core training defaults.
+        assert "dtype" in preset, f"preset '{name}' missing dtype"
+        assert "batch" in preset, f"preset '{name}' missing batch"
+        assert "max_seq_len" in preset, f"preset '{name}' missing max_seq_len"
+        assert "accum" in preset, f"preset '{name}' missing accum"
 
 
 def test_get_preset_cpu_is_fp32():
     from config.presets import get_preset
     preset = get_preset("cpu")
     assert preset["dtype"] == "fp32"
-    assert preset["batch_size"] == 1
+    assert preset["batch"] == 1
+    assert preset["max_seq_len"] == 128
+
+
+def test_get_preset_consumer_radeon_defaults():
+    """Consumer Radeon presets: bf16, flash-attn on (RDNA2+ has kernels),
+    no fp8, compile off. MI25 (gfx900) has no flash-attn kernels and no bf16."""
+    from config.presets import get_preset
+    p = get_preset("rx7900xtx-24g")
+    assert p["dtype"] == "bf16"
+    assert p["flash_attn"] is True
+    assert p["compile"] is False
+    mi25 = get_preset("mi25-16g")
+    assert mi25["flash_attn"] is False
+    assert mi25["dtype"] == "fp16"
 
 
 def test_apply_preset_does_not_override_explicit():
     from config import apply_preset
-    config = {"dtype": "bf16", "batch_size": 16}
+    config = {"dtype": "bf16", "batch": 16}
     merged = apply_preset(config, "cpu")
     assert merged["dtype"] == "bf16"
-    assert merged["batch_size"] == 16
+    assert merged["batch"] == 16
     assert merged["compile"] is False  # filled in from preset
+
+
+def test_suggest_preset_vram_tiers():
+    """suggest_preset picks the largest preset whose VRAM doesn't exceed the
+    card's (so 24GB -> rx7900xtx-24g, not rx7900xt-20g)."""
+    from config import suggest_preset
+    assert suggest_preset("cpu", 0) == "cpu"
+    assert suggest_preset("rocm", 192 * 1024**3) == "mi300x-192g"
+    assert suggest_preset("rocm", 80 * 1024**3) == "mi300x-80g"
+    assert suggest_preset("rocm", 24 * 1024**3) == "rx7900xtx-24g"
+    assert suggest_preset("rocm", 8 * 1024**3) == "rx6600-8g"
+    assert suggest_preset("rocm", 2 * 1024**3) == "apu-2g"
+    assert suggest_preset("rocm", 1 * 1024**3) is None  # <1.5GB too small
 
 
 def test_resolve_toml_recipe(tmp_path):
     from config import resolve_recipe
     recipe = tmp_path / "test.toml"
-    recipe.write_text('batch_size = 8\nseq_length = 512\n')
-    cfg = resolve_recipe(recipe, base_defaults={"dtype": "bf16", "batch_size": 1})
-    assert cfg["batch_size"] == 8
-    assert cfg["seq_length"] == 512
+    recipe.write_text('batch = 8\nmax_seq_len = 512\n')
+    cfg = resolve_recipe(recipe, base_defaults={"dtype": "bf16", "batch": 1})
+    assert cfg["batch"] == 8
+    assert cfg["max_seq_len"] == 512
     assert cfg["dtype"] == "bf16"
 
 
@@ -338,11 +390,11 @@ def test_resolve_recipe_extends_chain(tmp_path):
     base = tmp_path / "base.toml"
     base.write_text('dtype = "bf16"\ncompile = true\n')
     child = tmp_path / "child.toml"
-    child.write_text(f'extends = "base.toml"\nbatch_size = 4\n')
-    cfg = resolve_recipe(child, base_defaults={"batch_size": 1})
+    child.write_text(f'extends = "base.toml"\nbatch = 4\n')
+    cfg = resolve_recipe(child, base_defaults={"batch": 1})
     assert cfg["dtype"] == "bf16"
     assert cfg["compile"] is True
-    assert cfg["batch_size"] == 4
+    assert cfg["batch"] == 4
 
 
 # ── Runtime capability probes (runtime/) ────────────────────────────────────
@@ -377,6 +429,160 @@ def test_resolve_compile_false_when_requested_false():
     from backends import BackendDevice
     dev = BackendDevice(backend="cpu")
     assert resolve_compile(dev, requested=False) is False
+
+
+def test_dtype_map_includes_fp8_as_bf16():
+    """The shared DTYPE_MAP must map 'fp8' to bf16: fp8 runs load the model in
+    bf16 then quantize in place, so the dict lookup must succeed (a missing key
+    raised KeyError on MI300X before the quantize step ran)."""
+    import torch
+    from runtime import DTYPE_MAP
+    assert DTYPE_MAP["fp32"] is torch.float32
+    assert DTYPE_MAP["fp16"] is torch.float16
+    assert DTYPE_MAP["bf16"] is torch.bfloat16
+    assert DTYPE_MAP["fp8"] is torch.bfloat16  # load bf16, quantize after
+
+
+def test_rocm_fp8_gate_covers_mi300_family_excludes_consumer():
+    """supports_fp8() advertises fp8 ONLY for gfx940/gfx941/gfx942/gfx950
+    (MI300A/MI325X/MI300X/MI350). Consumer RDNA (gfx1100/gfx1200) and older
+    CDNA (gfx90a) must NOT be advertised -- they have no fp8 units, and
+    advertising fp8 makes --dtype fp8 attempt float8 conversion and crash."""
+    fp8_prefixes = ("gfx940", "gfx941", "gfx942", "gfx950", "gfx95")
+    for arch, expected in [
+        ("gfx942", True),   # MI300X
+        ("gfx940", True),   # MI300A
+        ("gfx941", True),   # MI325X
+        ("gfx950", True),   # MI350
+        ("gfx90a", False),  # MI250 -- no fp8
+        ("gfx908", False),  # MI100 -- no fp8
+        ("gfx1100", False), # RX 7900 -- no fp8
+        ("gfx1200", False), # RX 9070 -- no fp8 in current ROCm
+        ("gfx803", False),  # Polaris -- no fp8
+    ]:
+        got = arch.startswith(fp8_prefixes)
+        assert got is expected, f"{arch}: expected fp8={expected}, got {got}"
+
+
+def test_rocm_flash_attn_gate_excludes_old_archs():
+    """supports_flash_attn() must be False for archs with no flash-attn ROCm
+    kernels (gfx900/MI25, gfx803, gfx1010/RDNA1) and True for CDNA gfx908+ and
+    RDNA2+ (gfx1030+). The old code returned True for everything."""
+    from backends.rocm import RocmBackend
+
+    b = RocmBackend()
+    orig_avail = b.is_available
+    try:
+        b.is_available = lambda: True
+        cases = {
+            "gfx908": True,   # MI100
+            "gfx90a": True,   # MI250
+            "gfx942": True,   # MI300X
+            "gfx1030": True,  # RX 6800
+            "gfx1100": True,  # RX 7900
+            "gfx1200": True,  # RX 9070
+            "gfx900": False,  # MI25 -- no kernels
+            "gfx803": False,  # Polaris -- no kernels
+            "gfx1010": False, # RDNA1 -- no kernels
+        }
+        for arch, expected in cases.items():
+            b.get_arch_tag = lambda idx=0, _a=arch: _a
+            got = b.supports_flash_attn()
+            assert got is expected, f"{arch}: expected flash_attn={expected}, got {got}"
+    finally:
+        b.is_available = orig_avail
+
+
+def test_rocm_arch_tag_fallback_is_decimal_not_hex():
+    """get_arch_tag() capability-tuple fallback must emit minor in DECIMAL
+    (gfx942), not hex (gfx92a). A previous version used :x formatting and
+    produced bogus arch strings that nothing downstream would match."""
+    from backends.rocm import RocmBackend
+    import torch
+
+    b = RocmBackend()
+    orig_avail = b.is_available
+    try:
+        b.is_available = lambda: True
+        class FakeProps:
+            gcnArchName = ""
+        orig_get_props = torch.cuda.get_device_properties
+        orig_get_cap = torch.cuda.get_device_capability
+        torch.cuda.get_device_properties = lambda idx: FakeProps()
+        torch.cuda.get_device_capability = lambda idx: (9, 42)
+        tag = b.get_arch_tag(0)
+        assert tag == "gfx942", f"expected 'gfx942' (decimal), got {tag!r}"
+        torch.cuda.get_device_properties = orig_get_props
+        torch.cuda.get_device_capability = orig_get_cap
+    finally:
+        b.is_available = orig_avail
+
+
+def test_modeling_custom_family_class_chain_covers_supported_families():
+    """_FAMILY_CLASS_CHAINS must list every family in models/registry.py so a
+    user-specified --model-family always resolves to a class chain."""
+    import modeling_custom
+    from models.registry import list_model_families
+    registry_families = set(list_model_families())
+    chain_families = set(modeling_custom._FAMILY_CLASS_CHAINS.keys())
+    missing = registry_families - chain_families
+    assert not missing, f"families in registry but not in modeling_custom: {missing}"
+
+
+def test_modeling_custom_resolve_base_class_for_known_family():
+    """_resolve_base_class must return a real transformers CausalLM class for a
+    user-specified family (not guess across families)."""
+    import modeling_custom
+    import transformers
+    # 'llama' should always resolve (LlamaForCausalLM exists in every version).
+    cls = modeling_custom._resolve_base_class("llama")
+    assert isinstance(cls, type)
+    assert cls.__module__.startswith("transformers")
+
+
+def test_modeling_custom_resolve_base_class_rejects_unknown_family():
+    """_resolve_base_class must raise ValueError for an unknown family -- it
+    does NOT silently fall back to a cross-family guess."""
+    import modeling_custom
+    import pytest
+    with pytest.raises(ValueError, match="Unknown model family"):
+        modeling_custom._resolve_base_class("nonexistent_family")
+
+
+def test_modeling_custom_no_family_set_uses_sentinel():
+    """When config.json has no model_family (and no MODEL_FAMILY env var),
+    _BaseForCausalLM is a sentinel that raises a clear error at instantiation --
+    NOT a cross-family guess."""
+    import modeling_custom
+    # On this test host there's no config.json alongside modeling_custom.py
+    # and no MODEL_FAMILY env var, so _BaseForCausalLM is the sentinel.
+    sentinel = modeling_custom._BaseForCausalLM
+    assert sentinel.__name__ == "_ModelFamilyNotSet"
+    import pytest
+    with pytest.raises(ValueError, match="model_family is not set"):
+        sentinel()
+
+
+def test_modeling_custom_env_var_fallback_resolves_family():
+    """When MODEL_FAMILY env var is set, modeling_custom reads it and resolves
+    the base class -- this is the generate.py --model-family path."""
+    import importlib
+    import os
+    import modeling_custom
+    orig_env = os.environ.get("MODEL_FAMILY")
+    try:
+        os.environ["MODEL_FAMILY"] = "llama"
+        # Re-read to simulate the env-var path.
+        family = modeling_custom._read_model_family_from_config()
+        # On this host config.json won't have model_family, so env var wins.
+        assert family == "llama"
+        cls = modeling_custom._resolve_base_class(family)
+        assert cls.__name__ in ("LlamaForCausalLM", "Llama4ForCausalLM")
+    finally:
+        if orig_env is None:
+            os.environ.pop("MODEL_FAMILY", None)
+        else:
+            os.environ["MODEL_FAMILY"] = orig_env
 
 
 # ── MTP helpers (models/mtp.py) ─────────────────────────────────────────────

@@ -84,7 +84,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     Returns a result dict.
     """
     from backends import autodetect_backend, get_backend, BackendDevice
-    from runtime import resolve_dtype
+    from runtime import DTYPE_MAP, resolve_dtype
 
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
@@ -102,7 +102,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
         raise SystemExit("ERROR: no compute device visible — benchmark needs a device.")
 
     dtype_str = resolve_dtype(dev, "bf16")
-    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    torch_dtype = DTYPE_MAP[dtype_str]
 
     log(f"loading model for generation benchmark: {model_path} on {dev}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -199,7 +199,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
                   backend_name: str | None = None):
     """Run the benchmark for each config. Returns a list of result dicts."""
     from backends import autodetect_backend, get_backend, BackendDevice
-    from runtime import resolve_dtype, resolve_flash_attn, resolve_compile
+    from runtime import DTYPE_MAP, resolve_dtype, resolve_flash_attn, resolve_compile
 
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
@@ -222,7 +222,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         log(f"config {i+1}/{len(configs)}: {label}")
 
         dtype_str = resolve_dtype(dev, cfg["dtype"])
-        torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+        torch_dtype = DTYPE_MAP[dtype_str]
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=torch_dtype, trust_remote_code=True

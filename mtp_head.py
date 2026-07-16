@@ -210,6 +210,12 @@ def main():
                     help="Decoder-layer key prefix in the base checkpoint, same "
                          "semantics as expand_model.py --layer-prefix.")
     ap.add_argument("--max-shard-bytes", type=int, default=DEFAULT_MAX_SHARD_BYTES)
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Model architecture family (user-specified, NOT auto-guessed). "
+                         "Written into config.json so modeling_custom.py can select the "
+                         "right base class at load time. One of: gemma, llama, qwen, "
+                         "mistral, phi, falcon, gpt2, gpt_neox, gptj, bloom, mpt, cohere, "
+                         "starcoder2. If config.json already has model_family set, omit this.")
     args = ap.parse_args()
 
     import numpy as np
@@ -318,6 +324,12 @@ def main():
     # lives in, on both nested and flat inputs.
     tc["mtp_depths"] = args.mtp_depths
     tc["mtp_loss_weight"] = args.mtp_loss_weight
+    # Write the user-specified model_family into config so modeling_custom.py
+    # (placed alongside this checkpoint) can read it at load time to select
+    # the right base class. This is the "user says what model" path -- no
+    # auto-guessing. Write through tc (same nested-or-flat logic as mtp fields).
+    if args.model_family:
+        tc["model_family"] = args.model_family
     # auto_map wires AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)
     # to a custom modeling class. REQUIRES modeling_custom.py (defining
     # CustomForCausalLM with MTP modules consuming the keys above) to exist
@@ -325,8 +337,9 @@ def main():
     cfg["auto_map"] = {"AutoModelForCausalLM": "modeling_custom.CustomForCausalLM"}
     with open(os.path.join(args.dst, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
+    family_note = f", model_family={args.model_family}" if args.model_family else ""
     log(f"wrote config.json (mtp_depths={args.mtp_depths}, "
-        f"mtp_loss_weight={args.mtp_loss_weight}, auto_map set)")
+        f"mtp_loss_weight={args.mtp_loss_weight}, auto_map set{family_note})")
     log(f"NOTE: weights + config written. For these to be USED, place a "
         f"modeling_custom.py defining CustomForCausalLM (with MTP modules) "
         f"alongside {args.dst} — this script does not generate that file.")

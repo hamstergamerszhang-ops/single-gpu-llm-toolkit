@@ -33,7 +33,7 @@ class DDPStrategy(DistributedStrategy):
                 "DDP requested but world_size <= 1; use --distributed single instead."
             )
 
-        # Prefer nccl on NVIDIA/ROCm, gloo otherwise.
+        # Prefer nccl on ROCm (the AMD multi-GPU backend), gloo otherwise.
         if self.backend.name == "rocm" and dist.is_nccl_available():
             self._pg_backend = "nccl"
         else:

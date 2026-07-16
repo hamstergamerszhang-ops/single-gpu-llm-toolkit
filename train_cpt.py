@@ -989,6 +989,13 @@ def main():
                                     "for held-out eval (see --eval-every). Or a single "
                                     ".jsonl file (train only, no eval).")
     ap.add_argument("--save", help="Output directory for the trained model.")
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Model architecture family (user-specified, NOT auto-guessed). "
+                         "Required when using MTP (modeling_custom.py reads this from "
+                         "config.json to select the right base class). One of: "
+                         "gemma, llama, qwen, mistral, phi, falcon, gpt2, gpt_neox, "
+                         "gptj, bloom, mpt, cohere, starcoder2. If your checkpoint's "
+                         "config.json already has model_family set, you can omit this.")
     ap.add_argument("--start", type=int, default=0, help="First layer index to unfreeze.")
     ap.add_argument("--end", type=int, default=None,
                     help="Last layer index (exclusive). Default: all layers (full-model "
@@ -1124,7 +1131,51 @@ def main():
                          "'shard-grad-op' (SHARD_GRAD_OP) shards grads+optimizer "
                          "state only -- params stay replicated, less comm overhead, "
                          "more memory. 'no-shard' (NO_SHARD) is equivalent to DDP.")
+
+    # Hardware presets / recipes. A preset (cpu, rx6800-16g, rx7900xtx-24g,
+    # mi300x-80g, mi300x-192g, mi250-64g, ...) sets batch/max_seq_len/accum/
+    # dtype/compile/flash_attn defaults for a device class; a recipe is a
+    # TOML/YAML file of overrides. Both are applied UNDER explicit CLI flags,
+    # so `--batch 8` always wins over the preset's batch. Resolved below,
+    # before the validation checks (so a preset can supply --accum etc.).
+    ap.add_argument("--preset", type=str, default=None,
+                    help="Hardware preset (cpu, rx6800-16g, rx7900xtx-24g, "
+                         "rx7700xt-12g, rx9070xt-16g, mi300x-80g, mi300x-192g, "
+                         "mi250-64g, mi25-16g, apu-2g, ...). Sets batch/max_seq_len/"
+                         "accum/dtype/compile/flash_attn defaults for that device; "
+                         "CLI flags override.")
+    ap.add_argument("--config", type=str, default=None,
+                    help="Path to a TOML/YAML recipe file of overrides (applied "
+                         "under CLI flags, like --preset). Supports `extends = "
+                         "\"other.toml\"` inheritance.")
     args = ap.parse_args()
+
+    # Resolve recipe + preset BEFORE validation: a preset may supply --accum /
+    # --checkpoint-every / --max-seq-len, and those are validated just below.
+    # Merge semantics (matching generate.py): for each recipe/preset key that
+    # corresponds to an argparse dest, only apply it when the CLI value still
+    # equals the argparse default -- i.e. the user did NOT pass that flag
+    # explicitly. This is what makes "CLI overrides preset" work without
+    # tracking which args were explicitly set.
+    if args.preset or args.config:
+        from config import resolve_recipe, apply_preset
+        defaults = {a.dest: a.default for a in ap._actions if hasattr(a, "default")}
+        recipe = resolve_recipe(args.config, base_defaults={})
+        if args.preset:
+            try:
+                recipe = apply_preset(recipe, args.preset)
+            except ValueError as exc:
+                ap.error(str(exc))
+        applied = []
+        for key, value in recipe.items():
+            if hasattr(args, key) and getattr(args, key) == defaults.get(key):
+                setattr(args, key, value)
+                applied.append(f"{key}={value}")
+        if applied:
+            # At this point distributed rank isn't computed yet; rank 0 (or a
+            # single-process run with RANK unset) prints the applied defaults.
+            if os.environ.get("RANK", "0") == "0":
+                print(f"[cpt] preset/recipe applied: {', '.join(applied)}")
 
     # --checkpoint-every of 0 would hit ZeroDivisionError on `it % args.checkpoint_every`
     # in the training loop; validate up front with a clear message.
@@ -1299,6 +1350,15 @@ def main():
     else:
         model = AutoModelForCausalLM.from_pretrained(load_path, **load_kwargs).to(device)
     model.config.use_cache = False  # incompatible with checkpointing/training either way
+    # Write the user-specified model_family into config so it persists across
+    # checkpoint save/resume and so modeling_custom.py (copied alongside
+    # config.json) can read it at load time to select the right base class.
+    # This is the "user says what model" path -- no auto-guessing.
+    if args.model_family:
+        model.config.model_family = args.model_family
+        if is_main:
+            print(f"[cpt] model_family={args.model_family} (written to config.json "
+                  f"so modeling_custom.py selects the right base class)")
     if not args.no_grad_checkpoint:
         # FSDP requires use_reentrant=False for gradient checkpointing (the
         # reentrant variant is incompatible with FSDP's forward hooks and raises

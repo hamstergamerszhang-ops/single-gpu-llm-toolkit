@@ -15,6 +15,24 @@ import torch.nn as nn
 from backends.device import BackendDevice
 
 
+# Single source of truth for the dtype-name -> torch.dtype mapping used by every
+# entrypoint (generate, benchmark, compress_model, tensor_parallel, evaluate,
+# export_onnx). "fp8" maps to bf16 ON PURPOSE: there is no native fp8 storage
+# dtype for weights in PyTorch, so an fp8 run loads the model in bf16 and then
+# quantizes in place (torchao float8_weight_only / convert_to_float8_training).
+# Mapping "fp8" to bf16 here lets the standard DTYPE_MAP[dtype_str] lookup
+# succeed for an fp8 run instead of raising KeyError before the quantize step
+# ever runs -- which is exactly what happened previously on MI300X, where
+# resolve_dtype() legitimately returns "fp8" (the hardware supports it) but the
+# per-call-site dicts only had fp32/fp16/bf16.
+DTYPE_MAP: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp8": torch.bfloat16,
+}
+
+
 def _quietly(probe_fn):
     """Run a probe and swallow exceptions, returning (False, reason)."""
     try:
@@ -40,16 +58,21 @@ def probe_fp8(device: BackendDevice) -> tuple[bool, str]:
 
     # Try a minimal scaled matmul if the op exists.
     if hasattr(torch, "_scaled_mm"):
-        return _quietly(_run_scaled_mm)
+        return _quietly(lambda: _run_scaled_mm(device))
 
     return True, "torchao available; scaled matmul op not present, trusting backend"
 
 
-def _run_scaled_mm() -> tuple[bool, str]:
-    a = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn).cuda()
-    b = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn).cuda().t()
-    scale_a = torch.tensor(1.0, device="cuda")
-    scale_b = torch.tensor(1.0, device="cuda")
+def _run_scaled_mm(device: BackendDevice) -> tuple[bool, str]:
+    # Use the probed device, not a hardcoded "cuda" string: ROCm reports
+    # through the "cuda" namespace but the canonical torch.device string is
+    # built per-backend by BackendDevice.torch_device. Hardcoding .cuda() ran
+    # the fp8 probe on device 0, ignoring --device-index.
+    dev = device.torch_device
+    a = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn, device=dev)
+    b = torch.randint(-128, 127, (16, 16), dtype=torch.float8_e4m3fn, device=dev).t()
+    scale_a = torch.tensor(1.0, device=dev)
+    scale_b = torch.tensor(1.0, device=dev)
     out = torch._scaled_mm(a, b, scale_a, scale_b)
     if torch.isnan(out).any():
         return False, "scaled matmul produced NaN"

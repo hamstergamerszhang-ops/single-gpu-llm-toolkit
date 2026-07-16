@@ -65,7 +65,7 @@ def log(msg: str):
 def detect_gpu_count(backend_name: str | None = None):
     """Detect how many GPUs are available. Returns (count, arch_names).
 
-    Uses the backend abstraction (rocm, cuda, xpu) instead of torch.cuda
+    Uses the backend abstraction (rocm, cpu) instead of torch.cuda
     directly. On CPU-only boxes returns (0, []).
     """
     from backends import autodetect_backend, get_backend
@@ -254,7 +254,7 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
     HF's device_map="auto"), or "single" (force single-GPU even if multiple
     are detected)."""
     from backends import autodetect_backend, get_backend, BackendDevice
-    from runtime import resolve_dtype, resolve_flash_attn
+    from runtime import DTYPE_MAP, resolve_dtype, resolve_flash_attn
 
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
@@ -266,7 +266,7 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     dtype_str = resolve_dtype(BackendDevice(backend=backend), "bf16")
-    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    torch_dtype = DTYPE_MAP[dtype_str]
 
     load_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
     if resolve_flash_attn(BackendDevice(backend=backend), flash_attn):
@@ -305,7 +305,10 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
-        model.to(torch.device(backend.name, 0))
+        # PyTorch has no "rocm" device type -- ROCm exposes devices through the
+        # "cuda" namespace. torch.device("rocm", 0) raises immediately. Use
+        # BackendDevice.torch_device which maps rocm->cuda correctly.
+        model.to(BackendDevice(backend=backend).torch_device)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -319,7 +322,9 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
     report_vram_per_gpu(backend_name)
 
     # Determine the first device (where embed_tokens lives) for input placement.
-    first_device = torch.device(backend.name, 0)
+    # BackendDevice.torch_device maps rocm->cuda (PyTorch has no "rocm" device
+    # type); torch.device("rocm",0) would raise RuntimeError here.
+    first_device = BackendDevice(backend=backend).torch_device
     try:
         embed_device = model.get_input_embeddings().weight.device
         first_device = embed_device

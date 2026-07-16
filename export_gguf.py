@@ -14,13 +14,23 @@ import sys
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", required=True, help="Source checkpoint directory (HF format).")
-    ap.add_argument("--dst", required=True, help="Output GGUF file path.")
+    ap.add_argument("--src", help="Source checkpoint directory (HF format).")
+    ap.add_argument("--dst", help="Output GGUF file path.")
     ap.add_argument("--outtype", default="f16",
                     help="GGUF quantization type (e.g. f16, q4_k_m, q8_0).")
     ap.add_argument("--convert-script",
                     help="Path to llama.cpp convert_hf_to_gguf.py. Auto-detected if not set.")
+    ap.add_argument("--selftest", action="store_true", default=False,
+                    help="Run built-in self-test (no GPU/llama.cpp required).")
     args = ap.parse_args()
+
+    if args.selftest:
+        _self_test()
+        return
+
+    # Validate required args AFTER the --selftest check.
+    if not args.src or not args.dst:
+        ap.error("--src and --dst are required (unless --selftest).")
 
     convert_script = args.convert_script
     if convert_script is None:
@@ -60,6 +70,41 @@ def main():
     print(f"[export_gguf] running: {' '.join(cmd)}")
     subprocess.check_call(cmd)
     print("[export_gguf] done.")
+
+
+def _self_test():
+    """Self-test: verify command construction + convert-script path logic
+    (no GPU, no llama.cpp required)."""
+    print("[selftest] export_gguf: command construction (no GPU/llama.cpp required)")
+
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--src", required=True)
+    ap.add_argument("--dst", required=True)
+    ap.add_argument("--outtype", default="f16")
+    ap.add_argument("--convert-script", default=None)
+    ap.add_argument("--selftest", action="store_true", default=False)
+
+    a = ap.parse_args(["--src", "/tmp/model", "--dst", "/tmp/model.gguf"])
+    assert a.src == "/tmp/model"
+    assert a.dst == "/tmp/model.gguf"
+    assert a.outtype == "f16"
+    print("  OK (positional --src + flags parsed correctly)")
+
+    # Command construction mirrors main(): convert_script takes src as a
+    # positional, --outfile/--outtype as flags.
+    cmd = [sys.executable, "convert_hf_to_gguf.py", a.src,
+           "--outfile", a.dst, "--outtype", a.outtype]
+    assert cmd[2] == "/tmp/model", cmd
+    assert "--outfile" in cmd
+    assert "--outtype" in cmd
+    print("  OK (convert command: src positional, --outfile/--outtype flags)")
+
+    # outtype override.
+    a = ap.parse_args(["--src", "/m", "--dst", "/o.gguf", "--outtype", "q4_k_m"])
+    assert a.outtype == "q4_k_m"
+    print("  OK (outtype override q4_k_m)")
+
+    print("\n[selftest] All checks passed.")
 
 
 if __name__ == "__main__":

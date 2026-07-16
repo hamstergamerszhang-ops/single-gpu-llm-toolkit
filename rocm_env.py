@@ -427,7 +427,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
       you have many small allocations, or higher if you train with very large
       contiguous buffers. Set unconditionally (before GPU detection) because
       the env var must be set before the allocator initializes and is harmless
-      on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF instead).
+      on non-ROCm boxes (non-ROCm torch ignores PYTORCH_HIP_ALLOC_CONF).
 
     Returns a dict describing what happened:
         {'action': 'override'|'no-override'|'force-override'|'skip',
@@ -440,7 +440,7 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
     # Set PYTORCH_HIP_ALLOC_CONF early (before torch import) so the allocator
     # picks it up at init time. Set unconditionally (not gated on GPU detection)
     # because the env var must be set before the allocator initializes and is
-    # harmless on non-ROCm boxes (NVIDIA torch reads PYTORCH_CUDA_ALLOC_CONF).
+    # harmless on non-ROCm boxes (non-ROCm torch ignores PYTORCH_HIP_ALLOC_CONF).
     _set_hip_alloc_conf(hip_alloc_conf, verbose)
 
     if override is not None:

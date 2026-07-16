@@ -25,15 +25,17 @@ real bugs you hit running these on actual hardware.
 ## Before submitting
 
 - Run the self-tests for modules that have them (all CPU-only, no GPU needed).
-  Note: `prune_vocab.py`, `prune_embeddings_torch.py`, and `expand_model.py`
-  are transformation tools that need real checkpoints, so they have no
-  `--selftest` — their logic is covered by the pytest suite instead.
+  Note: `prune_vocab.py`, `prune_embeddings_torch.py`, `expand_model.py`, and
+  `export_safetensors.py` are transformation tools that need real checkpoints,
+  so they have no `--selftest` — their logic is covered by the pytest suite
+  instead.
   ```
   for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
            local_cache_stream.py optimizer_compat_guard.py \
            rocm_env.py mtp_head.py train_sft.py \
            preprocess_data.py benchmark.py generate.py \
-           compress_model.py tensor_parallel.py smart_hipify.py; do
+           compress_model.py tensor_parallel.py smart_hipify.py \
+           evaluate.py export_gguf.py export_onnx.py; do
     python3 "$f" --selftest || { echo "FAILED: $f"; exit 1; }
   done
   ```

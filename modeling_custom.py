@@ -16,15 +16,23 @@ It implements:
   * Best-effort KV-cache support for inference: each MTP depth maintains its
     own `past_key_value` entry when `use_cache=True`.
 
-The base class is selected from the installed transformers library by trying
-common CausalLM classes in order. Extend the chain if your model family is not
-listed.
+BASE CLASS SELECTION: the user specifies the model family explicitly via
+`--model-family <name>` at train time (train_cpt.py) or MTP-add time
+(mtp_head.py). That family name is written into config.json as
+`model_family`. At load time, this file reads `model_family` from the
+config.json sitting alongside it (they're in the same checkpoint directory)
+and selects the matching CausalLM base class. This is NOT auto-guessing --
+the user told us which family, and we only try classes within that family
+(in version order, since the exact class name depends on the transformers
+version installed).
 """
 
 from __future__ import annotations
 
 import copy
 import inspect
+import json
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -33,21 +41,128 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Base class selection. Try the common transformers CausalLM classes in turn.
+# Model family -> CausalLM class chain.
+#
+# Each family maps to a list of candidate class names, most specific first
+# (e.g. Gemma4 before Gemma3 before Gemma2). We try them in order BECAUSE the
+# exact class name depends on the transformers version installed -- Gemma4ForCausalLM
+# only exists in transformers 5.5+, so on an older install we fall back to
+# Gemma3ForCausalLM, etc. This is version resolution WITHIN the user-specified
+# family, not cross-family guessing.
+#
+# To add a new model family: add an entry here and pass --model-family <name>.
 # ---------------------------------------------------------------------------
-try:
-    from transformers import Gemma3ForCausalLM as _BaseForCausalLM
-except ImportError:
-    try:
-        from transformers import Gemma2ForCausalLM as _BaseForCausalLM
-    except ImportError:
+_FAMILY_CLASS_CHAINS: dict[str, list[str]] = {
+    "gemma":    ["Gemma4ForCausalLM", "Gemma3ForCausalLM", "Gemma2ForCausalLM", "GemmaForCausalLM"],
+    "llama":    ["Llama4ForCausalLM", "LlamaForCausalLM"],
+    "qwen":     ["Qwen3ForCausalLM", "Qwen2ForCausalLM"],
+    "mistral":  ["MistralForCausalLM"],
+    "phi3":     ["Phi4ForCausalLM", "Phi3ForCausalLM"],
+    "phi":      ["Phi4ForCausalLM", "Phi3ForCausalLM"],  # alias for phi3
+    "falcon":   ["FalconForCausalLM"],
+    "gpt2":     ["GPT2LMHeadModel"],
+    "gpt_neox": ["GPTNeoXForCausalLM"],
+    "gptj":     ["GPTJForCausalLM"],
+    "bloom":    ["BloomForCausalLM"],
+    "mpt":      ["MPTForCausalLM"],
+    "cohere":   ["CohereForCausalLM"],
+    "starcoder2": ["Starcoder2ForCausalLM"],
+}
+
+
+def _read_model_family_from_config() -> str | None:
+    """Read `model_family` from the config.json sitting alongside this file.
+
+    modeling_custom.py is copied alongside config.json by train_cpt.py's
+    checkpoint save. When HF loads via trust_remote_code=True, this file and
+    config.json are in the same directory, so we can read model_family here
+    at import time to select the right base class -- no guessing.
+
+    Also checks nested `text_config.model_family` (Gemma-4 / multimodal layouts
+    where the text config is one level down).
+    """
+    # Try the directory this file lives in.
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    for config_path in (
+        os.path.join(this_dir, "config.json"),
+    ):
+        if not os.path.exists(config_path):
+            continue
         try:
-            from transformers import Qwen2ForCausalLM as _BaseForCausalLM
-        except ImportError:
-            try:
-                from transformers import Phi3ForCausalLM as _BaseForCausalLM
-            except ImportError:
-                from transformers import LlamaForCausalLM as _BaseForCausalLM
+            with open(config_path) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Check top-level first, then nested text_config (Gemma-4 layout).
+        family = cfg.get("model_family")
+        if family:
+            return family
+        tc = cfg.get("text_config")
+        if isinstance(tc, dict):
+            family = tc.get("model_family")
+            if family:
+                return family
+    # Fallback: environment variable (for cases where config.json isn't
+    # readable at import time, e.g. HF Hub cached code without the config).
+    return os.environ.get("MODEL_FAMILY")
+
+
+def _resolve_base_class(family: str):
+    """Resolve the CausalLM base class for a user-specified model family.
+
+    Tries the family's class chain in order (most specific first) since the
+    exact class name depends on the transformers version. This is NOT guessing
+    across families -- the user explicitly specified which family, and we only
+    try classes within that family.
+    """
+    import transformers
+
+    if family not in _FAMILY_CLASS_CHAINS:
+        raise ValueError(
+            f"Unknown model family '{family}'. "
+            f"Supported families: {', '.join(sorted(_FAMILY_CLASS_CHAINS))}. "
+            f"Pass --model-family <name> at train time."
+        )
+    chain = _FAMILY_CLASS_CHAINS[family]
+    for cls_name in chain:
+        cls = getattr(transformers, cls_name, None)
+        if cls is not None:
+            return cls
+    raise ImportError(
+        f"No CausalLM class for family '{family}' found in transformers "
+        f"{transformers.__version__}. Tried: {chain}. Install a transformers "
+        f"version that has one of these classes, or pick a different --model-family."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resolve the base class at import time from the user-specified model_family
+# in config.json. If model_family is not set, we CANNOT guess -- error clearly
+# telling the user to pass --model-family.
+# ---------------------------------------------------------------------------
+_model_family = _read_model_family_from_config()
+if _model_family is not None:
+    _BaseForCausalLM = _resolve_base_class(_model_family)
+else:
+    # No model_family in config. We deliberately do NOT fall back to a
+    # cross-family guess (the old behavior tried Gemma -> Qwen -> Phi -> Llama,
+    # which could silently pick the wrong architecture and corrupt training).
+    # Instead, raise a clear error. The user must pass --model-family.
+    #
+    # We can't raise at import time because HF imports this module before
+    # the user sees any output. Instead, set _BaseForCausalLM to a sentinel
+    # that raises a clear error when CustomForCausalLM is instantiated.
+    class _ModelFamilyNotSet:
+        """Sentinel base class that raises a clear error at instantiation."""
+        def __init__(self, *args, **kwargs):
+            raise ValueError(
+                "config.model_family is not set. This file (modeling_custom.py) "
+                "was loaded via trust_remote_code but the checkpoint's config.json "
+                "does not contain a 'model_family' field. Pass --model-family <name> "
+                "when training (e.g. --model-family gemma) so the base class is "
+                f"known. Supported families: {', '.join(sorted(_FAMILY_CLASS_CHAINS))}."
+            )
+    _BaseForCausalLM = _ModelFamilyNotSet
 
 
 # ---------------------------------------------------------------------------

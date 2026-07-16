@@ -40,7 +40,7 @@ QUANT_OPTIONS = {
         "import_name": "float8_weight_only",
         "size_reduction": "~2x",
         "quality": "negligible loss",
-        "hardware": "best on GPUs with native fp8 (MI300X/H100)",
+        "hardware": "best on AMD CDNA3+ (MI300X/MI300A/MI325X/MI350)",
     },
 }
 
@@ -139,14 +139,14 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from backends import BackendDevice
-    from runtime import resolve_dtype
+    from runtime import DTYPE_MAP, resolve_dtype
 
     dev = BackendDevice(backend=args.backend, index=args.device_index)
     if not dev.backend.is_available():
         raise SystemExit(f"ERROR: backend {dev.name} is not available.")
 
     dtype_str = resolve_dtype(dev, model_info["dtype"].replace("bfloat16", "bf16").replace("float16", "fp16").replace("float32", "fp32"))
-    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    torch_dtype = DTYPE_MAP[dtype_str]
 
     log(f"loading model from {args.src} on {dev} (dtype={dtype_str}) ...")
     model = AutoModelForCausalLM.from_pretrained(

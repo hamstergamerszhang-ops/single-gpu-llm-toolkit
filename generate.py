@@ -89,10 +89,10 @@ def _load_model_and_tokenizer(args, dev):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from runtime import resolve_dtype, resolve_compile, resolve_flash_attn
+    from runtime import DTYPE_MAP, resolve_dtype, resolve_compile, resolve_flash_attn
 
     dtype_str = resolve_dtype(dev, args.dtype)
-    torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    torch_dtype = DTYPE_MAP[dtype_str]
 
     log(f"loading model from {args.model} on {dev} (dtype={dtype_str}) ...")
     load_kwargs = {"torch_dtype": torch_dtype, "trust_remote_code": True}
@@ -136,6 +136,14 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--model", required=True)
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Model architecture family (user-specified, NOT auto-guessed). "
+                         "If the checkpoint's config.json already has model_family set "
+                         "(written by train_cpt.py --model-family or mtp_head.py "
+                         "--model-family), omit this. Otherwise pass it so "
+                         "modeling_custom.py can select the right base class. One of: "
+                         "gemma, llama, qwen, mistral, phi, falcon, gpt2, gpt_neox, "
+                         "gptj, bloom, mpt, cohere, starcoder2.")
     ap.add_argument("--input", type=str, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -166,7 +174,8 @@ def main():
     ap.add_argument("--config", type=str, default=None,
                     help="Path to a TOML/YAML recipe file.")
     ap.add_argument("--preset", type=str, default=None,
-                    help="Hardware preset (cpu, mps, mi300x-80g, a100-80g, ...).")
+                    help="Hardware preset (cpu, rx6800-16g, rx7900xtx-24g, "
+                         "rx9070xt-16g, mi300x-80g, mi300x-192g, mi250-64g, ...).")
 
     args = ap.parse_args()
 
@@ -195,6 +204,14 @@ def main():
         from rocm_env import setup_rocm_env
         hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
         setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+
+    # If the user specified --model-family, set the MODEL_FAMILY env var so
+    # modeling_custom.py (loaded via trust_remote_code) picks it up. This is
+    # the fallback path for checkpoints whose config.json doesn't already have
+    # model_family set (e.g. loaded a base model directly for inference).
+    if args.model_family:
+        os.environ["MODEL_FAMILY"] = args.model_family
+        log(f"model_family={args.model_family} (set via env for modeling_custom.py)")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer

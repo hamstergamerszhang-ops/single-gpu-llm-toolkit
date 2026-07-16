@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "single-gpu-llm-toolkit"
+version = "1.0.0"
+description = "AMD ROCm single-GPU LLM training/inference toolkit: CPT, SFT, MTP, quantization, tensor-parallel inference."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+authors = [
+    {name = "mymaccrashed12times"},
+]
+keywords = ["amd", "rocm", "llm", "training", "finetuning", "gemma", "mtp", "fp8", "mi300x"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: AMD ROCm",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "safetensors>=0.4.0",
+    "numpy>=1.24.0",
+    "transformers==5.7.0",
+]
+
+[project.optional-dependencies]
+# torch is NOT a hard dep -- the ROCm build must come from AMD's index, not PyPI.
+# Install torch first (https://pytorch.org/get-started/locally/ -> ROCm), then:
+#   pip install -e ".[all]"
+train = [
+    "bitsandbytes>=0.43.0",
+    "tensorboard>=2.14.0",
+]
+infer = [
+    "flash-attn>=2.5.0",
+    "torchao>=0.5.0",
+]
+serve = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+all = [
+    "bitsandbytes>=0.43.0",
+    "tensorboard>=2.14.0",
+    "flash-attn>=2.5.0",
+    "torchao>=0.5.0",
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit"
+Repository = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit"
+Issues = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit/issues"
+
+[tool.setuptools]
+# The toolkit is a flat collection of CLI scripts + 5 subpackages. We package
+# the subpackages (backends, runtime, config, distributed, models) so they're
+# importable after `pip install -e .`; the top-level *.py scripts stay as
+# directly-invoked entrypoints (not installed as console_scripts, because the
+# repo's convention is `python3 train_cpt.py ...`).
+packages = ["backends", "runtime", "config", "distributed", "models"]
+py-modules = [
+    "train_cpt", "train_sft", "generate", "benchmark", "evaluate",
+    "compress_model", "tensor_parallel", "expand_model", "mtp_head",
+    "modeling_custom", "rocm_env", "async_checkpoint", "bnb_optimizer",
+    "local_cache_stream", "optimizer_compat_guard", "preprocess_data",
+    "smart_hipify", "prune_vocab", "prune_embeddings_torch",
+    "export_gguf", "export_onnx", "export_safetensors",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep the lint set small and focused: real bugs, not style nits.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line length handled by line-length above
