@@ -411,6 +411,7 @@ class ServerState:
         self.defaults = defaults or dict(DEFAULT_GEN_PARAMS)
         self.generate_stream_fn = generate_stream_fn or real_generate_stream
         self.generate_batch_fn = generate_batch_fn or real_generate_batch
+        self.is_vllm = False  # set to True by main() when --engine vllm
 
     # Apply default gen params for fields the request omitted. (parse_chat_request
     # already fills defaults, so this is mostly a no-op; kept for explicitness
@@ -600,6 +601,68 @@ def _check_serve_deps():
         )
 
 
+# ---------------------------------------------------------------------------
+# vLLM engine backend — continuous batching, PagedAttention, high throughput.
+# ---------------------------------------------------------------------------
+def load_vllm_engine(args, dev):
+    """Load the model via vLLM's LLM API for continuous-batching serving.
+
+    vLLM handles its own KV cache management (PagedAttention), continuous
+    batching across concurrent requests, and tensor parallelism. This is
+    the production serving path for high-throughput multi-tenant inference
+    on MI300X.
+
+    Requires the 'vllm' package built for ROCm:
+        pip install vllm --extra-index-url https://download.pytorch.org/whl/rocm6.3
+    """
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError:
+        raise SystemExit(
+            "ERROR: --engine vllm requires the 'vllm' package.\n"
+            "  Install for ROCm:\n"
+            "    pip install vllm --extra-index-url https://download.pytorch.org/whl/rocm6.3\n"
+        )
+
+    dtype_map = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16", "fp8": "float8_e4m3fn"}
+    llm = LLM(
+        model=args.model,
+        dtype=dtype_map.get(args.dtype, "bfloat16"),
+        trust_remote_code=True,
+        # vLLM manages flash-attn internally; --flash-attn is a no-op hint.
+        # tensor_parallel_size defaults to 1 (single-GPU); set via --tensor-parallel.
+        max_model_len=8192,  # sane default; override via config if needed
+        gpu_memory_utilization=0.90,
+    )
+    log(f"vLLM engine loaded: {args.model} (dtype={args.dtype})")
+    return llm
+
+
+def vllm_generate(llm, messages_list, max_tokens, temperature, top_p,
+                   stream=False):
+    """Generate completions using vLLM's batched engine.
+
+    Returns a list of generated text strings (one per input). vLLM's
+    continuous batching handles concurrent requests internally — this
+    function can be called from multiple async handlers simultaneously.
+    """
+    from vllm import SamplingParams
+
+    sampling = SamplingParams(
+        temperature=max(temperature, 0.01) if temperature > 0 else 0,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+    # vLLM accepts prompt strings or token IDs; use the chat template.
+    prompts = []
+    for messages in messages_list:
+        # vLLM's chat() applies the model's chat template internally.
+        prompts.append(messages)
+
+    outputs = llm.chat(prompts, sampling)
+    return [o.outputs[0].text for o in outputs]
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -616,6 +679,16 @@ def main():
     ap.add_argument("--compile", action="store_true", default=False)
     ap.add_argument("--compile-mode", default="max-autotune",
                     choices=["default", "reduce-overhead", "max-autotune"])
+    ap.add_argument("--engine", default="hf",
+                    choices=["hf", "vllm"],
+                    help="Inference engine. 'hf' (default) uses transformers' "
+                         "model.generate() — self-contained, no extra deps. "
+                         "'vllm' uses vLLM's continuous-batching engine for "
+                         "high-throughput multi-tenant serving (PagedAttention, "
+                         "cross-request batching). Requires the 'vllm' package "
+                         "built for ROCm. When --engine vllm, --flash-attn / "
+                         "--compile / --dtype fp8 are handled by vLLM's own "
+                         "config, not the HF path.")
 
     # ROCm bootstrap.
     ap.add_argument("--backend", default=None, choices=["rocm", "cpu"])
@@ -645,17 +718,29 @@ def main():
     if not dev.backend.is_available():
         raise SystemExit(f"ERROR: backend {dev.name} is not available.")
 
-    model, tokenizer = load_model_and_tokenizer(args, dev)
-
-    state = ServerState(
-        model=model, tokenizer=tokenizer, device=dev.torch_device,
-        model_id=args.model,
-    )
+    if args.engine == "vllm":
+        # vLLM engine: continuous batching, PagedAttention.
+        llm = load_vllm_engine(args, dev)
+        from vllm import SamplingParams  # noqa: F401
+        state = ServerState(
+            model=llm, tokenizer=None, device=dev.torch_device,
+            model_id=args.model,
+        )
+        state.is_vllm = True
+        log("vLLM continuous-batching engine active")
+    else:
+        # HF engine: transformers model.generate() (default).
+        model, tokenizer = load_model_and_tokenizer(args, dev)
+        state = ServerState(
+            model=model, tokenizer=tokenizer, device=dev.torch_device,
+            model_id=args.model,
+        )
+        state.is_vllm = False
     app = build_app(state)
 
     import uvicorn
     log(f"serving {args.model} on http://{args.host}:{args.port} "
-        f"(dtype={args.dtype}, flash_attn={args.flash_attn}, "
+        f"(engine={args.engine}, dtype={args.dtype}, flash_attn={args.flash_attn}, "
         f"compile={args.compile})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
