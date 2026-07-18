@@ -259,8 +259,7 @@ def run_tensor_parallel(model_path: str, num_gpus: int, archs: list,
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
-        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -352,7 +351,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True,garbage_collection_threshold:0.6",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
     ap.add_argument("--device-map", type=str, default="auto",
                     choices=["explicit", "auto", "single"],
@@ -383,8 +382,7 @@ def main():
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
 
     # Detect GPUs via the backend abstraction.
     num_gpus, archs = detect_gpu_count(backend_name=args.backend)

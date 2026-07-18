@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--quant", type=str, default="int4",
                     choices=list(QUANT_OPTIONS.keys()))
     ap.add_argument("--gfx-override", type=str, default=None)
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True")
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True,garbage_collection_threshold:0.6")
     ap.add_argument("--backend", type=str, default=None,
                     choices=["rocm", "cpu"],
                     help="Compute backend to use (auto-detected if unset).")
@@ -132,8 +132,7 @@ def main():
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer

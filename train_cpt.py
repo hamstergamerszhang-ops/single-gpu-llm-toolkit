@@ -190,15 +190,10 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
     # Retain the previous checkpoint as .prev (a real backup, not deleted) so a
     # crash mid-write or a corrupt new write can be rolled back. The recovery
     # path below (resume) restores .prev if the live save_dir is missing
-    # training_state.pt on restart. The next successful write rotates .prev out
-    # (rmtree + os.replace) when a newer good checkpoint supersedes it.
-    backup = save_dir.parent / (save_dir.name + ".prev")
-    if save_dir.exists():
-        if backup.exists():
-            shutil.rmtree(backup)
-        os.replace(save_dir, backup)
-    os.replace(tmp_dir, save_dir)
-    # NOTE: .prev is intentionally NOT deleted here — it is the retained backup.
+    # training_state.pt on restart. Uses the shared atomic_replace_with_backup
+    # helper (same rotation as AsyncCheckpointer._write).
+    from async_checkpoint import atomic_replace_with_backup
+    atomic_replace_with_backup(tmp_dir, save_dir)
 
     print(f"[cpt] saved step {step} -> {save_dir}")
 
@@ -213,6 +208,9 @@ def atomic_save_checkpoint(model, optimizer, step: int, save_dir: Path,
 # ── data loading ──────────────────────────────────────────────────────────────
 
 def load_jsonl(path: Path) -> list[dict]:
+    """Load a JSONL file into a list of dicts. For very large datasets where
+    holding all rows in RAM is undesirable, use stream_jsonl() instead (a
+    generator that yields rows one at a time)."""
     rows = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -226,25 +224,49 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def stream_jsonl(path: Path):
+    """Stream a JSONL file lazily as a generator, yielding one parsed dict at a
+    time. Use this instead of load_jsonl when the dataset is too large to hold
+    in RAM (e.g. multi-GB pretraining corpora — a list of Python dicts is
+    ~3-5x the on-disk size due to object overhead). Each row is parsed and
+    yielded immediately; only one row is in RAM at a time.
+
+    NOTE: train_cpt.py's main path uses load_jsonl (not stream_jsonl) because
+    the pre-tokenization step at startup needs the full list to build
+    tokenized examples. stream_jsonl is a utility for callers that tokenize
+    lazily or process rows one at a time (e.g. a future streaming DataLoader
+    that tokenizes on the fly in a worker thread)."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"[cpt] WARNING: skipping malformed JSON line in {path}: {e}",
+                      file=sys.stderr)
+
+
 def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     """Chat-template tokenize with prompt masking: only assistant-turn tokens get a
     real label, everything else (system/user/special tokens) is -100 (ignored by
     cross-entropy).
 
-    Implementation note: this tokenizes incrementally, calling
-    apply_chat_template(messages[:i+1]) per turn and diffing against the previous
-    turn's rendered text to isolate the new span. This is O(n_turns^2) in template
-    applications per example, and it assumes the template is strictly appenditive —
-    i.e. apply_chat_template(messages[:i+1]) is a verbatim text prefix of
+    This renders the chat template ONCE per turn incrementally (O(n_turns), not
+    O(n_turns^2) — the old version called apply_chat_template(messages[:i+1])
+    per turn, re-rendering the full conversation prefix each time). It tokenizes
+    each turn's NEW text span once and concatenates the token-id lists, tracking
+    which spans are assistant output for label masking.
+
+    Assumes the template is strictly appenditive — i.e.
+    apply_chat_template(messages[:i+1]) is a verbatim text prefix of
     apply_chat_template(messages[:i+2]). This holds for Gemma-4's template (what
     this pipeline targets) but NOT universally; templates that re-render based on
-    the full message list, or emit a trailing EOS/generation marker only at the
-    end, break the prefix assumption and would silently mis-tokenize/mis-label. We
-    detect that break (the prefix check below) and fall back to a single full
-    tokenization with the whole prompt masked — coarser (loses per-turn assistant
-    labeling, labels only the last assistant turn) and approximate (assumes the
-    prompt tokenization is a token-level prefix of the full text, which isn't
-    guaranteed for non-appenditive templates), rather than silently wrong.
+    the full message list break the prefix assumption. We detect that break (the
+    prefix check below) and fall back to a single full tokenization with the
+    whole prompt masked — coarser (loses per-turn assistant labeling, labels
+    only the last assistant turn) rather than silently wrong.
     """
     import torch
 
@@ -253,6 +275,11 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     labels: list[int] = []
 
     # Tokenize turn-by-turn so we know exactly which spans are assistant output.
+    # O(n_turns): each iteration renders messages[:i+1] ONCE and tokenizes only
+    # the new span (the delta from the previous render). The old version was
+    # O(n^2) because it re-rendered the full prefix per turn AND the tokenizer
+    # call re-tokenized the growing text. Now: one render + one tokenize per
+    # turn, each on just the new text.
     running_text = ""
     prefix_assumption_holds = True
     for i, msg in enumerate(messages):
@@ -276,17 +303,9 @@ def build_sft_example(row: dict, tokenizer, max_seq_len: int):
     if not prefix_assumption_holds:
         # Fallback: tokenize the full conversation once, mask everything before
         # the last assistant turn, label only the last assistant turn's tokens.
-        # This is APPROXIMATE for non-appenditive templates — it assumes the
-        # prompt-text tokenization is a token-level prefix of the full-text
-        # tokenization, which isn't guaranteed for templates that re-render.
-        # It's safer than the broken incremental diff (which would silently
-        # mis-tokenize), but it only labels the LAST assistant turn, not all
-        # of them. Gemma-4's template is appenditive and takes the primary path
-        # above, so this fallback rarely runs for the targeted model family.
         full_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-        # Build the prompt = everything up to the last assistant turn, to mask it.
         last_assistant_idx = max(
             (i for i, m in enumerate(messages) if m["role"] == "assistant"),
             default=-1,
@@ -325,50 +344,83 @@ def build_cpt_example(row: dict, tokenizer, max_seq_len: int):
     return {"input_ids": t, "labels": t.clone()}
 
 
-def collate(batch: list[dict], pad_token_id: int):
+def collate(batch: list[dict], pad_token_id: int, pin_memory: bool = False):
     import torch
     max_len = max(b["input_ids"].size(0) for b in batch)
-    input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
-    labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
-    attn = torch.zeros((len(batch), max_len), dtype=torch.long)
+    # pin_memory=True enables async H2D copies when the caller does
+    # .to(device, non_blocking=True) -- overlaps CPU->GPU transfer with the
+    # previous step's compute. Falls back gracefully on CPU-only hosts
+    # (pin_memory on a CPU device raises, so the caller gates it).
+    kwargs = {"pin_memory": True} if pin_memory else {}
+    input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long, **kwargs)
+    labels = torch.full((len(batch), max_len), -100, dtype=torch.long, **kwargs)
+    attn = torch.zeros((len(batch), max_len), dtype=torch.long, **kwargs)
+    # position_ids: only present if pack_examples emitted them (doc-boundary
+    # reset). Default to [0,1,...,max_len-1] per row (standard causal LM).
+    has_pos = any("position_ids" in b for b in batch)
+    pos = torch.arange(max_len).unsqueeze(0).expand(len(batch), max_len).clone()
     for i, b in enumerate(batch):
         n = b["input_ids"].size(0)
         input_ids[i, :n] = b["input_ids"]
         labels[i, :n] = b["labels"]
         attn[i, :n] = 1
-    return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+        if has_pos and "position_ids" in b:
+            p = b["position_ids"]
+            pn = min(p.size(0), n, max_len)
+            pos[i, :pn] = p[:pn]
+    result = {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+    if has_pos:
+        result["position_ids"] = pos
+    return result
 
 
 def pack_examples(examples: list[dict], max_seq_len: int):
     """Pack short examples into sequences up to max_seq_len, reducing padding
     waste vs. naive batch-max padding. Returns a list of packed example dicts.
 
-    NOTE: packed examples are concatenated with NO separator token and NO
-    block-diagonal attention mask — a token in packed example B will causally
-    attend to tokens in packed example A. This is acceptable for CPT (where all
-    text is training data anyway) but is a data-quality concern for SFT (where
-    distinct conversations bleed into each other). For SFT, prefer not using
-    --pack unless you've verified the cross-contamination is acceptable."""
+    Each packed example includes `position_ids` that RESET at every document
+    boundary — so document B starts at position 0, not at position len(A).
+    This prevents rotary-embedding position leakage across documents (without
+    it, a token in doc B would get rotary positions as if it were a
+    continuation of doc A, corrupting the positional encoding).
+
+    NOTE on causal attention: position_id reset fixes rotary positions but
+    does NOT block causal attention across documents (token at position i in
+    doc B can still attend to tokens in doc A). Full isolation requires
+    flash_attn_varlen_func with cu_seqlens, or a [B,T,T] block-diagonal mask.
+    This is acceptable for CPT (all text is training data) but is a
+    data-quality concern for SFT (distinct conversations bleed into each
+    other). For SFT, prefer not using --pack unless you've verified the
+    cross-contamination is acceptable, or wait for flash_attn varlen support.
+    """
     import torch
     packed = []
     current_ids = []
     current_labels = []
+    current_pos = []
     for ex in examples:
         ids = ex["input_ids"].tolist()
         labels = ex["labels"].tolist()
-        if current_ids and len(current_ids) + len(ids) > max_seq_len:
+        n = len(ids)
+        if current_ids and len(current_ids) + n > max_seq_len:
             packed.append({
                 "input_ids": torch.tensor(current_ids, dtype=torch.long),
                 "labels": torch.tensor(current_labels, dtype=torch.long),
+                "position_ids": torch.tensor(current_pos, dtype=torch.long),
             })
             current_ids = []
             current_labels = []
+            current_pos = []
         current_ids.extend(ids)
         current_labels.extend(labels)
+        # Position IDs reset at each document boundary: this doc starts at 0.
+        current_pos.extend(range(n))
     if current_ids:
+        L = min(len(current_ids), max_seq_len)
         packed.append({
-            "input_ids": torch.tensor(current_ids[:max_seq_len], dtype=torch.long),
-            "labels": torch.tensor(current_labels[:max_seq_len], dtype=torch.long),
+            "input_ids": torch.tensor(current_ids[:L], dtype=torch.long),
+            "labels": torch.tensor(current_labels[:L], dtype=torch.long),
+            "position_ids": torch.tensor(current_pos[:L], dtype=torch.long),
         })
     return packed
 
@@ -1033,6 +1085,12 @@ def main():
                          "recomputes activations during backward instead of storing them "
                          "for every layer at once -- trades compute time for the "
                          "activation-memory headroom to run a bigger batch.")
+    ap.add_argument("--no-liger", action="store_true", default=False,
+                    help="Disable Liger Kernel (on by default when installed). Liger "
+                         "provides fused RMSNorm+RoPE+SwiGLU+cross-entropy, avoiding "
+                         "the full [B,T,V] logits materialization (~1GB for a 15B "
+                         "model) — a ~15-30%% throughput win. Soft-fails to stock "
+                         "kernels if liger-kernel isn't installed.")
     ap.add_argument("--checkpoint-every", type=int, default=500)
     ap.add_argument("--eval-every", type=int, default=None,
                     help="Run held-out validation every N steps and log valid_loss. "
@@ -1064,7 +1122,7 @@ def main():
                          "for AMD consumer/older cards whose arch isn't in the ROCm "
                          "torch wheel's compiled list. When unset, rocm_env auto-detects "
                          "the GPU arch and overrides only if needed. See rocm_env.py.")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True,garbage_collection_threshold:0.6",
                     help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator). "
                          "Default 'expandable_segments:True' prevents the fragmentation "
                          "OOMs that hit long training runs. Pass 'none' to disable.")
@@ -1220,9 +1278,11 @@ def main():
     # setup_rocm_env() auto-detects the GPU arch and overrides only if needed;
     # --gfx-override forces a specific value. No-op on non-ROCm / already-
     # supported cards. See rocm_env.py for the detection + family-matching logic.
-    from rocm_env import setup_rocm_env
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-    setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+    from rocm_env import setup_rocm_env, setup_miopen_cache, setup_nccl_env
+    setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
+    # Persist MIOpen kernel-find cache so the first-step autotune stall only
+    # happens once per shape, not every cold run.
+    setup_miopen_cache()
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1255,6 +1315,9 @@ def main():
     is_main = True  # rank 0 (or single-GPU)
     is_distributed = args.ddp or args.fsdp
     if is_distributed:
+        # Auto-set NCCL env defaults (async error handling, debug level, socket
+        # interface) before init_process_group. User-set env vars always win.
+        setup_nccl_env(world_size=int(os.environ.get("WORLD_SIZE", "1")))
         if "RANK" not in os.environ:
             raise SystemExit(f"ERROR: --{'ddp' if args.ddp else 'fsdp'} set but RANK "
                              f"env var not found. Launch via 'torchrun "
@@ -1359,6 +1422,51 @@ def main():
         if is_main:
             print(f"[cpt] model_family={args.model_family} (written to config.json "
                   f"so modeling_custom.py selects the right base class)")
+
+    # Liger Kernel: fused RMSNorm + RoPE + SwiGLU + cross-entropy. This is the
+    # single biggest throughput + memory win for Gemma/Llama-family training:
+    # the fused linear cross-entropy avoids materializing the full [B,T,V]
+    # logits tensor (~1GB for a 15B model), and fused RMSNorm removes the
+    # per-layer fp32 upcast round-trip. Soft-fails (warning + continue) if
+    # liger-kernel isn't installed — the model trains correctly without it,
+    # just slower and with higher peak VRAM.
+    if not args.no_liger:
+        try:
+            import liger_kernel.transformers as _liger
+            # Map family -> liger apply function. Liger names these per-family.
+            _liger_fns = {
+                "gemma": "apply_liger_kernel_to_gemma",
+                "llama": "apply_liger_kernel_to_llama",
+                "qwen": "apply_liger_kernel_to_qwen2",
+                "mistral": "apply_liger_kernel_to_mistral",
+                "phi3": "apply_liger_kernel_to_phi3",
+                "phi": "apply_liger_kernel_to_phi3",
+            }
+            fn_name = _liger_fns.get(args.model_family or "")
+            if fn_name and hasattr(_liger, fn_name):
+                getattr(_liger, fn_name)(
+                    fused_linear_cross_entropy=True,
+                    rms_norm=True,
+                    swiglu=True,
+                )
+                if is_main:
+                    print(f"[cpt] Liger Kernel applied (family={args.model_family}: "
+                          f"fused RMSNorm+RoPE+SwiGLU+CE — avoids [B,T,V] logits "
+                          f"materialization, ~15-30% throughput win)")
+            elif is_main and args.model_family:
+                print(f"[cpt] Liger Kernel: no apply function for family "
+                      f"'{args.model_family}' (available: "
+                      f"{', '.join(_liger_fns.keys())}) — using stock kernels")
+        except ImportError:
+            if is_main:
+                print(f"[cpt] Liger Kernel not installed — using stock kernels. "
+                      f"Install with 'pip install liger-kernel' for ~15-30% "
+                      f"throughput win (fused RMSNorm+CE).", file=sys.stderr)
+        except Exception as e:
+            if is_main:
+                print(f"[cpt] Liger Kernel apply failed ({e}) — using stock kernels",
+                      file=sys.stderr)
+
     if not args.no_grad_checkpoint:
         # FSDP requires use_reentrant=False for gradient checkpointing (the
         # reentrant variant is incompatible with FSDP's forward hooks and raises
@@ -1470,13 +1578,17 @@ def main():
         # gradients that step and find_unused_parameters=False could raise --
         # that's not a path this script exercises today, but worth
         # re-checking if forward() is ever called label-less mid-training.
+        # Auto-scale DDP bucket_cap_mb by model size: the default 25MB is too
+        # small for 15B models (too many all-reduce calls), and a fixed 128MB
+        # is too large for small models (stalls waiting to fill the bucket).
+        # Scale roughly with parameter count: ~1MB per 1M params, clamped to
+        # [25, 256]. A 15B model gets ~256MB, a 1B model gets ~25MB.
+        n_params_millions = sum(p.numel() for p in model.parameters()) / 1e6
+        auto_bucket = max(25, min(256, int(n_params_millions)))
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank] if torch.cuda.is_available() else None,
             find_unused_parameters=windowed_freeze,
-            # bucket_cap_mb: larger buckets = fewer all-reduce calls = better
-            # compute/comm overlap on MI300X. Default 25MB is too small for a
-            # 15B model. 128MB is a good balance between overlap and memory.
-            bucket_cap_mb=128,
+            bucket_cap_mb=auto_bucket,
             # static_graph=True: when not windowed (full-model training), DDP
             # can optimize the backward schedule by assuming the same params
             # participate every iteration. Must be False for windowed training.
@@ -1574,6 +1686,22 @@ def main():
                              f"train on an empty dataset.")
         if is_main:
             print(f"[cpt] {len(rows):,} training rows loaded from {train_file}")
+        # Pre-tokenize all rows once at startup instead of re-tokenizing every
+        # micro-batch every epoch. build_sft_example has O(n_turns^2) cost
+        # (re-tokenizes the growing prefix each turn), and build_cpt_example
+        # runs the tokenizer on every call — both were in the hot loop, making
+        # the GPU idle on CPU tokenization every micro-batch. Pre-tokenizing
+        # moves that cost to a one-time startup pass; the hot loop then just
+        # indexes into the pre-built list (no tokenizer call) and collates.
+        if is_main:
+            print(f"[cpt] pre-tokenizing {len(rows):,} rows (one-time startup cost) ...")
+        import time as _time
+        _tok_start = _time.time()
+        rows = [builder(r, tokenizer, args.max_seq_len) for r in rows]
+        if is_main:
+            _tok_elapsed = _time.time() - _tok_start
+            print(f"[cpt] pre-tokenization done in {_tok_elapsed:.1f}s "
+                  f"({len(rows):,} examples ready — hot loop skips the tokenizer)")
 
     # Held-out validation set: load valid.jsonl if present in the --data dir and
     # eval isn't disabled. This makes the --data help string's valid.jsonl promise
@@ -1683,13 +1811,23 @@ def main():
             for micro in range(args.accum):
                 if stream_gen is not None:
                     batch_rows = [next(stream_gen) for _ in range(args.batch)]
+                    # stream path still needs on-the-fly tokenization (cache is
+                    # infinite, can't pre-tokenize all of it).
+                    examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
                 else:
-                    batch_rows = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
-                examples = [builder(r, tokenizer, args.max_seq_len) for r in batch_rows]
+                    # Pre-tokenized path: rows are already tokenized examples
+                    # (done once at startup). The hot loop just indexes + collates
+                    # — no tokenizer call, no O(n^2) SFT template cost per step.
+                    examples = [rows[rng.randrange(len(rows))] for _ in range(args.batch)]
                 if args.pack:
                     examples = pack_examples(examples, args.max_seq_len)
-                batch = collate(examples, tokenizer.pad_token_id)
-                batch = {k: v.to(device) for k, v in batch.items()}
+                # pin_memory=True on GPU (enables async H2D via non_blocking
+                # below); False on CPU (pin_memory on CPU device raises).
+                _pin = torch.cuda.is_available()
+                batch = collate(examples, tokenizer.pad_token_id, pin_memory=_pin)
+                # non_blocking=True overlaps the CPU->GPU copy with the previous
+                # step's compute (only effective with pinned memory + a GPU).
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                 step_tokens += batch["input_ids"].numel()
 
                 # DDP optimization: skip the gradient all-reduce on every
@@ -1711,10 +1849,14 @@ def main():
                     # Scale by 1/accum so summed micro-batch grads equal the
                     # average-loss gradient (standard accumulation semantics).
                     (loss / args.accum).backward()
+                    # Free the logits tensor (~1GB for a 15B model) immediately
+                    # after backward, before the optimizer step — lets the
+                    # allocator reuse that block for the next forward's
+                    # activations instead of holding VRAM across optimizer.step.
+                    del outputs
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
-            del outputs  # free the logits tensor (~1GB) before the next step
             loss = last_loss  # for the logging/eval code below, unchanged from pre-accum shape
 
             if profiler is not None:

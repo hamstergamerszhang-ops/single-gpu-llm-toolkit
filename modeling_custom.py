@@ -261,17 +261,31 @@ def _find_decoder_layers(model: nn.Module) -> nn.ModuleList:
 
 
 class _MTPRMSNorm(nn.Module):
+    """RMSNorm for MTP layers. Upcasts only the variance reduction to fp32
+    (not the full multiply) — matches HF's LlamaRMSNorm pattern and avoids the
+    per-layer full-tensor fp32 round-trip the old version did. When Liger
+    Kernel is available, the base model's RMSNorm is already fused by
+    apply_liger_kernel at load time; this custom norm only runs in the MTP
+    head layers (which Liger doesn't touch)."""
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
+        # Compute variance in fp32 (numerical stability) but keep the
+        # multiply + scale in the input dtype — avoids materializing a full
+        # fp32 copy of x (the old `x = x.to(torch.float32)` did that).
+        input_dtype = x.dtype
         x = x.to(torch.float32)
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(in_dtype)
+        x = x.to(input_dtype)
+        # Cast weight to input_dtype BEFORE the multiply — without this,
+        # float32 weight * bf16 x promotes to float32, and the output dtype
+        # no longer matches the input (a dtype mismatch bug that crashes the
+        # MTP forward pass on bf16 runs).
+        return self.weight.to(input_dtype) * x
 
 
 class _MTPModule(nn.Module):

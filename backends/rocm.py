@@ -114,24 +114,3 @@ class RocmBackend(ComputeBackend):
     def empty_cache(self) -> None:
         if self.is_available():
             torch.cuda.empty_cache()
-
-    def setup_environment(self, override: str | None = None, hip_alloc_conf: str | None = None) -> dict:
-        """Bootstrap ROCm environment before torch initializes.
-
-        This is a thin wrapper around `rocm_env.setup_rocm_env` so callers don't
-        have to import the old module directly. On non-ROCm hosts it returns an
-        empty info dict without erroring.
-        """
-        if not self.is_available() and override is None:
-            return {}
-        try:
-            from rocm_env import setup_rocm_env
-            return setup_rocm_env(override=override, hip_alloc_conf=hip_alloc_conf)
-        except Exception as exc:
-            # Don't swallow silently (repo convention: no bare `except: pass`).
-            # rocm_env's own environment bootstrap is best-effort by design --
-            # a failure here shouldn't crash callers that only want the info
-            # dict -- but it must be visible, not silent.
-            print(f"[backends.rocm] WARNING: setup_rocm_env failed, continuing "
-                  f"without ROCm env bootstrap: {exc!r}")
-            return {}

@@ -390,12 +390,16 @@ def _set_hip_alloc_conf(conf, verbose=True):
     it after init has no effect, which is why this runs at the top of
     setup_rocm_env rather than after torch import.
 
-    expandable_segments:True grows arena segments on demand instead of
-    pre-reserving per-size pools — dramatically reduces the "20GB free but OOM
-    on 2GB" failures on large-buffer workloads (a 15B model's logits/activations
-    are multi-GB contiguous). This directly attacks the repo's central OOM theme.
-    The older max_split_size_mb:128 knob is kept as a fallback option but
-    expandable_segments is the modern ROCm recommendation."""
+    The default conf includes:
+    - expandable_segments:True — grows arena segments on demand instead of
+      pre-reserving per-size pools. Dramatically reduces the "20GB free but OOM
+      on 2GB" failures on large-buffer workloads (a 15B model's logits/
+      activations are multi-GB contiguous).
+    - garbage_collection_threshold:0.6 — triggers the caching allocator's GC
+      when 60% of allocated memory is fragmented/dead blocks, reclaiming them
+      before they cause a phantom OOM. Without this, dead blocks accumulate
+      across training steps and eventually fragment the pool.
+    """
     if conf is None:
         return
     if "PYTORCH_HIP_ALLOC_CONF" not in os.environ:
@@ -410,7 +414,8 @@ def _set_hip_alloc_conf(conf, verbose=True):
                   f"'{existing}' by user — not overriding")
 
 
-def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
+def setup_rocm_env(override=None,
+                   hip_alloc_conf="expandable_segments:True,garbage_collection_threshold:0.6",
                    verbose=True):
     """Main entry point. Call BEFORE importing torch in a training script.
 
@@ -422,12 +427,15 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
       'expandable_segments:True') if it isn't already set. This prevents the ROCm
       caching allocator from splitting large blocks into fragments that can't
       be recombined, which is the #1 cause of "phantom OOM" on long training
-      runs where VRAM is actually available but fragmented. Pass None to skip.
-      The default 128MB split limit is conservative; set it lower (e.g. 64) if
-      you have many small allocations, or higher if you train with very large
-      contiguous buffers. Set unconditionally (before GPU detection) because
+      runs where VRAM is actually available but fragmented. Pass None or the
+      string "none" to skip. Set unconditionally (before GPU detection) because
       the env var must be set before the allocator initializes and is harmless
       on non-ROCm boxes (non-ROCm torch ignores PYTORCH_HIP_ALLOC_CONF).
+
+    `hip_alloc_conf` normalization: callers historically did
+    `hip_conf = None if args.hip_alloc_conf.lower() == "none" else ...` at 10
+    call sites. That normalization now lives HERE so callers pass the raw
+    string and this function handles "none"/"None"/"NONE" -> skip.
 
     Returns a dict describing what happened:
         {'action': 'override'|'no-override'|'force-override'|'skip',
@@ -437,6 +445,11 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
          'hip_alloc_conf': 'expandable_segments:True' or None,
          'reason': '...'}
     """
+    # Normalize the hip_alloc_conf: the string "none" (any case) means "don't
+    # set the env var." This used to be done at every call site; now it's here.
+    if isinstance(hip_alloc_conf, str) and hip_alloc_conf.lower() == "none":
+        hip_alloc_conf = None
+
     # Set PYTORCH_HIP_ALLOC_CONF early (before torch import) so the allocator
     # picks it up at init time. Set unconditionally (not gated on GPU detection)
     # because the env var must be set before the allocator initializes and is
@@ -580,6 +593,77 @@ def setup_rocm_env(override=None, hip_alloc_conf="expandable_segments:True",
     return info
 
 
+def setup_rocm_env_from_args(args, verbose=True):
+    """Call setup_rocm_env using the standard --gfx-override / --hip-alloc-conf
+    argparse args shared by every entrypoint.
+
+    This eliminates the `hip_conf = None if args.hip_alloc_conf.lower() == "none"
+    else args.hip_alloc_conf; setup_rocm_env(override=args.gfx_override,
+    hip_alloc_conf=hip_conf)` boilerplate that was copy-pasted at 10 call sites.
+    setup_rocm_env now normalizes "none" internally, so callers pass the raw
+    string and this helper does the rest.
+
+    Returns the setup_rocm_env info dict.
+    """
+    gfx_override = getattr(args, "gfx_override", None)
+    hip_alloc_conf = getattr(args, "hip_alloc_conf",
+                             "expandable_segments:True,garbage_collection_threshold:0.6")
+    return setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf,
+                          verbose=verbose)
+
+
+def setup_nccl_env(world_size: int, verbose=True):
+    """Set sensible NCCL defaults for multi-GPU ROCm runs.
+
+    Only applies when world_size > 1. These are env-var defaults (setdefault,
+    so user-set values always win). The README documents these but they were
+    never auto-applied -- this fixes that.
+
+    - NCCL_ASYNC_ERROR_HANDLING=1: makes NCCL errors surface as async signals
+      instead of hanging the process group (the default on some ROCm builds
+      is 0, which means a dead GPU hangs the whole training run silently).
+    - NCCL_DEBUG=WARN: enough diagnostics to debug a topology/p2p issue without
+      the full NCCL_DEBUG=INFO firehose.
+    - NCCL_SOCKET_IFNAME: best-effort; tries common ib/eth interfaces. User
+      override wins.
+    """
+    if world_size <= 1:
+        return
+    import os
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
+    # Best-effort interface hint. rocm-smi --showtopo would tell us if P2P/IB
+    # is available, but we can't run it here (this runs before torch import in
+    # some paths). Leave it to the user or the topology-aware caller.
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker0")
+    if verbose:
+        print(f"[rocm_env] NCCL defaults set for world_size={world_size} "
+              f"(NCCL_ASYNC_ERROR_HANDLING=1, NCCL_DEBUG=WARN)")
+
+
+def setup_miopen_cache(verbose=True):
+    """Enable MIOpen find-cache persistence so the first-step kernel autotune
+    stall only happens once (not every cold run).
+
+    MIOpen searches for the best kernel config on the first call for each
+    conv/norm shape. Without a persistent cache, this search repeats every
+    run. With MIOPEN_USER_DB_PATH set, the search results persist across runs.
+    """
+    import os
+    from pathlib import Path
+    cache_dir = Path.home() / ".cache" / "miopen_single_gpu_llm"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return  # can't create cache dir (read-only home); skip silently
+    os.environ.setdefault("MIOPEN_USER_DB_PATH", str(cache_dir))
+    # FIND_MODE=3 = fast find (uses the cached result or a quick search);
+    # 1 would be the full search. 3 is the right default for iterative training.
+    os.environ.setdefault("MIOPEN_FIND_MODE", "3")
+    if verbose:
+        print(f"[rocm_env] MIOpen find-cache: {cache_dir} (MIOPEN_FIND_MODE=3)")
+
+
 def _self_test():
     print("[selftest] rocm_env: gfx arch detection + family-matching logic "
           "(no GPU/torch required)")
@@ -698,7 +782,8 @@ def _self_test():
     info = setup_rocm_env(override="gfx1030", verbose=False)
     assert "PYTORCH_HIP_ALLOC_CONF" in os.environ, \
         "setup_rocm_env should set PYTORCH_HIP_ALLOC_CONF"
-    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == "expandable_segments:True"
+    assert os.environ["PYTORCH_HIP_ALLOC_CONF"] == \
+        "expandable_segments:True,garbage_collection_threshold:0.6"
     os.environ.pop("PYTORCH_HIP_ALLOC_CONF", None)
     # User-set value should NOT be overridden.
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.5"
@@ -723,16 +808,19 @@ def main():
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION to this value (e.g. "
                          "gfx1100), skipping auto-detection.")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
+    ap.add_argument("--hip-alloc-conf",
+                    type=str,
+                    default="expandable_segments:True,garbage_collection_threshold:0.6",
                     help="Value for PYTORCH_HIP_ALLOC_CONF (ROCm caching allocator "
-                         "config). Default 'expandable_segments:True' prevents "
-                         "fragmentation OOMs. Pass 'none' to skip.")
+                         "config). Default 'expandable_segments:True,"
+                         "garbage_collection_threshold:0.6' prevents fragmentation "
+                         "OOMs + reclaims dead blocks at 60 pct fragmentation. "
+                         "Pass 'none' to skip.")
     args = ap.parse_args()
     if args.selftest:
         _self_test()
     else:
-        conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        info = setup_rocm_env(override=args.gfx_override, hip_alloc_conf=conf)
+        info = setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
         print(f"\n{info}")
 
 

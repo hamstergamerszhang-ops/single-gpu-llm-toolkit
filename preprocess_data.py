@@ -93,22 +93,33 @@ def should_drop_by_script(row: dict, drop_scripts: set) -> bool:
     return False
 
 
-def pack_rows(rows: list, max_seqlen: int, separator: str = "\n"):
-    """Pack short rows into sequences up to max_seqlen chars, separated by
+def pack_rows(rows: list, max_seqlen: int, separator: str = "\n",
+              tokenizer=None):
+    """Pack short rows into sequences up to max_seqlen, separated by
     `separator`. Returns a list of {"text": "packed..."} rows. Rows longer
     than max_seqlen are passed through as-is (truncated to max_seqlen).
 
-    This is a CHAR-level pack (no tokenizer) — it reduces the number of
-    short rows that would otherwise waste padding, but the exact token count
-    of each packed sequence depends on the tokenizer. train_cpt.py's --pack
-    flag does a second token-level packing pass at collation time."""
+    By default this is a CHAR-level pack (no tokenizer) — fast, tokenizer-
+    free, but the exact token count of each packed sequence depends on the
+    tokenizer. train_cpt.py's --pack flag does a second token-level packing
+    pass at collation time.
+
+    If `tokenizer` is provided, packs by TOKEN count instead of char count
+    (more accurate — char length correlates poorly with token count for
+    CJK/code). This requires tokenizing each row once, which is slower but
+    produces tighter packing with less padding waste downstream.
+    """
     packed = []
     current_parts = []
     current_len = 0
-    sep_len = len(separator)
+    sep_len = len(tokenizer.encode(separator, add_special_tokens=False)) if tokenizer else len(separator)
     for row in rows:
         text = get_text(row)
-        if len(text) > max_seqlen:
+        if tokenizer:
+            row_len = len(tokenizer.encode(text, add_special_tokens=False))
+        else:
+            row_len = len(text)
+        if row_len > max_seqlen:
             # Flush current buffer, then emit the long row as-is (truncated).
             if current_parts:
                 packed.append({"text": separator.join(current_parts)})
@@ -116,11 +127,11 @@ def pack_rows(rows: list, max_seqlen: int, separator: str = "\n"):
                 current_len = 0
             packed.append({"text": text[:max_seqlen]})
             continue
-        addition = len(text) + (sep_len if current_parts else 0)
+        addition = row_len + (sep_len if current_parts else 0)
         if current_len + addition > max_seqlen and current_parts:
             packed.append({"text": separator.join(current_parts)})
             current_parts = [text]
-            current_len = len(text)
+            current_len = row_len
         else:
             current_parts.append(text)
             current_len += addition
@@ -228,12 +239,15 @@ def main():
         rows = kept
         log(f"script filter: dropped {dropped_script:,}, {len(rows):,} remain")
 
-    # Packing.
+    # Packing. Pass the tokenizer (if loaded) so packing is by token count
+    # (accurate for CJK/code) instead of char count (fast but inaccurate).
     packed_count = len(rows)
     if args.pack_seqlen:
-        rows = pack_rows(rows, args.pack_seqlen, args.pack_separator)
+        rows = pack_rows(rows, args.pack_seqlen, args.pack_separator,
+                         tokenizer=tokenizer)
+        unit = "tokens" if tokenizer else "chars"
         log(f"packing: {packed_count:,} rows -> {len(rows):,} packed sequences "
-            f"(max {args.pack_seqlen} chars each)")
+            f"(max {args.pack_seqlen} {unit} each)")
 
     log(f"final: {len(rows):,} rows ({total_in:,} in -> {len(rows):,} out, "
         f"dropped {total_in - len(rows):,} total)")

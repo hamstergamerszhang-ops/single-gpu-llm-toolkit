@@ -99,57 +99,77 @@ def materialize_to_cache(row_generator, dst_path: str, target_rows: int = 500_00
 
 def stream_from_cache(cache_path: str, seed: int = 42):
     """Infinite generator reading rows back out of a JSONL cache built by
-    materialize_to_cache(). Loads the whole file into memory ONCE (this is
-    the right tradeoff for a cache sized to comfortably fit RAM -- hundreds
-    of MB to low GB of short text rows -- not for an unbounded-size cache),
-    shuffles it with the given seed, then yields rows in a loop, reshuffling
-    on each full pass so a very long run doesn't see the exact same row
-    order repeat forever.
+    materialize_to_cache().
+
+    Memory-efficient approach: scans the file ONCE to record byte offsets of
+    each valid line, then seeks+reads individual lines on demand. Only the
+    active row is in RAM at a time — a multi-GB cache no longer needs to fit
+    in memory (the old version loaded the whole file into a Python list of
+    dicts, ~3-5x the on-disk size due to object overhead). The offset index
+    is just a list of ints (8 bytes per row), so even a 10M-row cache's
+    index is only ~80MB.
+
+    Shuffles the offset index with the given seed, then yields rows in a
+    loop, reshuffling on each full pass so a very long run doesn't see the
+    exact same row order repeat forever.
 
     Raises RuntimeError immediately if the cache file is empty -- training
     against zero rows is a silent no-op you want to fail loudly on, not a
     generator that just never yields anything.
 
     Malformed lines (e.g. a truncated last line from a crash mid-write) are
-    skipped with a warning rather than crashing the streamer. This makes a
-    partial cache genuinely usable even if the write was interrupted.
+    skipped with a warning rather than crashing the streamer.
     """
     import random
 
-    rows = []
+    # Pass 1: record byte offsets of each valid line. Only the offsets (ints)
+    # are held in RAM, not the row contents.
+    offsets = []
     malformed = 0
     with open(cache_path, encoding="utf-8") as f:
-        for line in f:
+        offset = f.tell()
+        line = f.readline()
+        while line:
             line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                # A truncated trailing line (crash mid-write) should not abort
-                # streaming — the rest of the cache is still usable.
-                malformed += 1
+            if line:
+                try:
+                    json.loads(line)  # validate without storing
+                    offsets.append(offset)
+                except json.JSONDecodeError:
+                    malformed += 1
+            offset = f.tell()
+            line = f.readline()
     if malformed:
         print(f"[local_cache_stream] WARNING: skipped {malformed} malformed "
               f"line(s) in {cache_path} (likely a truncated last line from a "
-              f"crash mid-write). {len(rows):,} valid rows loaded.",
+              f"crash mid-write). {len(offsets):,} valid rows indexed.",
               flush=True)
-    if not rows:
+    if not offsets:
         raise RuntimeError(f"Cache at {cache_path} is empty -- nothing to stream")
 
-    print(f"[local_cache_stream] loaded {len(rows):,} rows from {cache_path}", flush=True)
+    print(f"[local_cache_stream] indexed {len(offsets):,} row offsets from "
+          f"{cache_path} (memory-mapped access, only active row in RAM)",
+          flush=True)
+
+    # Pass 2+: seek+read individual lines on demand, in shuffled order.
     rng = random.Random(seed)
     pass_num = 0
-    while True:
-        order = list(range(len(rows)))
-        rng.shuffle(order)
-        pass_num += 1
-        if pass_num > 1:
-            print(f"[local_cache_stream] pass {pass_num}: reshuffled and looping over the "
-                  f"same {len(rows):,} cached rows again (cache exhausted, repetition beats "
-                  f"stopping)", flush=True)
-        for idx in order:
-            yield rows[idx]
+    f = open(cache_path, encoding="utf-8")  # kept open for the lifetime of the generator
+    try:
+        while True:
+            order = list(range(len(offsets)))
+            rng.shuffle(order)
+            pass_num += 1
+            if pass_num > 1:
+                print(f"[local_cache_stream] pass {pass_num}: reshuffled and looping over the "
+                      f"same {len(offsets):,} cached rows again (cache exhausted, repetition beats "
+                      f"stopping)", flush=True)
+            for idx in order:
+                f.seek(offsets[idx])
+                line = f.readline().strip()
+                yield json.loads(line)
+    finally:
+        f.close()
 
 
 def _self_test():

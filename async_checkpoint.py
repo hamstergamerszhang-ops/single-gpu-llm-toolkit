@@ -56,6 +56,29 @@ import threading
 from pathlib import Path
 
 
+def atomic_replace_with_backup(tmp_dir: Path, save_dir: Path):
+    """Atomically replace `save_dir` with the contents of `tmp_dir`, retaining
+    the old save_dir as `.prev` (a real backup, not deleted).
+
+    The rotation: if save_dir exists, move it to save_dir.prev (removing any
+    old .prev first); then os.replace(tmp_dir, save_dir). The .prev backup is
+    intentionally NOT deleted — it's the retained rollback target. A crash
+    mid-write or a corrupt new write can be rolled back to .prev.
+
+    Extracted as a shared helper (was duplicated in train_cpt.py's
+    atomic_save_checkpoint and async_checkpoint.py's _write). Both paths use
+    the same .tmp_ckpt -> os.replace -> .prev rotation; now there's one
+    canonical implementation.
+    """
+    backup = save_dir.parent / (save_dir.name + ".prev")
+    if save_dir.exists():
+        if backup.exists():
+            shutil.rmtree(backup)
+        os.replace(save_dir, backup)
+    os.replace(tmp_dir, save_dir)
+    # NOTE: .prev is intentionally NOT deleted here — it is the retained backup.
+
+
 def _move_to_cpu(obj):
     """Recursively moves tensors in a nested dict/list/tuple to CPU. Used to
     snapshot optimizer.state_dict() (a dict of dicts of tensors, e.g. Adam's
@@ -206,18 +229,9 @@ class AsyncCheckpointer:
 
                 # Retain the previous checkpoint as .prev (a real backup, not
                 # deleted) so a crash mid-write or a corrupt new write can be
-                # rolled back. The recovery path in train_cpt.py restores .prev
-                # if the live save_dir is missing training_state.pt on resume.
-                backup = save_dir.parent / (save_dir.name + ".prev")
-                if save_dir.exists():
-                    if backup.exists():
-                        shutil.rmtree(backup)
-                    os.replace(save_dir, backup)
-                os.replace(tmp_dir, save_dir)
-                # NOTE: .prev is intentionally NOT deleted here — it is the
-                # retained backup. The next successful write rotates it out
-                # (rmtree + os.replace above) when a newer good checkpoint
-                # supersedes it.
+                # rolled back. Uses the shared atomic_replace_with_backup
+                # helper (same rotation as train_cpt.py's atomic_save_checkpoint).
+                atomic_replace_with_backup(tmp_dir, save_dir)
 
                 print(f"[ckpt-async] step {step}: background write finished -> {save_dir}")
             except Exception as e:

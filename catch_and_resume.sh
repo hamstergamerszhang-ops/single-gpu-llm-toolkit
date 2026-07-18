@@ -162,11 +162,21 @@ while true; do
     # pattern is adapted from -- train_cpt.py finds $SAVE/training_state.pt itself
     # and resumes from it automatically. Re-running the identical command is the
     # entire resume mechanism.
-    python3 train_cpt.py \
+    #
+    # MODE=sft switches to train_sft.py and drops --cpt (SFT has its own
+    # builder). Everything else (save/resume/async-checkpoint) is identical.
+    SCRIPT="${TRAIN_SCRIPT:-train_cpt.py}"
+    CPT_FLAG=()
+    if [ "${MODE:-cpt}" = "sft" ]; then
+        SCRIPT="train_sft.py"
+    else
+        CPT_FLAG=(--cpt)
+    fi
+    python3 "$SCRIPT" \
         --model "$MODEL" \
         --save "$SAVE" \
         "${data_args[@]}" \
-        --cpt \
+        "${CPT_FLAG[@]}" \
         --iters "$TOTAL_ITERS" \
         --batch "$BATCH" \
         --lr "$LR" \

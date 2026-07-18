@@ -30,6 +30,7 @@ dependencies = [
     "safetensors>=0.4.0",
     "numpy>=1.24.0",
     "transformers==5.7.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +40,7 @@ dependencies = [
 train = [
     "bitsandbytes>=0.43.0",
     "tensorboard>=2.14.0",
+    "liger-kernel>=0.3.0",
 ]
 infer = [
     "flash-attn>=2.5.0",
@@ -51,6 +53,7 @@ serve = [
 ]
 dev = [
     "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",
 ]
 all = [
     "bitsandbytes>=0.43.0",
@@ -71,7 +74,7 @@ Issues = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit/issue
 # importable after `pip install -e .`; the top-level *.py scripts stay as
 # directly-invoked entrypoints (not installed as console_scripts, because the
 # repo's convention is `python3 train_cpt.py ...`).
-packages = ["backends", "runtime", "config", "distributed", "models"]
+packages = ["backends", "runtime", "config", "models"]
 py-modules = [
     "train_cpt", "train_sft", "generate", "benchmark", "evaluate",
     "compress_model", "tensor_parallel", "expand_model", "mtp_head",
