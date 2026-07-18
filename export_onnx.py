@@ -14,8 +14,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", help="Source checkpoint directory.")
     ap.add_argument("--dst", help="Output directory or .onnx file path.")
-    ap.add_argument("--seq-length", type=int, default=128, help="Dummy input sequence length.")
-    ap.add_argument("--batch-size", type=int, default=1, help="Dummy input batch size.")
+    ap.add_argument("--seq-length", "--max-seq-len", type=int, default=128, dest="seq_length",
+                    help="Dummy input sequence length.")
+    ap.add_argument("--batch-size", "--batch", type=int, default=1, dest="batch_size",
+                    help="Dummy input batch size.")
     ap.add_argument("--dtype", choices=["fp32", "fp16", "bf16", "fp8"], default="fp32")
     ap.add_argument("--selftest", action="store_true", default=False,
                     help="Run built-in self-test (no GPU required).")

@@ -78,15 +78,12 @@ def main():
         with open(index_path) as f:
             index = json.load(f)
     else:
-        single_file = "model.safetensors"
-        if not os.path.exists(os.path.join(src, single_file)):
-            raise SystemExit(f"ERROR: no model.safetensors.index.json AND no {single_file} in {src}")
-        with open(os.path.join(src, single_file), "rb") as f:
-            header_len = int.from_bytes(f.read(8), "little")
-            header = json.loads(f.read(header_len))
-        weight_map = {k: single_file for k in header if k != "__metadata__"}
-        index = {"metadata": {"total_size": os.path.getsize(os.path.join(src, single_file))}, "weight_map": weight_map}
-        print(f"[prune_embed] no index.json found -- synthesized one for the single-file checkpoint ({single_file})")
+        # No index -- synthesize one for the single-file checkpoint using the
+        # shared helper (was duplicated inline here + in expand_model.py +
+        # mtp_head.py; now one canonical implementation in expand_model.py).
+        from expand_model import synthesize_single_shard_index
+        index = synthesize_single_shard_index(src)
+        print(f"[prune_embed] no index.json found -- synthesized one for the single-file checkpoint")
 
     embed_shard = index["weight_map"][embed_key]
     all_shards = sorted(set(index["weight_map"].values()))

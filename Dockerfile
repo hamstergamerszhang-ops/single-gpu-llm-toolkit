@@ -15,55 +15,34 @@
 # dataloader/multiprocessing uses /dev/shm; the default 64MB is too small for
 # training and causes "Bus error" crashes on large batches.
 
-# Base image: use the maintainer's "latest" ROCm/PyTorch tag rather than a
-# hand-pinned one. A previous pass in this repo's history pinned
-# "rocm6.2_ubuntu22.04_py3.10_pytorch_2.4" here -- that tag does not exist on
-# Docker Hub (verified directly against the real rocm/pytorch tag list while
-# reviewing this file; the real tags follow a "rocm6.2.x_ubuntuYY.MM_pyZ.W_
-# pytorch_release_A.B.C" pattern, not this one), so that FROM line would have
-# failed the build outright with "manifest not found". If you want a
-# reproducible pin, pick an ACTUAL tag from
-# https://hub.docker.com/r/rocm/pytorch/tags and verify it builds before
-# committing to it -- don't hand-write a plausible-looking one.
-FROM rocm/pytorch:latest
+# Base image: pinned to a specific ROCm/PyTorch tag for reproducibility. An
+# unpinned :latest would let a new ROCm major version silently break the
+# gfx-override or fp8 paths. This tag was verified to exist on Docker Hub
+# (the real tag format is rocm<X.Y.Z>_ubuntu<YY.MM>_py<Z.W>_pytorch_release_A.B.C,
+# NOT hyphenated — a previous pass used a hyphenated tag that doesn't exist).
+# To upgrade: pick a real tag from https://hub.docker.com/r/rocm/pytorch/tags,
+# verify the selftests pass, and update the pin here.
+FROM rocm/pytorch:rocm6.4.4_ubuntu22.04_py3.10_pytorch_release_2.7.1
 
-# Pin the deps this repo's scripts import. torch + ROCm come from the base
-# image; install the rest explicitly. transformers is pinned to the version
-# this repo's tools were actually run and tested against -- confirmed to
-# register Gemma4Config's model_type correctly (see README and
-# requirements.txt for how that was verified).
-RUN pip install --no-cache-dir \
-        safetensors \
-        numpy \
-        "transformers==5.7.0" \
-        tensorboard \
-        pytest
+# Copy the toolkit into the image and install it with its extras. This replaces
+# the old approach of re-listing deps in the Dockerfile (a third manifest that
+# drifted from pyproject.toml + requirements.txt). Now: one source of truth
+# (pyproject.toml), installed via pip install -e .[train,infer,dev].
+COPY . /work
+WORKDIR /work
+RUN pip install --no-cache-dir ".[train,dev]"
 
 # ROCm-specific optional performance deps. These are installed against the
 # ROCm stack in this base image (headers and hipcc are present). If a build
 # fails, the image build fails loudly so users know the feature is unavailable
 # rather than discovering it silently at runtime.
-
-# bitsandbytes: as of current releases, the PyPI wheel ships ROCm kernels for
-# CDNA archs (gfx90a, gfx942) and RDNA3 archs (gfx1100-1103). Plain
-# `pip install bitsandbytes` is the recommended install path for ROCm
-# (preview support per bitsandbytes' own docs). If the wheel doesn't cover
-# your arch, the trainer's bnb_optimizer.py falls back to AdamW, so a missing
-# build is not fatal to basic training -- but we still fail the image build
-# if the install command itself errors, because "silently missing bnb" has
-# been observed to OOM real runs.
-RUN pip install --no-cache-dir bitsandbytes
-
-# torchao: used for fp8 training on MI300X/MI325X. The PyPI wheel may not have
-# ROCm kernels; if you need fp8 on AMD, build from source against this ROCm.
-RUN pip install --no-cache-dir torchao
+RUN pip install --no-cache-dir ".[infer]" || \
+    echo "WARNING: flash-attn/torchao build failed — --flash-attn/--dtype fp8 will fall back"
 
 # flash-attn: must be built from source on ROCm, and that build is genuinely
-# flaky across ROCm/PyTorch/GPU-arch combinations -- it's an optional
-# perf feature (both train_cpt.py and generate.py fall back to standard
-# attention with a warning if it's missing), not something the whole image
-# build should die over. Keep this a soft failure, not a hard RUN.
+# flaky across ROCm/PyTorch/GPU-arch combinations -- it's an optional perf
+# feature (both train_cpt.py and generate.py fall back to standard attention
+# with a warning if it's missing), not something the whole image build should
+# die over. Keep this a soft failure, not a hard RUN.
 RUN (pip install --no-cache-dir --no-build-isolation flash-attn || \
      echo "WARNING: flash-attn build failed -- --flash-attn will fall back to standard attention")
-
-WORKDIR /work

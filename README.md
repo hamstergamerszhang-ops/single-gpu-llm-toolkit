@@ -2,7 +2,9 @@
 
 Twenty-two independently-runnable tools (twenty Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
-multi-node cluster, no distributed training framework. The pipeline covers
+multi-node cluster, no external orchestration framework (no SLURM/Ray —
+though `--ddp`/`--fsdp` via `torch.distributed` is supported for multi-GPU
+nodes; see [Multi-GPU](#multi-gpu-ddp--fsdp) below). The pipeline covers
 the full path from a base checkpoint to a trained one: shrink a tokenizer,
 grow a model's width and depth, continue-pretrain or fine-tune it, and
 survive the specific ways a single GPU fails you along the way — OOM,
@@ -12,25 +14,27 @@ data in, compare configs before committing to a long run, and actually talk
 to the model you just trained. `evaluate.py` measures perplexity, the three
 `export_*.py` tools convert a checkpoint to GGUF/ONNX/safetensors, and every
 tool ships its own `--selftest` or pytest coverage — transformation tools
-that need real checkpoints (`prune_vocab.py`, `expand_model.py`,
-`export_safetensors.py`) are covered by pytest logic tests instead, and the
-two shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are exercised
-manually; see [Testing](#testing). Everything is independently runnable —
-use the whole pipeline or just the one tool that solves your problem.
+that need real checkpoints (`prune_vocab.py`, `prune_embeddings_torch.py`,
+`expand_model.py`, `export_safetensors.py`) are covered by pytest logic tests
+instead, and the two shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are
+exercised manually; see [Testing](#testing). Everything is independently
+runnable — use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
 `train_sft.py`) — no LoRA, no adapters. That's a deliberate choice, not an
 oversight: the quality this repo's own runs are built around comes from
 training the real weights, not a low-rank approximation of them.
 
-None of this is pinned to one GPU. There's no device-name check, no
-architecture branch, no VRAM-threshold logic in the source —
-batch size, sequence length, and how many layers stay unfrozen are all
-plain CLI flags, so the same scripts scale down to a smaller card by
-freezing more layers and shrinking the batch, or scale up by unfreezing
-more and running bigger batches. Standard ROCm/PyTorch throughout — nothing
-here calls out to an MI300X-only code path. It happens to have been built
-and run on one MI300X; there's nothing in it that ties it there.
+None of this is pinned to one GPU. The training loop itself doesn't branch on
+device name or VRAM — batch size, sequence length, and how many layers stay
+unfrozen are all plain CLI flags, so the same scripts scale down to a smaller
+card by freezing more layers and shrinking the batch, or scale up by unfreezing
+more and running bigger batches. Capability advertisement and preset suggestion
+DO use arch/VRAM (intentionally): `backends/rocm.py` gates fp8/flash-attn on
+the gfx arch, and `config/presets.py::suggest_preset` picks defaults by VRAM
+tier — but these only set defaults, never block a run. Standard ROCm/PyTorch
+throughout — nothing here calls out to an MI300X-only code path. It happens to
+have been built and run on one MI300X; there's nothing in it that ties it there.
 
 Here's what that actually buys you, concretely, instead of just abstractly:
 you don't have to choose between "fits in memory" and "actually trains all
@@ -439,6 +443,12 @@ is for:
   long-context training. Requires `flash-attn` built for ROCm (`pip install
   flash-attn --no-build-isolation`). Falls back to standard attention with a
   warning if not installed.
+- **`--no-liger`** — Disable Liger Kernel (on by default when installed).
+  Liger provides fused RMSNorm + RoPE + SwiGLU + cross-entropy, avoiding the
+  full `[B,T,V]` logits materialization (~1GB for a 15B model). This is a
+  ~15-30% throughput win and a large peak-VRAM reduction. Soft-fails to stock
+  kernels with a warning if `liger-kernel` isn't installed (`pip install
+  liger-kernel`). Applied per model family (gemma, llama, qwen, mistral, phi).
 - **`--dtype fp8`** — fp8 training via `torchao`'s `Float8Linear`
   (`float8_e4m3fn`). Native fp8 compute is available on the CDNA3 MI300
   family: `gfx940` (MI300A), `gfx941` (MI325X), `gfx942` (MI300X), and the
@@ -1064,7 +1074,9 @@ actual filesystem layout in it.
 ## Requirements
 
 See [`requirements.txt`](requirements.txt) for pinned versions, or use the
-[`Dockerfile`](Dockerfile), which bakes in a ROCm torch + all deps:
+[`Dockerfile`](Dockerfile), which starts from a pinned ROCm/PyTorch base image
+and installs the toolkit + its deps via `pip install -e .[train,infer,dev]`
+(the image includes the toolkit itself at `/work`):
 
 - `torch` (ROCm build for AMD GPUs — install from AMD's index, not PyPI; it's
   deliberately not in `requirements.txt`)

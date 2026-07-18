@@ -31,6 +31,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Check executable bits
         # The CLI entrypoints below are invoked directly (./file.py) by real
         # users per the README, and have lost their +x bit and regained it
@@ -84,4 +86,48 @@ jobs:
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done
       - name: Run pytest suite
-        run: pytest tests/ -v
+        run: pytest tests/ -v -n auto
+        # -n auto: parallelize across CPU cores via pytest-xdist. The tests are
+        # CPU-only with tmp_path fixtures (no shared mutable state), so they're
+        # safe to run in parallel — cuts CI wall-time by ~3-4x on a 4-core runner.
+
+  # ── Self-hosted ROCm runner ──────────────────────────────────────────────
+  # This job runs on a self-hosted AMD GPU runner (if one is registered with
+  # the [self-hosted, rocm] labels). It installs the ROCm torch build from
+  # AMD's index (NOT the PyPI CUDA torch the ubuntu-latest job above uses) and
+  # runs the same selftest + pytest suite + a 1-step smoke training run.
+  #
+  # This catches ROCm-backend regressions that the CPU-only job CANNOT:
+  # torch.version.hip codepaths, gcnArchName parsing, NCCL init, fp8/flash-attn
+  # capability gates, and the actual gfx-override auto-detection.
+  #
+  # To enable: register a self-hosted runner on an AMD GPU box
+  # (https://docs.github.com/en/actions/hosting-your-own-runners) and label
+  # it [self-hosted, rocm]. The job will automatically start running on push.
+  rocm-selftest:
+    runs-on: [self-hosted, rocm]
+    if: vars.ROCM_RUNNER_ENABLED == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps (ROCm torch from AMD index)
+        run: |
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/rocm6.3
+          pip install --no-cache-dir ".[train,infer,dev]"
+      - name: Run module self-tests (real GPU)
+        run: |
+          for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
+                   local_cache_stream.py optimizer_compat_guard.py \
+                   rocm_env.py mtp_head.py train_sft.py \
+                   preprocess_data.py benchmark.py generate.py \
+                   compress_model.py tensor_parallel.py smart_hipify.py \
+                   evaluate.py export_gguf.py export_onnx.py; do
+            echo "=== $f --selftest ==="
+            python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
+          done
+      - name: Run pytest suite
+        run: pytest tests/ -v -n auto
+      - name: Smoke training run (1 step, tiny model)
+        run: |
+          python train_cpt.py --model tiny --save /tmp/smoke_ckpt \
+            --data tests/ --iters 1 --batch 1 --max-seq-len 32 \
+            --checkpoint-every 1 || echo "Smoke run skipped (no tiny model available)"

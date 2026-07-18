@@ -188,6 +188,22 @@ def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows
             f"{n_existing}-dimensional space (n_new must be <= n_existing). "
             f"transpose_for_rows={transpose_for_rows}"
         )
+    # Use torch.linalg.qr on GPU when available (rocSOLVER-backed on ROCm) —
+    # a 15B-width expansion took minutes on CPU (numpy single-threaded). Falls
+    # back to numpy if no GPU or if torch.linalg.qr is unavailable.
+    try:
+        import torch
+        if transpose_for_rows:
+            R = torch.randn(n_new, n_existing, dtype=torch.float32, device="cuda")
+            Q, _ = torch.linalg.qr(R.T, mode="reduced")
+            pad = (Q[:, :n_new].T * scale).contiguous().to("cpu")
+        else:
+            R = torch.randn(n_existing, n_new, dtype=torch.float32, device="cuda")
+            Q, _ = torch.linalg.qr(R, mode="reduced")
+            pad = (Q[:, :n_new] * scale).contiguous().to("cpu")
+        return pad
+    except (RuntimeError, Exception):
+        pass  # no GPU, or torch.linalg.qr unavailable — fall back to numpy
     if transpose_for_rows:
         R = np.random.randn(n_new, n_existing).astype(np.float32)
         Q, _ = np.linalg.qr(R.T, mode="reduced")
@@ -393,6 +409,34 @@ def write_sharded(tensors: dict, dst: str, max_shard_bytes: int, log_prefix: str
     log(f"wrote index.json -- {n_shards} shards, {total_size/1024**3:.2f}GB total", **_log_kwargs)
 
 
+def synthesize_single_shard_index(src_dir: str) -> dict:
+    """Synthesize a model.safetensors.index.json for a single-file checkpoint
+    (one that ships as a lone model.safetensors with no index).
+
+    Reads the 8-byte header length, parses the header JSON, and builds a
+    weight_map pointing every tensor key at "model.safetensors". Returns the
+    full index dict (metadata + weight_map).
+
+    Extracted as a shared helper (was duplicated in expand_model.py,
+    mtp_head.py, and prune_embeddings_torch.py). Callers that already have
+    an index.json should use it directly; this is the fallback for the
+    single-file case.
+    """
+    single_file = "model.safetensors"
+    single_path = os.path.join(src_dir, single_file)
+    if not os.path.exists(single_path):
+        raise SystemExit(
+            f"ERROR: no model.safetensors.index.json AND no {single_file} in {src_dir}")
+    with open(single_path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    weight_map = {k: single_file for k in header if k != "__metadata__"}
+    return {
+        "metadata": {"total_size": os.path.getsize(single_path)},
+        "weight_map": weight_map,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -483,25 +527,10 @@ def main():
             src_index = json.load(f)
         shard_files = sorted(set(src_index["weight_map"].values()))
     else:
-        # No index -- some checkpoints ship as a single unsharded
-        # model.safetensors with no index at all (a real downloaded case, not
-        # an assumption -- same fallback as prune_embeddings_torch.py). Synthesize
-        # a single-shard index from the safetensors header so the rest of this
-        # script can rely on one consistent format.
-        single_file = "model.safetensors"
-        single_path = os.path.join(args.src, single_file)
-        if not os.path.exists(single_path):
-            raise SystemExit(f"ERROR: no model.safetensors.index.json AND no "
-                             f"{single_file} in {args.src}")
-        with open(single_path, "rb") as f:
-            header_len = int.from_bytes(f.read(8), "little")
-            header = json.loads(f.read(header_len))
-        weight_map = {k: single_file for k in header if k != "__metadata__"}
-        src_index = {"metadata": {"total_size": os.path.getsize(single_path)},
-                     "weight_map": weight_map}
-        shard_files = [single_file]
-        log(f"no index.json found -- synthesized one for the single-file "
-            f"checkpoint ({single_file})")
+        # No index -- synthesize one for the single-file checkpoint.
+        src_index = synthesize_single_shard_index(args.src)
+        shard_files = ["model.safetensors"]
+        log(f"no index.json found -- synthesized one for the single-file checkpoint")
 
     log(f"loading {len(shard_files)} source shards ...")
     tensors = {}

@@ -89,8 +89,7 @@ def run_gen_benchmark(model_path: str, prompt_len: int, gen_len: int,
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
-        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
@@ -204,8 +203,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
     backend = get_backend(backend_name) if backend_name else autodetect_backend()
     if backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if hip_alloc_conf.lower() == "none" else hip_alloc_conf
-        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=gfx_override, hip_alloc_conf=hip_alloc_conf)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -261,18 +259,22 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
 
         model.train()
         model.config.use_cache = False
-        try:
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=1e-5, fused=True, foreach=False)
-        except (ValueError, RuntimeError):
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+        # Use the canonical bnb_optimizer.build_optimizer (same path the real
+        # trainer uses) instead of reimplementing the try-bitsandbytes pattern.
+        from bnb_optimizer import build_optimizer
+        optimizer, _opt_kind = build_optimizer(model.parameters(), lr=1e-5)
+
+        # Generate dummy data ONCE outside the timed loop — the randint kernel
+        # time was distorting step_ms on small configs. Reuse the same batch
+        # for every step so timing reflects model+optimizer only.
+        vocab = tokenizer.vocab_size or len(tokenizer) or 1
+        dummy_ids = torch.randint(0, vocab,
+                                  (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
+        dummy_labels = dummy_ids.clone()
+        dummy_attn = torch.ones_like(dummy_ids)
 
         for _ in range(warmup):
-            input_ids = torch.randint(0, tokenizer.vocab_size,
-                                      (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
-            labels = input_ids.clone()
-            attn = torch.ones_like(input_ids)
-            outputs = model(input_ids=input_ids, labels=labels, attention_mask=attn)
+            outputs = model(input_ids=dummy_ids, labels=dummy_labels, attention_mask=dummy_attn)
             optimizer.zero_grad(set_to_none=True)
             outputs.loss.backward()
             optimizer.step()
@@ -282,11 +284,7 @@ def run_benchmark(model_path: str, configs: list[dict], warmup: int, steps: int,
         start = time.perf_counter()
 
         for _ in range(steps):
-            input_ids = torch.randint(0, tokenizer.vocab_size,
-                                      (cfg["batch"], cfg["seqlen"]), device=dev.torch_device)
-            labels = input_ids.clone()
-            attn = torch.ones_like(input_ids)
-            outputs = model(input_ids=input_ids, labels=labels, attention_mask=attn)
+            outputs = model(input_ids=dummy_ids, labels=dummy_labels, attention_mask=dummy_attn)
             optimizer.zero_grad(set_to_none=True)
             outputs.loss.backward()
             optimizer.step()
@@ -335,7 +333,7 @@ def main():
                     help="Measured steps (default 10).")
     ap.add_argument("--gfx-override", type=str, default=None,
                     help="Force HSA_OVERRIDE_GFX_VERSION (see rocm_env.py).")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True,garbage_collection_threshold:0.6",
                     help="PYTORCH_HIP_ALLOC_CONF value (pass 'none' to skip).")
     ap.add_argument("--gen", action="store_true", default=False,
                     help="Run a generation benchmark instead of the training "
@@ -354,14 +352,12 @@ def main():
                     help="Compute backend to use (auto-detected if unset).")
     args = ap.parse_args()
 
-    hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-
     if args.gen:
         log(f"generation benchmark: prompt_len={args.gen_prompt_len}, "
             f"gen_len={args.gen_len}, warmup={args.warmup}, steps={args.steps}")
         result = run_gen_benchmark(args.model, args.gen_prompt_len, args.gen_len,
                                    args.warmup, args.steps,
-                                   args.gfx_override, hip_conf,
+                                   args.gfx_override, args.hip_alloc_conf,
                                    backend_name=args.backend)
         print("\n" + format_gen_table(result))
         return
@@ -373,7 +369,7 @@ def main():
     log(f"benchmarking {len(configs)} config(s): warmup={args.warmup}, steps={args.steps}")
 
     results = run_benchmark(args.model, configs, args.warmup, args.steps,
-                            args.gfx_override, hip_conf,
+                            args.gfx_override, args.hip_alloc_conf,
                             backend_name=args.backend)
 
     print("\n" + format_table(results))

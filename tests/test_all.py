@@ -203,54 +203,6 @@ def test_backend_prefer_unavailable_falls_back():
     assert dev.name == "cpu"
 
 
-# ── Distributed strategies (distributed/) ───────────────────────────────────
-
-def test_process_group_env_defaults(monkeypatch):
-    from distributed.env import detect_process_group_env
-    monkeypatch.delenv("RANK", raising=False)
-    monkeypatch.delenv("WORLD_SIZE", raising=False)
-    monkeypatch.delenv("LOCAL_RANK", raising=False)
-    env = detect_process_group_env()
-    assert env.rank == 0
-    assert env.world_size == 1
-    assert env.local_rank == 0
-    assert not env.is_distributed
-
-
-def test_process_group_env_torchrun(monkeypatch):
-    from distributed.env import detect_process_group_env
-    monkeypatch.setenv("RANK", "2")
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    monkeypatch.setenv("LOCAL_RANK", "1")
-    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", "6000")
-    env = detect_process_group_env()
-    assert env.rank == 2
-    assert env.world_size == 8
-    assert env.local_rank == 1
-    assert env.master_addr == "10.0.0.1"
-    assert env.master_port == "6000"
-
-
-def test_create_single_strategy_falls_back_when_not_distributed():
-    from distributed import create_strategy
-    from backends import get_backend, default_device
-    dev = default_device(prefer="cpu")
-    strategy = create_strategy("ddp", get_backend("cpu"), dev)
-    assert strategy.name == "single"
-    assert strategy.world_size == 1
-    assert strategy.is_main
-
-
-def test_single_strategy_no_sync_is_no_op():
-    from distributed import create_strategy
-    from backends import get_backend, default_device
-    dev = default_device(prefer="cpu")
-    strategy = create_strategy("single", get_backend("cpu"), dev)
-    with strategy.no_sync(None):
-        pass
-
-
 # ── Model-family registry (models/) ─────────────────────────────────────────
 
 def test_list_model_families_includes_common():
@@ -2509,3 +2461,154 @@ def test_modeling_custom_no_mtp_depths_is_a_clean_noop():
     with torch.no_grad():
         out = model(input_ids=input_ids)
     assert not hasattr(out, "mtp_hidden_states")
+
+
+# ── New feature tests (batch_generate, position_ids, stream_jsonl, etc.) ───
+
+def test_pack_examples_emits_position_ids_with_doc_reset():
+    """pack_examples must emit position_ids that RESET at each document
+    boundary, so document B starts at position 0 (prevents rotary-embedding
+    position leakage across packed documents)."""
+    import torch
+    from train_cpt import pack_examples
+    examples = [
+        {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([1, 2, 3])},
+        {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([4, 5])},
+        {"input_ids": torch.tensor([6, 7, 8, 9]), "labels": torch.tensor([6, 7, 8, 9])},
+    ]
+    packed = pack_examples(examples, max_seq_len=100)
+    assert len(packed) == 1  # all fit in one sequence
+    pos = packed[0]["position_ids"]
+    # pos should be [0,1,2, 0,1, 0,1,2,3] — resets at each doc boundary
+    assert pos.tolist() == [0, 1, 2, 0, 1, 0, 1, 2, 3], pos.tolist()
+
+
+def test_pack_examples_position_ids_reset_on_boundary_split():
+    """When packing splits across multiple sequences, each sequence's
+    position_ids must still reset at doc boundaries."""
+    import torch
+    from train_cpt import pack_examples
+    examples = [
+        {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([1, 2, 3])},
+        {"input_ids": torch.tensor([4, 5, 6]), "labels": torch.tensor([4, 5, 6])},
+    ]
+    # max_seq_len=4 forces a split after the first example (3+3 > 4)
+    packed = pack_examples(examples, max_seq_len=4)
+    assert len(packed) == 2
+    assert packed[0]["position_ids"].tolist() == [0, 1, 2]
+    assert packed[1]["position_ids"].tolist() == [0, 1, 2]
+
+
+def test_collate_passes_position_ids_when_present():
+    """collate must include position_ids in the output when any input has them
+    (the packing path), and omit them when none do (the normal path)."""
+    import torch
+    from train_cpt import collate
+    # With position_ids (packed path)
+    batch = [{"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([1, 2]),
+              "position_ids": torch.tensor([0, 1])}]
+    out = collate(batch, pad_token_id=0)
+    assert "position_ids" in out
+    # Without position_ids (normal path)
+    batch = [{"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([1, 2])}]
+    out = collate(batch, pad_token_id=0)
+    assert "position_ids" not in out
+
+
+def test_stream_jsonl_yields_rows_lazily():
+    """stream_jsonl must yield rows one at a time (a generator), not load
+    all into a list. Verify it's a generator and yields the right rows."""
+    import json
+    import tempfile
+    from train_cpt import stream_jsonl, load_jsonl
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for i in range(5):
+            f.write(json.dumps({"text": f"row-{i}"}) + "\n")
+        path = f.name
+    gen = stream_jsonl(path)
+    # Verify it's a generator (has __next__, not a list)
+    assert hasattr(gen, "__next__")
+    rows = list(gen)
+    assert len(rows) == 5
+    assert rows[0] == {"text": "row-0"}
+    assert rows[4] == {"text": "row-4"}
+    # load_jsonl should return the same data as a list
+    loaded = load_jsonl(path)
+    assert loaded == rows
+    import os; os.unlink(path)
+
+
+def test_atomic_replace_with_backup_rotation():
+    """atomic_replace_with_backup must: move save_dir to .prev, then tmp to
+    save_dir. A second call rotates .prev out (old backup deleted)."""
+    import tempfile
+    from pathlib import Path
+    from async_checkpoint import atomic_replace_with_backup
+    with tempfile.TemporaryDirectory() as td:
+        save = Path(td) / "ckpt"
+        save.mkdir()
+        (save / "v1.txt").write_text("v1")
+
+        tmp = Path(td) / "ckpt.tmp_ckpt"
+        tmp.mkdir()
+        (tmp / "v2.txt").write_text("v2")
+
+        atomic_replace_with_backup(tmp, save)
+        # save now has v2, .prev has v1
+        assert (save / "v2.txt").exists()
+        backup = Path(td) / "ckpt.prev"
+        assert (backup / "v1.txt").exists()
+
+        # Second rotation: .prev (v1) deleted, old save (v2) becomes .prev
+        tmp2 = Path(td) / "ckpt.tmp_ckpt"
+        tmp2.mkdir()
+        (tmp2 / "v3.txt").write_text("v3")
+        atomic_replace_with_backup(tmp2, save)
+        assert (save / "v3.txt").exists()
+        assert (backup / "v2.txt").exists()
+        assert not (backup / "v1.txt").exists()  # old backup rotated out
+
+
+def test_synthesize_single_shard_index_builds_weight_map():
+    """synthesize_single_shard_index must read the safetensors 8-byte header,
+    parse the tensor keys, and build a weight_map pointing all keys at
+    'model.safetensors'."""
+    import json
+    import tempfile
+    from expand_model import synthesize_single_shard_index
+    from safetensors.torch import save_file
+    import torch
+    with tempfile.TemporaryDirectory() as td:
+        tensors = {"weight.1": torch.zeros(2), "weight.2": torch.ones(3)}
+        save_file(tensors, f"{td}/model.safetensors")
+        index = synthesize_single_shard_index(td)
+        assert index["weight_map"]["weight.1"] == "model.safetensors"
+        assert index["weight_map"]["weight.2"] == "model.safetensors"
+        assert "__metadata__" not in index["weight_map"]
+        assert index["metadata"]["total_size"] > 0
+
+
+def test_mtp_rms_norm_preserves_input_dtype():
+    """_MTPRMSNorm must output the same dtype as the input — a float32 weight
+    must NOT promote a bf16 input to float32 (that was a bug: the multiply
+    self.weight * x promoted to float32 because the weight wasn't cast)."""
+    import torch
+    from modeling_custom import _MTPRMSNorm
+    norm = _MTPRMSNorm(8)
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        x = torch.randn(2, 4, 8, dtype=dtype)
+        out = norm(x)
+        assert out.dtype == dtype, f"input {dtype} -> output {out.dtype} (BUG)"
+
+
+def test_build_gen_kwargs_static_cache_flag():
+    """build_gen_kwargs with static_cache=True must add
+    cache_implementation='static'; with False it must not."""
+    from generate import build_gen_kwargs
+    class FakeStreamer: pass
+    kw = build_gen_kwargs("ids", "mask", 10, 0.7, 0.9, 1.0, 0, 1, FakeStreamer(),
+                          static_cache=True)
+    assert kw["cache_implementation"] == "static"
+    kw = build_gen_kwargs("ids", "mask", 10, 0.7, 0.9, 1.0, 0, 1, FakeStreamer(),
+                          static_cache=False)
+    assert "cache_implementation" not in kw

@@ -41,8 +41,13 @@ def main():
                     help="Force HSA_OVERRIDE_GFX_VERSION (e.g. gfx1100) for AMD "
                          "consumer/older cards whose arch isn't in the ROCm torch "
                          "wheel's compiled list. Auto-detected when unset.")
-    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True",
+    ap.add_argument("--hip-alloc-conf", type=str, default="expandable_segments:True,garbage_collection_threshold:0.6",
                     help="Value for PYTORCH_HIP_ALLOC_CONF. Pass 'none' to skip.")
+    ap.add_argument("--preset", type=str, default=None,
+                    help="Hardware preset (cpu, rx6800-16g, rx7900xtx-24g, "
+                         "mi300x-80g, ...). Sets dtype/batch defaults; CLI flags override.")
+    ap.add_argument("--config", type=str, default=None,
+                    help="Path to a TOML/YAML recipe file of overrides.")
     ap.add_argument("--selftest", action="store_true", default=False,
                     help="Run built-in self-test (no GPU required).")
     args = ap.parse_args()
@@ -50,6 +55,23 @@ def main():
     if args.selftest:
         _self_test()
         return
+
+    # Resolve recipe/preset BEFORE the required-arg check (a preset could
+    # supply defaults, though not model/data which are required). Same merge
+    # semantics as train_cpt.py/generate.py: recipe values win over argparse
+    # defaults only when the CLI value still equals the default.
+    if args.preset or args.config:
+        from config import resolve_recipe, apply_preset
+        defaults = {a.dest: a.default for a in ap._actions if hasattr(a, "default")}
+        recipe = resolve_recipe(args.config, base_defaults={})
+        if args.preset:
+            try:
+                recipe = apply_preset(recipe, args.preset)
+            except ValueError as exc:
+                ap.error(str(exc))
+        for key, value in recipe.items():
+            if hasattr(args, key) and getattr(args, key) == defaults.get(key):
+                setattr(args, key, value)
 
     # Validate required args AFTER the --selftest check so `--selftest` alone
     # doesn't trip argparse's required-arg enforcement.
@@ -68,8 +90,7 @@ def main():
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
         from rocm_env import setup_rocm_env
-        hip_conf = None if args.hip_alloc_conf.lower() == "none" else args.hip_alloc_conf
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=hip_conf)
+        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
 
     import torch
     import torch.nn.functional as F
@@ -136,19 +157,29 @@ def main():
     total_loss = 0.0
     total_tokens = 0
 
-    print(f"[evaluate] evaluating {len(texts)} samples ...")
+    # Pre-tokenize all texts once (without padding) so the per-batch loop only
+    # pads + moves to device — it doesn't re-run the text->token pipeline every
+    # batch. Minor win for eval (the real win was pre-tokenization for training,
+    # already done in train_cpt.py), but removes the tokenizer from the timed
+    # eval path.
+    print(f"[evaluate] tokenizing {len(texts)} samples ...")
+    tokenized = [tokenizer(t, truncation=True, max_length=args.seq_length,
+                          add_special_tokens=True)["input_ids"] for t in texts]
+
+    print(f"[evaluate] evaluating {len(tokenized)} samples ...")
     with torch.inference_mode():
-        for i in range(0, len(texts), args.batch_size):
-            batch_texts = texts[i:i + args.batch_size]
-            enc = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=args.seq_length,
-            )
-            input_ids = enc["input_ids"].to(dev.torch_device)
-            attention_mask = enc["attention_mask"].to(dev.torch_device)
+        for i in range(0, len(tokenized), args.batch_size):
+            batch_ids = tokenized[i:i + args.batch_size]
+            max_len = max(len(ids) for ids in batch_ids)
+            pad_id = tokenizer.pad_token_id
+            input_ids = torch.full((len(batch_ids), max_len), pad_id, dtype=torch.long)
+            attention_mask = torch.zeros((len(batch_ids), max_len), dtype=torch.long)
+            for j, ids in enumerate(batch_ids):
+                n = len(ids)
+                input_ids[j, :n] = torch.tensor(ids, dtype=torch.long)
+                attention_mask[j, :n] = 1
+            input_ids = input_ids.to(dev.torch_device)
+            attention_mask = attention_mask.to(dev.torch_device)
 
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100

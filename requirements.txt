@@ -12,6 +12,7 @@
 
 safetensors>=0.4.0
 numpy>=1.24.0
+pyyaml>=6.0  # for --config recipe.yaml (config/loader.py); tomllib covers TOML but YAML needs this
 # Gemma-4 support (Gemma4Config / model_type="gemma4") is NOT in transformers
 # 4.x at all -- verified directly against the real published wheels: no
 # "gemma4" model directory exists as of 4.49.0 through 5.4.0. It first

@@ -38,20 +38,60 @@ read_available_mb() {
 
 # ---------------------------------------------------------------------------
 # GPU backend detection and per-GPU free-VRAM polling.
+# Try KFD sysfs first (fast: ~1ms, no subprocess), then fall back to rocm-smi
+# (~50-100ms per poll, competes for the SMI lock).
 # ---------------------------------------------------------------------------
 GPU_BACKEND="none"
-if command -v rocm-smi >/dev/null 2>&1; then
+if [ -d /sys/class/kfd/topology/nodes ]; then
+    GPU_BACKEND="kfd"
+    echo "[oom_guard] GPU backend: KFD sysfs (/sys/class/kfd)"
+elif command -v rocm-smi >/dev/null 2>&1; then
     GPU_BACKEND="rocm"
     echo "[oom_guard] GPU backend: ROCm (rocm-smi)"
 else
-    echo "[oom_guard] no rocm-smi found -- GPU-VRAM checks skipped (system-RAM only)."
+    echo "[oom_guard] no KFD sysfs or rocm-smi found -- GPU-VRAM checks skipped (system-RAM only)."
 fi
 
 read_all_vram_free_mb() {
     # Prints one line per GPU: "<index> <free_mb>". Empty output means unavailable.
-    if [ "$GPU_BACKEND" = "rocm" ]; then
+    if [ "$GPU_BACKEND" = "kfd" ]; then
+        _read_kfd_vram
+    elif [ "$GPU_BACKEND" = "rocm" ]; then
         _read_rocm_vram
     fi
+}
+
+_read_kfd_vram() {
+    # Read per-GPU free VRAM from KFD sysfs topology. Each GPU node has a
+    # mem_banks subdir with properties files containing "Size in bytes" and
+    # "Used bytes". This is ~100x faster than spawning rocm-smi (no subprocess)
+    # and doesn't compete for the SMI lock.
+    local idx=0
+    for node in /sys/class/kfd/topology/nodes/*/; do
+        [ -d "$node" ] || continue
+        # Skip CPU-only nodes (no mem_banks).
+        local mem_dir="${node}mem_banks/"
+        [ -d "$mem_dir" ] || { idx=$((idx + 1)); continue; }
+        for bank in "$mem_dir"*/; do
+            [ -d "$bank" ] || continue
+            local props="${bank}properties"
+            [ -f "$props" ] || continue
+            local size_bytes=0 used_bytes=0
+            while IFS=' ' read -r key val; do
+                case "$key" in
+                    "Size") size_bytes="$val" ;;
+                    "Used") used_bytes="$val" ;;
+                esac
+            done < "$props"
+            if [ "$size_bytes" -gt 0 ] 2>/dev/null; then
+                local free_bytes=$((size_bytes - used_bytes))
+                local free_mb=$((free_bytes / 1024 / 1024))
+                echo "$idx $free_mb"
+                break  # one bank per GPU (VRAM)
+            fi
+        done
+        idx=$((idx + 1))
+    done
 }
 
 _read_rocm_vram() {
