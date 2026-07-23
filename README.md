@@ -10,7 +10,10 @@ crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
 `benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
 data in, compare configs before committing to a long run, and actually talk
 to the model you just trained. Every tool ships its own `--selftest` or
-pytest coverage (the two shell scripts, `catch_and_resume.sh` and `oom_guard.sh`, are not covered by selftests or pytest — their logic is exercised manually; see [Testing](#testing)) and is independently runnable —
+pytest coverage — including the two shell scripts (`catch_and_resume.sh` and
+`oom_guard.sh`, covered by `tests/test_shell.py` via pytest+subprocess with
+faked `/proc/meminfo`, stubbed `rocm-smi`, and a fake `train_cpt.py`; see
+[Testing](#testing)) — and is independently runnable —
 use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
@@ -82,14 +85,28 @@ Every model-specific constant — the embedding tensor's key name, the
 vocab_size config path, the layer-naming prefix, the sharding size, the
 depth/width step sizes, the GQA head count — is a CLI flag, defaulting to
 the Gemma-4 layout these tools were built against but pointable at whatever
-your own checkpoint actually uses. The one piece that isn't a flag is
-`expand_model.py`'s submodule key *suffixes*
-(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`),
-because those names are shared by most Llama-derived decoder architectures
-(Llama, Mistral, Qwen2/3, every Gemma generation) — verified directly
-against the installed `transformers` library's modeling source. They're not
-universal: GPT-2, the original Phi, Phi-3, Falcon, MPT, and BLOOM use
-different, fused-QKV naming and need code changes (not a flag) to support.
+your own checkpoint actually uses. `expand_model.py`'s submodule key
+*suffixes* (`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/
+`o_proj`) used to be hardcoded, because those names are shared by most
+Llama-derived decoder architectures (Llama, Mistral, Qwen2/3, every Gemma
+generation) — verified directly against the installed `transformers`
+library's modeling source. They're not universal, though: GPT-2, the
+original Phi, Phi-3, Falcon, MPT, and BLOOM use different, fused-QKV naming.
+Those suffixes are now sourced from a model-family registry
+(`models.registry`, auto-detected from `config.json`'s `model_type` before
+any tensor is touched, overridable via `--model-family`) rather than
+hardcoded — the same detect-before-you-act pattern the GQA fix below uses.
+GPT-2 is the first fused-QKV architecture with real code support there: its
+`c_attn` is a `Conv1D` (weight stored transposed, Q|K|V fused as column
+blocks), so width expansion pads the opposite axis from the `nn.Linear` case
+and grows the Conv1D biases in lockstep with the weights, and the GQA pass
+is skipped outright (a fused layout has no separate `v_proj` for it to
+target). Verified end-to-end against a real GPT-2 checkpoint: expand →
+`from_pretrained` load (zero missing/unexpected keys) → forward pass (no
+NaN/Inf) → the zeroed-output-projection duplicate layers confirmed
+numerically no-op. Phi-3/Falcon/MPT/BLOOM still need per-architecture code
+(not a flag) to support; they fail cleanly with a `KeyError` on a missing
+tensor key rather than silently doing the wrong thing.
 `expand_model.py`'s GQA fix runs a detection pass against the loaded
 checkpoint's real tensors before touching anything, and skips cleanly with
 a logged reason if the checkpoint doesn't match the MQA layout it targets,
@@ -933,8 +950,17 @@ Each module with logic that can be tested without a real checkpoint ships a
 `prune_embeddings_torch.py`, `expand_model.py`) are covered by the pytest suite
 in [`tests/`](tests/) instead — they need a real checkpoint to run their
 `main()` for real, so their pure-logic functions (depth planning, orthogonal
-padding shapes, merge-format parsing, the MQA layout detection) get exercised
-directly instead. CI (`.github/workflows/selftest.yml`) runs both on every
+padding shapes, merge-format parsing, the MQA layout detection, the GPT-2
+Conv1D width-axis handling) get exercised directly instead. The two shell
+scripts (`catch_and_resume.sh`, `oom_guard.sh`) are covered by
+[`tests/test_shell.py`](tests/test_shell.py), which drives them as subprocesses
+with faked inputs: a fake `train_cpt.py` that exits on command and writes a
+fake `training_state.pt`, a faked `/proc/meminfo` (via an `OOM_GUARD_MEMINFO`
+env override the script supports), and a stubbed `rocm-smi` on PATH — so the
+supervisor's retry-cap / stop-file / loss-regression-rollback / history-pruning
+logic and the guard's warn-vs-emergency thresholds / SIGTERM-on-emergency /
+VRAM-JSON-parsing logic are all exercised automatically, not manually. CI
+(`.github/workflows/selftest.yml`) runs the full pytest suite on every
 push/PR.
 
 ```bash
