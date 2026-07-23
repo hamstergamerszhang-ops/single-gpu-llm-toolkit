@@ -19,11 +19,20 @@ import shutil
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", required=True, help="Source checkpoint directory.")
-    ap.add_argument("--dst", required=True, help="Output directory.")
+    ap.add_argument("--src", help="Source checkpoint directory.")
+    ap.add_argument("--dst", help="Output directory.")
     ap.add_argument("--max-shard-bytes", type=int, default=None,
                     help="If set, shard output so no file exceeds this many bytes.")
+    ap.add_argument("--selftest", action="store_true", default=False,
+                    help="Run built-in self-test (no GPU required).")
     args = ap.parse_args()
+
+    if args.selftest:
+        _self_test()
+        return
+
+    if not args.src or not args.dst:
+        ap.error("--src and --dst are required (unless --selftest).")
 
     from safetensors.torch import load_file, save_file
 
@@ -68,6 +77,60 @@ def main():
     else:
         save_file(tensors, os.path.join(args.dst, "model.safetensors"))
         print(f"[export_safetensors] wrote {len(tensors)} tensors to {args.dst}/model.safetensors")
+
+
+def _self_test():
+    """Self-test: create a sharded checkpoint, consolidate it, verify the
+    output is a single model.safetensors with all tensors + non-weight files
+    copied (no GPU required)."""
+    import tempfile
+    import torch
+    from safetensors.torch import save_file
+    print("[selftest] export_safetensors: consolidate sharded checkpoint (no GPU)")
+
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "src")
+        os.makedirs(src)
+        # Write a fake sharded checkpoint: 2 shards + index + config.json.
+        tensors1 = {"layer.0.weight": torch.zeros(4), "layer.0.bias": torch.ones(4)}
+        tensors2 = {"layer.1.weight": torch.zeros(2)}
+        save_file(tensors1, os.path.join(src, "model-00001-of-00002.safetensors"))
+        save_file(tensors2, os.path.join(src, "model-00002-of-00002.safetensors"))
+        index = {
+            "metadata": {"total_size": 40},
+            "weight_map": {
+                "layer.0.weight": "model-00001-of-00002.safetensors",
+                "layer.0.bias": "model-00001-of-00002.safetensors",
+                "layer.1.weight": "model-00002-of-00002.safetensors",
+            },
+        }
+        with open(os.path.join(src, "model.safetensors.index.json"), "w") as f:
+            json.dump(index, f)
+        with open(os.path.join(src, "config.json"), "w") as f:
+            json.dump({"model_type": "test"}, f)
+
+        # Run the consolidation via main() by simulating argv.
+        import sys
+        dst = os.path.join(td, "dst")
+        old_argv = sys.argv
+        sys.argv = ["export_safetensors.py", "--src", src, "--dst", dst]
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+        # Verify: single model.safetensors with all 3 tensors.
+        assert os.path.exists(os.path.join(dst, "model.safetensors"))
+        assert not os.path.exists(os.path.join(dst, "model.safetensors.index.json"))
+        # config.json must be copied (non-weight file).
+        assert os.path.exists(os.path.join(dst, "config.json"))
+        # All tensors present.
+        from safetensors.torch import load_file
+        loaded = load_file(os.path.join(dst, "model.safetensors"))
+        assert set(loaded.keys()) == {"layer.0.weight", "layer.0.bias", "layer.1.weight"}, loaded.keys()
+        print("  OK (3 tensors consolidated into single model.safetensors, config.json copied)")
+
+    print("\n[selftest] All checks passed.")
 
 
 if __name__ == "__main__":

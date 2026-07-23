@@ -530,7 +530,7 @@ def main():
         # No index -- synthesize one for the single-file checkpoint.
         src_index = synthesize_single_shard_index(args.src)
         shard_files = ["model.safetensors"]
-        log(f"no index.json found -- synthesized one for the single-file checkpoint")
+        log("no index.json found -- synthesized one for the single-file checkpoint")
 
     log(f"loading {len(shard_files)} source shards ...")
     tensors = {}

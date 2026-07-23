@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import os
-import sys
 
 
 def log(msg: str):
@@ -104,7 +103,6 @@ def batch_generate(model, tokenizer, prompts: list[str], max_new_tokens: int,
     prefill+decode cycles).
     """
     import torch
-    from transformers import TextStreamer
 
     # Left-pad so generation appends to the right of every prompt.
     tokenizer.padding_side = "left"
@@ -187,8 +185,8 @@ def _load_model_and_tokenizer(args, dev):
         auto_mode = args.compile_mode
         if args.compile_mode == "max-autotune" and dev.supports_fp8():
             auto_mode = "reduce-overhead"
-            log(f"torch.compile: auto-selected mode='reduce-overhead' "
-                f"(MI300-class arch — cudagraph tree capture for decode)")
+            log("torch.compile: auto-selected mode='reduce-overhead' "
+                "(MI300-class arch — cudagraph tree capture for decode)")
         try:
             model = torch.compile(model, mode=auto_mode)
             log(f"torch.compile enabled (mode={auto_mode})")
@@ -326,9 +324,6 @@ def main():
     if args.model_family:
         os.environ["MODEL_FAMILY"] = args.model_family
         log(f"model_family={args.model_family} (set via env for modeling_custom.py)")
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from backends import BackendDevice
     dev = BackendDevice(backend=args.backend, index=args.device_index)

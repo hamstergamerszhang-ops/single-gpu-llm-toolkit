@@ -83,7 +83,7 @@ def main():
         # mtp_head.py; now one canonical implementation in expand_model.py).
         from expand_model import synthesize_single_shard_index
         index = synthesize_single_shard_index(src)
-        print(f"[prune_embed] no index.json found -- synthesized one for the single-file checkpoint")
+        print("[prune_embed] no index.json found -- synthesized one for the single-file checkpoint")
 
     embed_shard = index["weight_map"][embed_key]
     all_shards = sorted(set(index["weight_map"].values()))

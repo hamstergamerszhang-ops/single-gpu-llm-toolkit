@@ -13,7 +13,6 @@ fp8) via the shared runtime.DTYPE_MAP + resolve_dtype.
 import argparse
 import json
 import math
-import os
 import sys
 
 
@@ -93,7 +92,6 @@ def main():
         setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
 
     import torch
-    import torch.nn.functional as F
 
     from backends import default_device
     from runtime import DTYPE_MAP, resolve_dtype

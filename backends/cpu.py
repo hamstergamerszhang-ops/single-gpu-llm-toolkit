@@ -1,7 +1,5 @@
 """CPU backend — always available, always the safe fallback."""
 
-import torch
-
 from backends.base import ComputeBackend
 
 

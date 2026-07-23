@@ -167,7 +167,10 @@ else:
 
 # ---------------------------------------------------------------------------
 # Pure MTP helpers (duplicated here so this file is self-contained when copied
-# to a checkpoint directory outside the repo root).
+# to a checkpoint directory outside the repo root — it can't import models.mtp
+# from a checkpoint dir). The canonical source is models/mtp.py; if you change
+# the logic there, update this copy too (a bidirectional test pins the
+# equivalence: test_shift_labels matches both implementations).
 # ---------------------------------------------------------------------------
 def _shift_labels(
     input_ids: Optional[torch.Tensor],

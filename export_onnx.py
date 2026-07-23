@@ -32,7 +32,7 @@ def main():
         ap.error("--src and --dst are required (unless --selftest).")
 
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
     except ImportError as exc:
         raise SystemExit("transformers is required for ONNX export") from exc
 

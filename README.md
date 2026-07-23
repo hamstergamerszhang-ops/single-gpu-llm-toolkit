@@ -597,6 +597,18 @@ between attempts instead of having to reach for `kill -9`.
 ./catch_and_resume.sh
 ```
 
+By default the supervisor runs `train_cpt.py` with `--cpt` (continued
+pretraining). To supervise an SFT run instead, set `MODE=sft`:
+
+```
+MODE=sft ./catch_and_resume.sh
+```
+
+This switches the launched script to `train_sft.py` and drops the `--cpt`
+flag (SFT uses its own builder). Everything else — save/resume, async
+checkpointing, loss-rollback, bounded retry — works identically for both
+modes.
+
 ## `preprocess_data.py` — dedup, filter, and pack training data
 
 The rest of this pipeline assumes your JSONL is already reasonably clean, and
@@ -674,8 +686,29 @@ that would actually cost you real wall-clock time, recomputing every prior
 token's attention on every new token. Interactive mode (type prompts,
 Ctrl+D to exit) or batch mode (`--input prompts.txt`, one prompt per line).
 
+Inference optimization flags:
+
+- **`--compile`** — `torch.compile()` the model. On MI300-class (gfx94x),
+  auto-selects `mode="reduce-overhead"` (HIP graph capture of the decode step,
+  1.5-3× TPOT improvement); on RDNA consumer cards, uses `mode="max-autotune"`.
+  A 1-token warmup forward captures the decode shape for cudagraph.
+- **`--static-cache`** — use HF `StaticCache` (pre-allocated KV tensors) instead
+  of dynamic allocation. Pairs with `--compile --compile-mode reduce-overhead`
+  for HIP graph capture. Only works for single-prompt generation (interactive
+  mode); auto-disabled in `--input` batch mode (variable prompt lengths break
+  the pre-allocated shape).
+- **`--speculative`** — request speculative decoding via the model's MTP head.
+  **Not yet implemented** (the MTP head isn't a standalone module; HF's
+  `generate()` needs a separate `assistant_model`). The flag is accepted and
+  prints an honest "not yet implemented" note. Standard decoding is used.
+- **Batched generation** — when `--input` has multiple prompts, they're
+  processed in a single batched forward pass (left-padded) instead of
+  sequentially, giving 2-4× throughput for multi-prompt inference.
+
 ```
 python3 generate.py --model ./checkpoints/model_cpt_1 --flash-attn --dtype fp8
+python3 generate.py --model ./checkpoints/model_cpt_1 --compile --static-cache
+python3 generate.py --model ./checkpoints/model_cpt_1 --input prompts.txt
 ```
 
 ## `compress_model.py` — quantize any model (int8/int4/fp8)
@@ -1054,7 +1087,7 @@ for f in train_cpt.py async_checkpoint.py bnb_optimizer.py \
          rocm_env.py mtp_head.py train_sft.py \
          preprocess_data.py benchmark.py generate.py \
          compress_model.py tensor_parallel.py smart_hipify.py \
-         evaluate.py export_gguf.py export_onnx.py; do
+         evaluate.py export_gguf.py export_onnx.py export_safetensors.py; do
   python3 "$f" --selftest
 done
 pytest tests/ -v

@@ -170,7 +170,7 @@ def hipify_text(source: str) -> tuple:
         if count > 0:
             # Insert a TODO comment before the first occurrence.
             todo_comment = f"/* HIPIFY: TODO — {cuda_call} → {rocmm_eq} "
-            todo_comment += f"requires manual conversion (API differs) */\n"
+            todo_comment += "requires manual conversion (API differs) */\n"
             # Find the first occurrence's line and prepend the comment. MUST
             # use the same word-boundary `pattern` used for `count` above, not
             # a plain substring check -- a prior version did `if cuda_call in
@@ -291,13 +291,13 @@ def main():
         if report["kernels_found"]:
             log(f"  kernels found (__global__): {report['kernels_found']}")
         if report["hip_header_added"]:
-            log(f"  added #include <hip/hip_runtime.h>")
+            log("  added #include <hip/hip_runtime.h>")
         for w in report["warnings"]:
             log(f"  WARNING: {w}")
             total_warnings += 1
         if not report["api_substitutions"] and not report["header_substitutions"] \
            and not report["library_calls_flagged"]:
-            log(f"  (no CUDA APIs found — file may already be HIP or has no CUDA code)")
+            log("  (no CUDA APIs found — file may already be HIP or has no CUDA code)")
 
     log(f"\nsummary: {total_subs} API substitutions, {total_flags} library calls "
         f"flagged for manual conversion, {total_warnings} warnings, "

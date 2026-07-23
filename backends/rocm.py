@@ -1,7 +1,5 @@
 """AMD ROCm (HIP) backend."""
 
-import os
-
 import torch
 
 from backends.base import ComputeBackend

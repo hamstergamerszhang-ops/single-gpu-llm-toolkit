@@ -491,9 +491,9 @@ def setup_rocm_env(override=None,
                       "not overriding",
         }
         if verbose:
-            print(f"[rocm_env] no AMD GPU arch detected (rocm-smi and /sys/class/kfd "
-                  f"both unavailable) — not setting HSA_OVERRIDE_GFX_VERSION. "
-                  f"If you're on an AMD card, check that rocm-smi is on PATH.")
+            print("[rocm_env] no AMD GPU arch detected (rocm-smi and /sys/class/kfd "
+                  "both unavailable) — not setting HSA_OVERRIDE_GFX_VERSION. "
+                  "If you're on an AMD card, check that rocm-smi is on PATH.")
         return info
 
     if torch_arch_list is None:

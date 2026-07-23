@@ -244,7 +244,7 @@ def main():
 
     # Dry run: don't load shards, just project shapes from config.
     if args.dry_run:
-        log(f"DRY RUN — planned new tensors (per depth):")
+        log("DRY RUN — planned new tensors (per depth):")
         log(f"  {args.mtp_prefix}.{{i}}.enorm.weight: ({hidden},)")
         log(f"  {args.mtp_prefix}.{{i}}.eh_proj.weight: ({hidden}, {2*hidden})")
         log(f"  {args.mtp_prefix}.{{i}}.block.<suffix>: cloned from {args.layer_prefix}.{num_layers - 1}")
@@ -252,7 +252,7 @@ def main():
         log(f"  {args.mtp_prefix}.norm.weight: ({hidden},)  [shared final]")
         log(f"  eh_proj params/depth: {hidden * 2 * hidden:,} "
             f"({hidden * 2 * hidden * 2 / 1024**3:.2f}GB at bf16)")
-        log(f"  (block params depend on layer width — load for real to count exactly)")
+        log("  (block params depend on layer width — load for real to count exactly)")
         log("Nothing written.")
         return
 
@@ -456,10 +456,7 @@ def _self_test():
 
         # Shards loadable and the MTP tensor is present on disk.
         from safetensors.torch import load_file as lf
-        any_shard = list(set(out_index["weight_map"].values()))[0]
-        loaded = lf(dst / any_shard)
-        # At least one MTP key should land in whatever shard we picked if it's
-        # the shard holding eh_proj; instead check across all shards.
+        # Check across all shards (the MTP key could be in any of them).
         all_loaded = {}
         for shard in set(out_index["weight_map"].values()):
             all_loaded.update(lf(dst / shard))

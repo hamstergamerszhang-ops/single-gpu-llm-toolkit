@@ -71,7 +71,7 @@ jobs:
       - name: Run module self-tests
         run: |
           # Only modules with a --selftest flag (transformation tools like
-          # prune_vocab/expand_model/export_safetensors need real checkpoints,
+          # prune_vocab/expand_model need real checkpoints,
           # so they have no self-test — they're covered by the pytest suite's
           # logic tests). train_sft.py needs transformers installed above --
           # its selftest imports build_sft_example to verify the symbol exists
@@ -81,7 +81,7 @@ jobs:
                    rocm_env.py mtp_head.py train_sft.py \
                    preprocess_data.py benchmark.py generate.py \
                    compress_model.py tensor_parallel.py smart_hipify.py \
-                   evaluate.py export_gguf.py export_onnx.py; do
+                   evaluate.py export_gguf.py export_onnx.py export_safetensors.py; do
             echo "=== $f --selftest ==="
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done
@@ -120,7 +120,7 @@ jobs:
                    rocm_env.py mtp_head.py train_sft.py \
                    preprocess_data.py benchmark.py generate.py \
                    compress_model.py tensor_parallel.py smart_hipify.py \
-                   evaluate.py export_gguf.py export_onnx.py; do
+                   evaluate.py export_gguf.py export_onnx.py export_safetensors.py; do
             echo "=== $f --selftest ==="
             python "$f" --selftest || { echo "FAILED: $f"; exit 1; }
           done

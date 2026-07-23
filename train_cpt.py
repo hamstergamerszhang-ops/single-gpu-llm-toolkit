@@ -1013,8 +1013,8 @@ _SHOULD_STOP = False
 
 def _on_sigterm(signum, frame):
     global _SHOULD_STOP
-    print(f"\n[signal] received SIGTERM -- will checkpoint after the current step "
-          f"and exit", file=sys.stderr)
+    print("\n[signal] received SIGTERM -- will checkpoint after the current step "
+          "and exit", file=sys.stderr)
     _SHOULD_STOP = True
 
 
@@ -1459,9 +1459,9 @@ def main():
                       f"{', '.join(_liger_fns.keys())}) — using stock kernels")
         except ImportError:
             if is_main:
-                print(f"[cpt] Liger Kernel not installed — using stock kernels. "
-                      f"Install with 'pip install liger-kernel' for ~15-30% "
-                      f"throughput win (fused RMSNorm+CE).", file=sys.stderr)
+                print("[cpt] Liger Kernel not installed — using stock kernels. "
+                      "Install with 'pip install liger-kernel' for ~15-30% "
+                      "throughput win (fused RMSNorm+CE).", file=sys.stderr)
         except Exception as e:
             if is_main:
                 print(f"[cpt] Liger Kernel apply failed ({e}) — using stock kernels",
@@ -1731,9 +1731,9 @@ def main():
             tb_writer = SummaryWriter(args.tb)
             print(f"[cpt] TensorBoard logging -> {args.tb}")
         except ImportError:
-            print(f"[cpt] WARNING: --tb set but tensorboard not installed — "
-                  f"falling back to stdout-only logging. Install with "
-                  f"'pip install tensorboard'.", file=sys.stderr)
+            print("[cpt] WARNING: --tb set but tensorboard not installed — "
+                  "falling back to stdout-only logging. Install with "
+                  "'pip install tensorboard'.", file=sys.stderr)
             tb_writer = None
 
     model.train()

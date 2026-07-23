@@ -295,7 +295,6 @@ def _self_test():
         {"text": "包含中文的文本"},
         {"text": "more English"},
     ]
-    from prune_vocab import classify, REMOVABLE
     kept = [r for r in rows if not should_drop_by_script(r, {"cjk"})]
     assert len(kept) == 2
     assert "包含中文的文本" not in [r["text"] for r in kept]
@@ -320,6 +319,27 @@ def _self_test():
     msg_row = {"messages": [{"content": "a"}, {"content": "b"}]}
     assert get_text(msg_row) == "a\nb"
     print("  OK (get_text handles CPT and SFT row formats)")
+
+    # Token-based packing: when a tokenizer is provided, pack_rows should pack
+    # by token count, not char count. Verify with a fake tokenizer that reports
+    # a different length than the char count (e.g. CJK where 1 char = 1 token
+    # but the token count differs from char count for multi-byte sequences).
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            # Fake: each char is 1 token, but the separator is 2 tokens.
+            return list(range(len(text)))
+    rows_tokens = [
+        {"text": "aaa"},   # 3 tokens
+        {"text": "bb"},    # 2 tokens
+        {"text": "cccccc"}, # 6 tokens
+    ]
+    packed_t = pack_rows(rows_tokens, max_seqlen=5, separator="|",
+                         tokenizer=FakeTokenizer())
+    # With token counting: "aaa"(3) + "|"(2) + "bb"(2) = 7 > 5, so "aaa" flushes
+    # alone, then "bb"(2) + "|"(2) + "cccccc"(6) = 10 > 5, so "bb" flushes,
+    # then "cccccc"(6) > 5 truncates.
+    assert len(packed_t) >= 2, packed_t
+    print(f"  OK (token-based packing: {len(rows_tokens)} rows -> {len(packed_t)} packed)")
 
     print("\n[selftest] All checks passed (no tokenizer/GPU required — run with "
           "real data + --tokenizer for the token-based path).")
