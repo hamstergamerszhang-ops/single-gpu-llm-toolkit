@@ -922,6 +922,270 @@ def test_clone_layer_tensors_copies_and_zeros_outputs():
                        tensors[f"{prefix}.mlp.gate_proj.weight"])
 
 
+# ── expand_model.py GPT-2 fused-QKV (Conv1D) architecture ──────────────────
+
+def _write_gpt2_style_checkpoint(root: Path, n_inner_explicit: bool = True):
+    """Builds a real, on-disk GPT-2-shaped checkpoint: config.json with the
+    ORIGINAL OpenAI n_* key names (n_embd/n_layer/n_head/n_inner/n_positions --
+    verified against GPT2Config().to_dict() on transformers 5.7.0 that GPT-2
+    configs do NOT serialize the unified hidden_size/num_hidden_layers names),
+    plus safetensors weights with the GPT-2 tensor layout verified directly
+    against the installed transformers GPT2Block/GPT2Attention/GPT2MLP __init__:
+
+      - c_attn = Conv1D(3*hidden, hidden) -> weight (hidden, 3*hidden), with
+        Q|K|V as three equal column-blocks along dim=1. Conv1D stores the
+        weight TRANSPOSED vs nn.Linear ("basically works like a linear layer
+        but the weights are transposed" -- Conv1D docstring).
+      - c_fc = Conv1D(intermediate, hidden) -> weight (hidden, intermediate).
+      - c_proj (attn) = Conv1D(hidden, hidden) -> weight (hidden, hidden).
+      - c_proj (mlp) = Conv1D(hidden, intermediate) -> weight (intermediate, hidden).
+      - layer path is transformer.h.{i}, attn submodule is `attn` (not self_attn).
+      - lm_head is tied to transformer.wte.weight.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    hidden, n_layers, n_head, intermediate = 32, 4, 4, 64
+    cfg = {
+        "model_type": "gpt2",
+        "n_embd": hidden,
+        "n_layer": n_layers,
+        "n_head": n_head,
+        "n_positions": 128,
+        "vocab_size": 100,
+        "activation_function": "gelu_new",
+        "layer_norm_epsilon": 1e-5,
+    }
+    if n_inner_explicit:
+        cfg["n_inner"] = intermediate
+    # else: n_inner absent -> expand_model resolves it to 4*hidden
+    with open(root / "config.json", "w") as f:
+        json.dump(cfg, f)
+
+    tensors = {
+        "transformer.wte.weight": torch.randn(100, hidden).to(torch.bfloat16),
+        "transformer.wpe.weight": torch.randn(128, hidden).to(torch.bfloat16),
+        "transformer.ln_f.weight": torch.ones(hidden).to(torch.bfloat16),
+        "transformer.ln_f.bias": torch.zeros(hidden).to(torch.bfloat16),
+    }
+    for i in range(n_layers):
+        p = f"transformer.h.{i}"
+        # c_attn (hidden, 3*hidden) -- fused QKV
+        tensors[f"{p}.attn.c_attn.weight"] = torch.randn(hidden, 3 * hidden).to(torch.bfloat16)
+        tensors[f"{p}.attn.c_attn.bias"] = torch.randn(3 * hidden).to(torch.bfloat16)
+        # attn output proj c_proj (hidden, hidden)
+        tensors[f"{p}.attn.c_proj.weight"] = torch.randn(hidden, hidden).to(torch.bfloat16)
+        tensors[f"{p}.attn.c_proj.bias"] = torch.randn(hidden).to(torch.bfloat16)
+        # ln_1 / ln_2
+        tensors[f"{p}.ln_1.weight"] = torch.ones(hidden).to(torch.bfloat16)
+        tensors[f"{p}.ln_1.bias"] = torch.zeros(hidden).to(torch.bfloat16)
+        tensors[f"{p}.ln_2.weight"] = torch.ones(hidden).to(torch.bfloat16)
+        tensors[f"{p}.ln_2.bias"] = torch.zeros(hidden).to(torch.bfloat16)
+        # c_fc (hidden, intermediate) -- up projection
+        tensors[f"{p}.mlp.c_fc.weight"] = torch.randn(hidden, intermediate).to(torch.bfloat16)
+        tensors[f"{p}.mlp.c_fc.bias"] = torch.randn(intermediate).to(torch.bfloat16)
+        # c_proj (intermediate, hidden) -- down projection
+        tensors[f"{p}.mlp.c_proj.weight"] = torch.randn(intermediate, hidden).to(torch.bfloat16)
+        tensors[f"{p}.mlp.c_proj.bias"] = torch.randn(hidden).to(torch.bfloat16)
+    save_file(tensors, str(root / "model.safetensors"))
+    index = {"metadata": {"total_size": 0},
+             "weight_map": {k: "model.safetensors" for k in tensors}}
+    with open(root / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+
+def test_expand_model_gpt2_width_grows_conv1d_on_correct_axis():
+    """GPT-2's c_fc/c_proj/c_attn are HF Conv1D -- weights stored TRANSPOSED
+    as (in, out) -- so width expansion must pad the axis OPPOSITE the nn.Linear
+    case. For c_fc = (hidden, intermediate) the OUTPUT dim (intermediate) is
+    dim=1, not dim=0; for c_proj = (intermediate, hidden) the INPUT dim is
+    dim=0, not dim=1. A bug that used the linear axes would grow the wrong
+    dimension and either crash at load or silently corrupt the checkpoint.
+    This drives main() end-to-end on a real on-disk GPT-2 checkpoint and
+    asserts the expanded shapes + config writeback are correct."""
+    import sys
+    import torch
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_gpt2_style_checkpoint(src, n_inner_explicit=True)
+        dst = Path(td) / "dst"
+
+        width_step = 16
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--width-step", str(width_step), "--depth-step", "0",
+                "--layer-prefix", "transformer.h", "--gqa-kv-heads", "0"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()  # must not raise
+        finally:
+            sys.argv = old_argv
+
+        # Config writeback must use GPT-2's n_inner key (not intermediate_size).
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        assert out_cfg["n_inner"] == 64 + width_step, \
+            f"n_inner should be grown by width_step, got {out_cfg.get('n_inner')}"
+        assert "intermediate_size" not in out_cfg, \
+            "must not create a spurious Llama-name key on a GPT-2 config"
+        assert out_cfg["n_layer"] == 4  # depth-step 0, unchanged
+
+        # write_sharded names files model-00001-of-00001.safetensors (the
+        # standard HF sharded layout), not model.safetensors -- load via glob.
+        from safetensors.torch import load_file
+        sd = {}
+        for shard in sorted(dst.glob("model-*.safetensors")):
+            sd.update(load_file(str(shard)))
+        hidden, new_inter = 32, 64 + width_step
+        # c_fc (hidden, intermediate) -> grew along dim=1 (the output dim)
+        assert sd["transformer.h.0.mlp.c_fc.weight"].shape == (hidden, new_inter), \
+            sd["transformer.h.0.mlp.c_fc.weight"].shape
+        # c_proj (intermediate, hidden) -> grew along dim=0 (the input dim)
+        assert sd["transformer.h.0.mlp.c_proj.weight"].shape == (new_inter, hidden), \
+            sd["transformer.h.0.mlp.c_proj.weight"].shape
+        # c_attn (hidden, 3*hidden) -> untouched by width expansion (it's the
+        # attention input projection, not the MLP). Confirms width only grew MLP.
+        assert sd["transformer.h.0.attn.c_attn.weight"].shape == (hidden, 3 * hidden)
+        # No NaN/Inf introduced by the orthogonal pad
+        assert torch.isfinite(sd["transformer.h.0.mlp.c_fc.weight"]).all()
+        assert torch.isfinite(sd["transformer.h.0.mlp.c_proj.weight"]).all()
+
+
+def test_expand_model_gpt2_depth_duplicates_and_zeros_output_projections():
+    """GPT-2 duplicates the layer path transformer.h.{i}; the duplicated
+    layer's OUTPUT projections (attn.c_proj + mlp.c_proj) must be zeroed so the
+    new layer is a true no-op. Critically, GPT-2 reuses the leaf name 'c_proj'
+    for BOTH attn-output and mlp-output -- the zeroing must be path-segment-
+    aware (attn.c_proj vs mlp.c_proj), not leaf-name-aware, or it would zero
+    the wrong tensors."""
+    import sys
+    import torch
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_gpt2_style_checkpoint(src, n_inner_explicit=True)
+        dst = Path(td) / "dst"
+
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--width-step", "0", "--depth-step", "1",
+                "--interleave-every", "2", "--layer-prefix", "transformer.h",
+                "--gqa-kv-heads", "0"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        assert out_cfg["n_layer"] == 5  # 4 + 1 duplicate
+
+        from safetensors.torch import load_file
+        sd = {}
+        for shard in sorted(dst.glob("model-*.safetensors")):
+            sd.update(load_file(str(shard)))
+        # The duplicated layer is at index 2 (inserted after old layer 1, since
+        # interleave_every=2 means a dup follows old_idx 1). Its output
+        # projections must be zero; its input projections must clone the donor.
+        # Find which new index is the duplicate by checking for zeroed c_proj.
+        dup_idx = None
+        for i in range(5):
+            attn_o = sd.get(f"transformer.h.{i}.attn.c_proj.weight")
+            mlp_down = sd.get(f"transformer.h.{i}.mlp.c_proj.weight")
+            if attn_o is not None and torch.all(attn_o == 0) and \
+               mlp_down is not None and torch.all(mlp_down == 0):
+                dup_idx = i
+                break
+        assert dup_idx is not None, "no duplicated layer with zeroed output projections found"
+        # The duplicated layer's INPUT projections must NOT be zero (they clone
+        # the donor's real weights).
+        assert not torch.all(sd[f"transformer.h.{dup_idx}.attn.c_attn.weight"] == 0), \
+            "duplicated layer's c_attn (input proj) must clone donor, not be zeroed"
+        assert not torch.all(sd[f"transformer.h.{dup_idx}.mlp.c_fc.weight"] == 0), \
+            "duplicated layer's c_fc (input proj) must clone donor, not be zeroed"
+
+
+def test_expand_model_gpt2_gqa_skipped_for_fused_qkv():
+    """The GQA/MQA fix targets separate k_proj/v_proj weights. GPT-2's fused
+    c_attn has neither -- the fix must be skipped cleanly (no 'v_proj not found'
+    false-mismatch), and the config must NOT gain attention_k_eq_v or any
+    kv-head change it didn't actually apply."""
+    import sys
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_gpt2_style_checkpoint(src, n_inner_explicit=True)
+        dst = Path(td) / "dst"
+
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--width-step", "0", "--depth-step", "0",
+                "--layer-prefix", "transformer.h"]  # default --gqa-kv-heads 8
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()  # must not raise / must not KeyError on missing v_proj
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        assert "attention_k_eq_v" not in out_cfg, \
+            "GQA fix must not apply to a fused-QKV family"
+        assert out_cfg.get("n_head") == 4  # untouched
+
+
+def test_expand_model_gpt2_n_inner_absent_resolves_to_4x_hidden():
+    """Real GPT-2 configs often omit n_inner entirely (the modeling code then
+    uses 4*n_embd). expand_model must resolve this None to the real intermediate
+    size the weights were built with, not crash on None arithmetic."""
+    import sys
+    from expand_model import main
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        # n_inner absent -> weights were built with 4*hidden = 128
+        _write_gpt2_style_checkpoint(src, n_inner_explicit=False)
+        # Rewrite the weights to match the 4*hidden intermediate the fixture
+        # would have used if n_inner were absent.
+        import torch
+        from safetensors.torch import save_file, load_file
+        sd = load_file(str(src / "model.safetensors"))
+        hidden, intermediate = 32, 4 * 32
+        for i in range(4):
+            p = f"transformer.h.{i}"
+            sd[f"{p}.mlp.c_fc.weight"] = torch.randn(hidden, intermediate).to(torch.bfloat16)
+            sd[f"{p}.mlp.c_fc.bias"] = torch.randn(intermediate).to(torch.bfloat16)
+            sd[f"{p}.mlp.c_proj.weight"] = torch.randn(intermediate, hidden).to(torch.bfloat16)
+            sd[f"{p}.mlp.c_proj.bias"] = torch.randn(hidden).to(torch.bfloat16)
+        save_file(sd, str(src / "model.safetensors"))
+
+        dst = Path(td) / "dst"
+        argv = ["expand_model.py", "--src", str(src), "--dst", str(dst),
+                "--width-step", "16", "--depth-step", "0",
+                "--layer-prefix", "transformer.h", "--gqa-kv-heads", "0"]
+        old_argv = sys.argv
+        try:
+            sys.argv = argv
+            main()  # must not raise on None n_inner
+        finally:
+            sys.argv = old_argv
+
+        with open(dst / "config.json") as f:
+            out_cfg = json.load(f)
+        # n_inner was absent; expand_model should write the RESOLVED value back
+        # so the expanded checkpoint loads with the right intermediate.
+        assert out_cfg.get("n_inner") == 4 * 32 + 16
+
+
 # ── AsyncCheckpointer error surfacing + .prev retention ─────────────────────
 
 def test_async_checkpoint_prev_retained():

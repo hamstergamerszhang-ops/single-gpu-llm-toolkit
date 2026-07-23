@@ -82,14 +82,28 @@ Every model-specific constant — the embedding tensor's key name, the
 vocab_size config path, the layer-naming prefix, the sharding size, the
 depth/width step sizes, the GQA head count — is a CLI flag, defaulting to
 the Gemma-4 layout these tools were built against but pointable at whatever
-your own checkpoint actually uses. The one piece that isn't a flag is
-`expand_model.py`'s submodule key *suffixes*
-(`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/`o_proj`),
-because those names are shared by most Llama-derived decoder architectures
-(Llama, Mistral, Qwen2/3, every Gemma generation) — verified directly
-against the installed `transformers` library's modeling source. They're not
-universal: GPT-2, the original Phi, Phi-3, Falcon, MPT, and BLOOM use
-different, fused-QKV naming and need code changes (not a flag) to support.
+your own checkpoint actually uses. `expand_model.py`'s submodule key
+*suffixes* (`gate_proj`/`up_proj`/`down_proj`, `q_proj`/`k_proj`/`v_proj`/
+`o_proj`) used to be hardcoded, because those names are shared by most
+Llama-derived decoder architectures (Llama, Mistral, Qwen2/3, every Gemma
+generation) — verified directly against the installed `transformers`
+library's modeling source. They're not universal, though: GPT-2, the
+original Phi, Phi-3, Falcon, MPT, and BLOOM use different, fused-QKV naming.
+Those suffixes are now sourced from a model-family registry
+(`models.registry`, auto-detected from `config.json`'s `model_type` before
+any tensor is touched, overridable via `--model-family`) rather than
+hardcoded — the same detect-before-you-act pattern the GQA fix below uses.
+GPT-2 is the first fused-QKV architecture with real code support there: its
+`c_attn` is a `Conv1D` (weight stored transposed, Q|K|V fused as column
+blocks), so width expansion pads the opposite axis from the `nn.Linear` case
+and grows the Conv1D biases in lockstep with the weights, and the GQA pass
+is skipped outright (a fused layout has no separate `v_proj` for it to
+target). Verified end-to-end against a real GPT-2 checkpoint: expand →
+`from_pretrained` load (zero missing/unexpected keys) → forward pass (no
+NaN/Inf) → the zeroed-output-projection duplicate layers confirmed
+numerically no-op. Phi-3/Falcon/MPT/BLOOM still need per-architecture code
+(not a flag) to support; they fail cleanly with a `KeyError` on a missing
+tensor key rather than silently doing the wrong thing.
 `expand_model.py`'s GQA fix runs a detection pass against the loaded
 checkpoint's real tensors before touching anything, and skips cleanly with
 a logged reason if the checkpoint doesn't match the MQA layout it targets,

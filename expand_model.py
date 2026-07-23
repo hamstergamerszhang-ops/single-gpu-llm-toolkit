@@ -98,11 +98,11 @@ pass -- they used to be hardcoded module constants (INTERLEAVE_EVERY,
 MAX_SHARD_BYTES) with no way to override them without editing source; now
 they're flags too, same pattern as the others.
 
-On tensor key SUFFIXES (gate/up/down_proj, self_attn.q/k/v/o_proj): these are
-NOT parameterized here (only the prefix before the layer index is, via
---layer-prefix), but checked directly against the installed `transformers`
-library's own modeling source (not assumed) -- Llama, Mistral, Qwen2, Qwen3,
-and every Gemma generation all define these exact attribute names
+On tensor key SUFFIXES (gate/up/down_proj, self_attn.q/k/v/o_proj): these used
+to be hardcoded here (only the prefix before the layer index was a flag, via
+--layer-prefix), checked against the installed `transformers` library's own
+modeling source (not assumed) -- Llama, Mistral, Qwen2, Qwen3, and every Gemma
+generation all define these exact attribute names
 (`self.gate_proj`/`self.up_proj`/`self.down_proj`, `self.q_proj`/`k_proj`/
 `v_proj`/`o_proj`), because HF safetensors keys are just the module's
 attribute path, and this naming traces back to the original Llama
@@ -116,16 +116,31 @@ uses `c_fc`/`c_proj` for the MLP; the original Phi (phi-1/phi-2) uses
 one `qkv_proj` and the MLP into one `gate_up_proj`; Falcon, MPT, and BLOOM
 all fuse attention into a single `query_key_value` (or `Wqkv`) matrix and use
 model-specific MLP names (`dense_h_to_4h`/`dense_4h_to_h` or
-`up_proj`/`down_proj` with no `gate_proj` at all). Point this at one of those
-and it will KeyError cleanly on a missing tensor key rather than silently
-doing the wrong thing -- but it won't work without real code changes to
-width_expand_layer() / gqa_expand_kv() / clone_layer_tensors() for those
-architectures' actual submodule names.
+`up_proj`/`down_proj` with no `gate_proj` at all).
 
-This has only ever actually been run end-to-end against Gemma-4-family
-checkpoints on a single MI300X; the flags plus the suffix research above make
-it plausible (and, for the common Llama-style suffix case, probably correct)
-to point elsewhere, but that's not the same as verified there.
+The suffixes are now sourced from `models.registry.ModelFamily` (auto-detected
+from config.json's model_type before any tensor is touched, overridable via
+--model-family) rather than hardcoded -- same "detect before you act" pattern
+as detect_mqa_v_shares_k_layout(). GPT-2 is the first fused-QKV architecture
+with REAL code support here (not just a flag): its `c_attn` is a Conv1D whose
+weight is stored TRANSPOSED as (in, out) with Q|K|V as three column-blocks, so
+width_expand_layer pads the axis OPPOSITE the nn.Linear case, extends the
+Conv1D biases in lockstep with the grown weights (Llama's Linear layers have
+bias=False; GPT-2's Conv1D always carries a bias that must grow too -- a bug
+caught by the load-test this tool's closing log line asks for), and the GQA
+pass is skipped outright (a fused-QKV layout has no separate v_proj for the
+fix to target). Verified end-to-end against a real GPT-2 checkpoint built from
+GPT2Config: expand (width+depth) -> from_pretrained load (zero missing/
+unexpected) -> forward pass (no NaN/Inf) -> the zeroed-output-projection
+duplicate layers confirmed numerically no-op. Phi-3/Falcon/MPT/BLOOM remain
+KeyError-on-missing-key (clean failure, not silent wrong behavior) until they
+get the same per-architecture code GPT-2 just got.
+
+This has been run end-to-end against Gemma-4-family checkpoints on a single
+MI300X and against a real GPT-2 checkpoint on CPU; the flags plus the suffix
+research above make it plausible (and, for the common Llama-style suffix case,
+probably correct) to point elsewhere, but that's not the same as verified
+there.
 """
 
 import argparse
@@ -200,21 +215,91 @@ def orthogonal_pad(n_new: int, n_existing: int, scale: float, transpose_for_rows
 
 
 def width_expand_layer(tensors: dict, layer_prefix: str, old_intermediate: int,
-                       new_intermediate: int):
+                       new_intermediate: int, family=None):
+    """Grow one decoder layer's MLP intermediate dimension by `n_new` columns.
+
+    `family` (a models.registry.ModelFamily, or None for the legacy Llama
+    default) drives TWO architecture-dependent decisions, both verified against
+    the installed transformers modeling source rather than assumed:
+
+      1. The tensor-key segments and leaf suffixes come from the family
+         (mlp_path + mlp_suffixes), not hardcoded `mlp.gate_proj` etc. -- so
+         GPT-2's `mlp.c_fc`/`mlp.c_proj` are addressed by name.
+      2. The axis padded depends on `family.weight_orientation`:
+           - "linear" (Llama/Gemma/Qwen, nn.Linear, weight=(out,in)): gate/up
+             pad dim=0 (the output dim), down pads dim=1.
+           - "conv1d" (GPT-2/GPT-NeoX, HF Conv1D, weight=(in,out) TRANSPOSED):
+             the up projection (c_fc) pads dim=1 and the down projection
+             (c_proj) pads dim=0 -- the OPPOSITE axes from the linear case,
+             because the matrices are stored transposed. Padding the linear
+             case's axes here would grow the wrong dimension and silently
+             corrupt the checkpoint.
+
+    A gated MLP (Llama gate_proj) and a non-gated MLP (GPT-2, no gate) are both
+    handled: gate is only touched when the family declares one. There is no
+    GQA/attention work here -- that's gqa_expand_kv() (skipped for fused-QKV
+    families; see main()).
+    """
     n_new = new_intermediate - old_intermediate
-    gate_key = f"{layer_prefix}.mlp.gate_proj.weight"
-    up_key = f"{layer_prefix}.mlp.up_proj.weight"
-    down_key = f"{layer_prefix}.mlp.down_proj.weight"
-    hidden = tensors[gate_key].shape[1]
+    # Default to the legacy Llama layout when called without a family (the
+    # pre-existing call sites and tests that pass family=None get byte-identical
+    # behavior to before this function was family-aware).
+    mlp_path = getattr(family, "mlp_path", "mlp") if family else "mlp"
+    mlp_suffixes = getattr(family, "mlp_suffixes", None) if family else None
+    orientation = getattr(family, "weight_orientation", "linear") if family else "linear"
+    if mlp_suffixes is None:
+        mlp_suffixes = {"gate": "gate_proj", "up": "up_proj", "down": "down_proj"}
 
-    for key in (gate_key, up_key):
+    up_suffix = mlp_suffixes.get("up")
+    down_suffix = mlp_suffixes["down"]
+    gate_suffix = mlp_suffixes.get("gate")  # None for non-gated MLPs (GPT-2, MPT)
+
+    up_key = f"{layer_prefix}.{mlp_path}.{up_suffix}.weight"
+    down_key = f"{layer_prefix}.{mlp_path}.{down_suffix}.weight"
+
+    # `hidden` is the input dim common to both projections. For nn.Linear it is
+    # .shape[1] (the in-dim) on gate/up; for Conv1D (transposed) it is .shape[0]
+    # (the in-dim) on c_fc. Detect it from whichever key exists.
+    hidden = tensors[up_key].shape[1] if orientation == "linear" else tensors[up_key].shape[0]
+
+    # The "expanding" projections (gate+up for Llama, c_fc for GPT-2) grow along
+    # the OUTPUT dim. For linear weights (out,in) that's dim=0; for Conv1D
+    # (in,out) that's dim=1. The pad shape that fits that dim is orientation-
+    # dependent too: orthogonal_pad(transpose_for_rows=True) returns (n_new,
+    # n_existing) -- correct for cat on dim=0 (Linear); transpose_for_rows=False
+    # returns (n_existing, n_new) -- correct for cat on dim=1 (Conv1D). So the
+    # transpose flag is SWAPPED vs the project-back case below.
+    expand_dim = 0 if orientation == "linear" else 1
+    expand_transpose = True if orientation == "linear" else False
+    expand_keys = [f"{layer_prefix}.{mlp_path}.{gate_suffix}.weight"] if gate_suffix else []
+    expand_keys.append(up_key)
+    for key in expand_keys:
         old_w = tensors[key]
-        pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=True)
-        tensors[key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=0)
+        pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=expand_transpose)
+        tensors[key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=expand_dim)
+        # The matching bias (if present) must grow in lockstep with the weight's
+        # OUTPUT dim -- Llama's gate/up_proj have bias=False (no bias key), but
+        # GPT-2's Conv1D always carries a bias of shape (out,). A weight grown
+        # to a new out-dim with a stale bias fails from_pretrained with a size
+        # mismatch (caught by a real load test). Zero-pad the new bias entries:
+        # new capacity contributes nothing until training turns it on, matching
+        # the orthogonal-pad-then-small-scale principle for the weights.
+        bias_key = key[:-len(".weight")] + ".bias"
+        if bias_key in tensors:
+            old_b = tensors[bias_key]
+            new_b = torch.zeros(n_new, dtype=old_b.dtype)
+            tensors[bias_key] = torch.cat([old_b, new_b], dim=0)
 
+    # The "projecting-back" projection (down_proj for Llama, c_proj for GPT-2)
+    # grows along the INPUT dim -- the opposite axis from the expanding one,
+    # so the pad shape (and thus the transpose flag) is the opposite too. Its
+    # bias is (hidden,) -- the OUTPUT dim, which is unchanged -- so the bias
+    # needs NO growth here (only the input dim grew).
     old_w = tensors[down_key]
-    pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=False)
-    tensors[down_key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=1)
+    down_transpose = False if orientation == "linear" else True
+    pad = orthogonal_pad(n_new, hidden, INIT_SCALE, transpose_for_rows=down_transpose)
+    down_dim = 1 if orientation == "linear" else 0
+    tensors[down_key] = torch.cat([old_w, pad.to(old_w.dtype)], dim=down_dim)
 
 
 def detect_mqa_v_shares_k_layout(tensors: dict, full_attn_idxs: list, layer_prefix: str,
@@ -323,15 +408,29 @@ def gqa_expand_kv(tensors: dict, layer_prefix: str, head_dim: int, old_kv_heads:
 
 
 def clone_layer_tensors(tensors: dict, src_prefix: str, dst_prefix: str,
-                        zero_output_projections: bool):
+                        zero_output_projections: bool, family=None):
     prefix_dot = src_prefix + "."
+    # The output projections whose zeroing turns a duplicated layer into a true
+    # no-op (contributes nothing to the residual stream until training turns it
+    # on). Family-derived so GPT-2's attn.c_proj.weight + mlp.c_proj.weight are
+    # zeroed, not Llama's self_attn.o_proj.weight + mlp.down_proj.weight --
+    # GPT-2 reuses the leaf name "c_proj" for BOTH attention-output and
+    # MLP-output, so the match must be path-segment-aware (attn_path/mlp_path),
+    # not leaf-name-aware, or it would zero the wrong tensors / miss the right
+    # ones. Defaults to the legacy Llama paths when called without a family.
+    if family is not None:
+        attn_o = f"{family.attn_path}.{family.attn_suffixes.get('o', 'o_proj')}.weight"
+        mlp_down = f"{family.mlp_path}.{family.mlp_suffixes['down']}.weight"
+        zero_suffixes = (attn_o, mlp_down)
+    else:
+        zero_suffixes = ("self_attn.o_proj.weight", "mlp.down_proj.weight")
     new_entries = {}
     for key, val in tensors.items():
         if not key.startswith(prefix_dot):
             continue
         suffix = key[len(prefix_dot):]
         new_key = f"{dst_prefix}.{suffix}"
-        if zero_output_projections and suffix in ("self_attn.o_proj.weight", "mlp.down_proj.weight"):
+        if zero_output_projections and suffix in zero_suffixes:
             new_entries[new_key] = torch.zeros(val.shape, dtype=val.dtype)
         else:
             # .clone() is required, not cosmetic: without it, a duplicated layer's
@@ -436,6 +535,15 @@ def main():
     ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,
                     help="Byte budget per output safetensors shard (default 5GB). Was a "
                          "hardcoded module constant; now a flag with the same default.")
+    ap.add_argument("--model-family", type=str, default=None,
+                    help="Force a specific model family (from models.registry: llama, gemma, "
+                         "gpt2, phi3, falcon, mpt, bloom, ...) instead of auto-detecting from "
+                         "config.json's model_type. Auto-detection is run BEFORE any tensor is "
+                         "touched and drives the tensor-key segments + pad axes -- a fused-QKV "
+                         "architecture like GPT-2 (c_attn Conv1D, attn/mlp paths) needs real "
+                         "code changes, not just --layer-prefix, and the family is how those "
+                         "changes are routed. If detection fails it falls back to the legacy "
+                         "Llama-derived layout with a logged warning.")
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -449,9 +557,70 @@ def main():
     # config layouts. mtp_head.py uses the same .get() fallback pattern.
     tc = cfg.get("text_config", cfg)
 
-    orig_layers = tc["num_hidden_layers"]
-    orig_intermediate = tc["intermediate_size"]
-    hidden = tc["hidden_size"]
+    # Pre-flight model-family detection BEFORE touching any tensor -- same
+    # "detect before you act" discipline as detect_mqa_v_shares_k_layout()
+    # below. The family (from models.registry, auto-detected from config.json's
+    # model_type, overridable via --model-family) drives the tensor-key segments
+    # and pad axes used by width_expand_layer / clone_layer_tensors, so a wrong
+    # guess here would corrupt weights silently. If detection fails we fall back
+    # to the legacy Llama-derived layout (the only layout this tool handled
+    # before GPT-2 support) and log it, rather than aborting -- a Llama-derived
+    # checkpoint still expands correctly under that fallback, and a genuinely
+    # unrecognized fused-QKV architecture will KeyError cleanly on a missing
+    # tensor key (as the module docstring already documents), not silently
+    # mis-expand. --layer-prefix remains the explicit override for the prefix
+    # before the layer index; the family only governs the suffixes/segments
+    # after it.
+    family = None
+    try:
+        from models import resolve_model_family
+        family = resolve_model_family(cfg, override=getattr(args, "model_family", None))
+        log(f"detected model family: {family.name} "
+            f"(attn_path={family.attn_path}, mlp_path={family.mlp_path}, "
+            f"orientation={family.weight_orientation}, layout={family.attn_layout})")
+    except Exception as e:
+        log(f"model-family detection did not match ({e}); falling back to the "
+            f"legacy Llama-derived layout (self_attn/mlp, linear, separate q/k/v). "
+            f"Pass --model-family to force one if you know it.")
+        family = None
+
+    # Family-aware config keys: GPT-2's serialized config.json uses n_embd/
+    # n_layer/n_head/n_inner (verified against GPT2Config().to_dict()), not the
+    # unified hidden_size/num_hidden_layers names. Falling back to the unified
+    # names keeps the legacy Llama/Gemma/Qwen path byte-identical. Returns None
+    # if neither the family key nor the fallback is present (e.g. GPT-2 with
+    # n_inner absent -- the caller resolves that to 4*hidden below).
+    def _cfg(key_attr, fallback_key):
+        if family is not None:
+            k = getattr(family, key_attr)
+            if k is not None and k in tc:
+                return tc[k]
+        return tc.get(fallback_key)
+
+    orig_layers = _cfg("num_hidden_layers_key", "num_hidden_layers")
+    orig_intermediate = _cfg("intermediate_size_key", "intermediate_size")
+    hidden = _cfg("hidden_size_key", "hidden_size")
+    # hidden_size and num_hidden_layers are REQUIRED (unlike n_inner, which
+    # legitimately can be absent on GPT-2). A None here means the config is
+    # missing a field the rest of main() can't proceed without -- fail clearly
+    # rather than crashing later with a confusing None+int TypeError.
+    if hidden is None:
+        raise SystemExit(
+            "ERROR: config.json has no hidden-size field (looked for "
+            f"{getattr(family, 'hidden_size_key', 'hidden_size')!r}"
+            + (" and 'hidden_size'" if family else "") + ").")
+    if orig_layers is None:
+        raise SystemExit(
+            "ERROR: config.json has no num-hidden-layers field (looked for "
+            f"{getattr(family, 'num_hidden_layers_key', 'num_hidden_layers')!r}"
+            + (" and 'num_hidden_layers'" if family else "") + ").")
+    # GPT-2's n_inner is None when unset -- the real modeling code then uses
+    # 4*n_embd. A None here would crash the width arithmetic below, so resolve
+    # it to the actual intermediate size the weights were built with.
+    if orig_intermediate is None:
+        orig_intermediate = 4 * hidden
+        log(f"  intermediate_size key was None (GPT-2 n_inner unset) -- resolved "
+            f"to 4*hidden = {orig_intermediate} (the real GPT-2 default)")
     # layer_types is Gemma-4-specific (full_attention/sliding_attention). Most
     # architectures don't have it — default to all "full_attention" so the
     # depth-plan and GQA logic treats every layer uniformly.
@@ -511,7 +680,19 @@ def main():
     log(f"  loaded {len(tensors)} tensors")
 
     gqa_applied = False
-    if args.gqa_kv_heads > 0:
+    if args.gqa_kv_heads > 0 and family is not None and family.attn_layout == "fused_qkv":
+        # GQA/MQA expansion assumes SEPARATE k_proj/v_proj weights it can grow
+        # independently. A fused-QKV family (GPT-2's c_attn holds Q|K|V as one
+        # matrix) has no separate v_proj to clobber and no k_proj to misshape --
+        # the whole premise of the fix doesn't apply, and detect_mqa_v_shares_k_layout()
+        # below would look for a v_proj key that structurally cannot exist and
+        # report "not found" as if it were a layout mismatch. Skip it outright
+        # with a specific reason instead of letting it run that misleading path.
+        log(f"Pass 1/3: SKIPPED -- family {family.name} uses a fused-QKV attention "
+            f"layout ({family.attn_suffixes.get('qkv')}); the GQA/MQA fix targets "
+            f"separate k_proj/v_proj weights and does not apply here. Use "
+            f"--gqa-kv-heads 0 to silence this explicitly.")
+    elif args.gqa_kv_heads > 0:
         old_kv_heads = tc.get("num_global_key_value_heads", tc.get("num_key_value_heads", 1))
         # .get(...) all the way down -- NOT tc["head_dim"] -- because "no
         # head_dim key at all" must flow into the same safe-skip path as any
@@ -578,7 +759,7 @@ def main():
             f"on {orig_layers} layers ...")
         for old_idx in range(orig_layers):
             prefix = f"{args.layer_prefix}.{old_idx}"
-            width_expand_layer(tensors, prefix, orig_intermediate, new_intermediate)
+            width_expand_layer(tensors, prefix, orig_intermediate, new_intermediate, family=family)
             if (old_idx + 1) % 12 == 0:
                 log(f"  widened {old_idx + 1}/{orig_layers} layers")
         log("  width expansion done")
@@ -586,18 +767,28 @@ def main():
         log("Pass 2/3: SKIPPED (--width-step 0, debug isolation mode)")
 
     log(f"Pass 3/3: depth duplication ({orig_layers} -> {new_layers} layers) ...")
+    # Carry through every NON-layer tensor (embeddings, norms, lm_head) before
+    # re-emitting layers by their new indices. The filter must match the
+    # family's actual layers path, not a hardcoded ".layers." substring -- GPT-2's
+    # path is "transformer.h", which contains no ".layers.", so the old filter
+    # would have kept ALL original layer tensors AND added re-indexed clones
+    # (stale duplicates). Fall back to ".layers." only when no family resolved.
+    if family is not None:
+        layer_marker = f".{family.decoder_layers_path}."
+    else:
+        layer_marker = ".layers."
     final_tensors = {}
     for key, val in tensors.items():
-        if ".layers." not in key:
+        if layer_marker not in key:
             final_tensors[key] = val
 
     for new_idx, old_idx, is_dup in depth_plan:
         src_prefix = f"{args.layer_prefix}.{old_idx}"
         dst_prefix = f"{args.layer_prefix}.{new_idx}"
         cloned = clone_layer_tensors(tensors, src_prefix, dst_prefix,
-                                     zero_output_projections=is_dup)
+                                     zero_output_projections=is_dup, family=family)
         final_tensors.update(cloned)
-        tag = "DUPLICATE (o_proj+down_proj zeroed)" if is_dup else "original"
+        tag = "DUPLICATE (output projections zeroed)" if is_dup else "original"
         log(f"  layer {new_idx:2d} <- old layer {old_idx:2d} [{tag}]")
 
     del tensors
@@ -608,8 +799,14 @@ def main():
     # Write through tc (which is either cfg["text_config"] or cfg itself,
     # depending on whether the config was nested or flat). This avoids creating
     # a spurious text_config dict on flat configs (Llama/Mistral/Qwen).
-    tc["intermediate_size"] = new_intermediate
-    tc["num_hidden_layers"] = new_layers
+    # Write back via the SAME config keys the family reads (GPT-2's serialized
+    # config uses n_inner/n_layer, not intermediate_size/num_hidden_layers) --
+    # writing the Llama names would leave the real keys stale at their old
+    # values and the expanded checkpoint would load with the wrong dimensions.
+    intermediate_key = getattr(family, "intermediate_size_key", "intermediate_size") if family else "intermediate_size"
+    layers_key = getattr(family, "num_hidden_layers_key", "num_hidden_layers") if family else "num_hidden_layers"
+    tc[intermediate_key] = new_intermediate
+    tc[layers_key] = new_layers
     # Only write layer_types back if the original config had it — don't create
     # a spurious Gemma-4-specific field on flat (Llama/Mistral/Qwen) configs.
     if "layer_types" in tc:
