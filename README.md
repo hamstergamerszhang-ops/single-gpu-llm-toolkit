@@ -10,7 +10,10 @@ crashes, a data source that goes unreachable mid-run. `preprocess_data.py`,
 `benchmark.py`, and `generate.py` round out the pipeline end-to-end: clean
 data in, compare configs before committing to a long run, and actually talk
 to the model you just trained. Every tool ships its own `--selftest` or
-pytest coverage (the two shell scripts, `catch_and_resume.sh` and `oom_guard.sh`, are not covered by selftests or pytest — their logic is exercised manually; see [Testing](#testing)) and is independently runnable —
+pytest coverage — including the two shell scripts (`catch_and_resume.sh` and
+`oom_guard.sh`, covered by `tests/test_shell.py` via pytest+subprocess with
+faked `/proc/meminfo`, stubbed `rocm-smi`, and a fake `train_cpt.py`; see
+[Testing](#testing)) — and is independently runnable —
 use the whole pipeline or just the one tool that solves your problem.
 
 All training here is full-parameter fine-tuning (`train_cpt.py` /
@@ -947,8 +950,17 @@ Each module with logic that can be tested without a real checkpoint ships a
 `prune_embeddings_torch.py`, `expand_model.py`) are covered by the pytest suite
 in [`tests/`](tests/) instead — they need a real checkpoint to run their
 `main()` for real, so their pure-logic functions (depth planning, orthogonal
-padding shapes, merge-format parsing, the MQA layout detection) get exercised
-directly instead. CI (`.github/workflows/selftest.yml`) runs both on every
+padding shapes, merge-format parsing, the MQA layout detection, the GPT-2
+Conv1D width-axis handling) get exercised directly instead. The two shell
+scripts (`catch_and_resume.sh`, `oom_guard.sh`) are covered by
+[`tests/test_shell.py`](tests/test_shell.py), which drives them as subprocesses
+with faked inputs: a fake `train_cpt.py` that exits on command and writes a
+fake `training_state.pt`, a faked `/proc/meminfo` (via an `OOM_GUARD_MEMINFO`
+env override the script supports), and a stubbed `rocm-smi` on PATH — so the
+supervisor's retry-cap / stop-file / loss-regression-rollback / history-pruning
+logic and the guard's warn-vs-emergency thresholds / SIGTERM-on-emergency /
+VRAM-JSON-parsing logic are all exercised automatically, not manually. CI
+(`.github/workflows/selftest.yml`) runs the full pytest suite on every
 push/PR.
 
 ```bash
