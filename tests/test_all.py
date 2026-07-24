@@ -519,47 +519,35 @@ def test_export_onnx_end_to_end_real_inference(tmp_path):
     mode where torch.onnx.export exits 0 but produces a graph that fails to
     load or silently mismatches the source.
 
-    Uses a simple nn.Module-based checkpoint rather than GPT-2 because torch
-    2.13's ONNX exporters (both the new Dynamo-based and the legacy TorchScript
-    tracer) fail on GPT-2's dynamic attention control flow -- that's a
-    torch-version limitation, not a bug in export_onnx.py (which is a thin
-    wrapper around torch.onnx.export). The test's purpose is to verify
-    export_onnx.py produces a loadable, inference-correct ONNX file, which it
-    does for any traceable architecture."""
+    Uses a real GPT-2 model (built from GPT2Config, no download). torch 2.13's
+    Dynamo-based ONNX exporter fails on GPT-2's forward because it returns a
+    namedtuple (CausalLMOutputWithCrossAttentions); export_onnx.py wraps the
+    model in a LogitsOnlyWrapper that returns just .logits, making the graph
+    a plain Tensor→Tensor that exports cleanly. This test verifies that wrapper
+    works and the exported ONNX matches the source model's predictions."""
     pytest.importorskip("onnx")
     pytest.importorskip("onnxruntime")
     pytest.importorskip("onnxscript")
     import sys
     import torch
-    import torch.nn as nn
     import onnx
     import onnxruntime
-
-    # Build a tiny traceable LM checkpoint (Embedding + Linear).
-    class TinyLM(nn.Module):
-        def __init__(self, vocab=100, dim=16):
-            super().__init__()
-            self.embed = nn.Embedding(vocab, dim)
-            self.linear = nn.Linear(dim, vocab)
-        def forward(self, input_ids):
-            return self.linear(self.embed(input_ids))
+    from transformers import GPT2LMHeadModel
 
     src = tmp_path / "src"
     src.mkdir()
-    src_model = TinyLM()
+    src_model = _build_tiny_gpt2_checkpoint(src)
     src_model.eval()
-    # Save as an HF-format checkpoint so export_onnx.py's from_pretrained loads it.
-    # TinyLM isn't an HF model, so we test export_onnx.py's core path directly:
-    # call torch.onnx.export the same way the script does, then verify the result.
-    dummy = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+
     dst = tmp_path / "model.onnx"
-    torch.onnx.export(
-        src_model, dummy, str(dst),
-        input_names=["input_ids"], output_names=["logits"],
-        dynamic_axes={"input_ids": {0: "batch", 1: "sequence"},
-                      "logits": {0: "batch", 1: "sequence"}},
-        opset_version=14, dynamo=False,
-    )
+    saved = sys.argv
+    try:
+        sys.argv = ["export_onnx.py", "--src", str(src), "--dst", str(dst),
+                    "--seq-length", "8", "--batch-size", "1", "--dtype", "fp32"]
+        from export_onnx import main
+        main()
+    finally:
+        sys.argv = saved
 
     # Validate the graph itself loads.
     onnx.checker.check_model(onnx.load(str(dst)))
@@ -567,11 +555,13 @@ def test_export_onnx_end_to_end_real_inference(tmp_path):
     # Run inference at a DIFFERENT shape (seq-len 5, not the export's 8) to
     # exercise the dynamic axes declaration.
     sess = onnxruntime.InferenceSession(str(dst), providers=["CPUExecutionProvider"])
-    test_input = torch.randint(0, 100, (1, 5)).numpy()
+    test_input = torch.randint(0, src_model.config.vocab_size, (1, 5)).numpy()
     ort_logits = sess.run(None, {"input_ids": test_input})[0]
 
     with torch.no_grad():
-        src_logits = src_model(torch.tensor(test_input)).numpy()
+        src_logits = src_model(input_ids=torch.tensor(test_input)).logits.numpy()
+    # Argmax (predicted next token) must match -- exact logits can differ
+    # slightly due to ONNX op fusion, but the argmax prediction must agree.
     assert (ort_logits.argmax(-1) == src_logits.argmax(-1)).all(), \
         "ONNX export argmax predictions differ from source model"
 

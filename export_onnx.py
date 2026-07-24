@@ -51,10 +51,27 @@ def main():
         os.makedirs(dst, exist_ok=True)
         dst = os.path.join(dst, "model.onnx")
 
+    # Wrap the model so torch.onnx.export gets a plain Tensor→Tensor function.
+    # HF CausalLM models return a namedtuple (CausalLMOutputWithCrossAttentions),
+    # which torch 2.13's Dynamo-based ONNX exporter (the new default since
+    # torch 2.9) can't trace through. The wrapper extracts .logits, making the
+    # graph a plain Tensor→Tensor that exports cleanly. The legacy TorchScript
+    # tracer (dynamo=False) also fails on GPT-2's dynamic attention control
+    # flow, so this wrapper is needed regardless of exporter mode.
+    class LogitsOnlyWrapper(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.model = m
+        def forward(self, input_ids):
+            return self.model(input_ids=input_ids).logits
+
+    export_model = LogitsOnlyWrapper(model)
+    export_model.eval()
+
     print(f"[export_onnx] exporting to {dst} ...")
     with torch.no_grad():
         torch.onnx.export(
-            model,
+            export_model,
             dummy_input,
             dst,
             input_names=["input_ids"],
@@ -63,7 +80,7 @@ def main():
                 "input_ids": {0: "batch", 1: "sequence"},
                 "logits": {0: "batch", 1: "sequence"},
             },
-            opset_version=14,
+            opset_version=18,
         )
     print("[export_onnx] done.")
 
