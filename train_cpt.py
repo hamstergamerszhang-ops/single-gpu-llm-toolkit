@@ -950,7 +950,11 @@ def find_decoder_layers(model):
     if type(model).__name__ in ("DistributedDataParallel", "FullyShardedDataParallel"):
         model = model.module
     for path in ["model.layers", "language_model.model.layers", "model.model.layers",
-                "model.language_model.layers"]:  # the path used by custom multi-token-
+                "model.language_model.layers",
+                "transformer.h",  # GPT-2/GPT-Neo: transformer.h is the layer list
+                "gpt_neox.layers",  # GPT-NeoX
+                "transformer.blocks",  # MPT
+                ]:  # the path used by custom multi-token-
                 # prediction subclasses that wrap Gemma4ForConditionalGeneration --
                 # its .model is a Gemma4Model, whose .language_model is the
                 # Gemma4TextModel holding the actual decoder layer stack.
