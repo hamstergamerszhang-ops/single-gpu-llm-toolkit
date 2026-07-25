@@ -2259,7 +2259,42 @@ def test_train_cpt_checkpoint_every_zero_rejected():
 
 # ── modeling_custom.py: MTP stub loads mtp_head.py's weights + runs forward ──
 
-def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys():
+@pytest.fixture
+def modeling_custom_gemma():
+    """modeling_custom with its base class resolved to the Gemma family.
+
+    modeling_custom.py picks `_BaseForCausalLM` ONCE at import time from
+    `model_family` (config.json alongside it, else the MODEL_FAMILY env var).
+    In CI there is neither, so it installs the `_ModelFamilyNotSet` sentinel
+    and every `CustomForCausalLM(...)` raises ValueError. The tests below all
+    build a Gemma3TextConfig, so they need the Gemma base class actually
+    resolved.
+
+    Setting MODEL_FAMILY globally (e.g. in the workflow env) is NOT a valid
+    fix: test_modeling_custom_no_family_set_uses_sentinel deliberately asserts
+    the sentinel IS installed when nothing is set, so a global env var would
+    trade these 5 failures for that one. Scoping it to a fixture that sets the
+    env var, reloads the module, and restores both afterwards keeps the two
+    behaviours independent.
+    """
+    import importlib
+    import os
+    import modeling_custom
+
+    orig_env = os.environ.get("MODEL_FAMILY")
+    os.environ["MODEL_FAMILY"] = "gemma"
+    try:
+        yield importlib.reload(modeling_custom)
+    finally:
+        if orig_env is None:
+            os.environ.pop("MODEL_FAMILY", None)
+        else:
+            os.environ["MODEL_FAMILY"] = orig_env
+        # Reload again so later tests see the unset-family state they expect.
+        importlib.reload(modeling_custom)
+
+
+def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys(modeling_custom_gemma):
     """End-to-end: build a tiny Gemma3-family CustomForCausalLM, generate MTP
     weights for it via mtp_head.py's build_mtp_tensors, and load_state_dict.
 
@@ -2279,7 +2314,7 @@ def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys():
         from transformers import Gemma3TextConfig
     except ImportError:
         pytest.skip("Gemma3TextConfig not available in this transformers version")
-    from modeling_custom import CustomForCausalLM
+    CustomForCausalLM = modeling_custom_gemma.CustomForCausalLM
     from mtp_head import build_mtp_tensors
 
     hidden = 32
@@ -2316,7 +2351,7 @@ def test_modeling_custom_mtp_weights_load_with_no_missing_or_unexpected_keys():
     assert unexpected == [], f"checkpoint has orphan MTP keys: {unexpected}"
 
 
-def test_modeling_custom_forward_pass_runs_without_crashing():
+def test_modeling_custom_forward_pass_runs_without_crashing(modeling_custom_gemma):
     """End-to-end forward pass smoke test for CustomForCausalLM with MTP
     enabled -- must produce logits + mtp_hidden_states without raising.
 
@@ -2335,7 +2370,7 @@ def test_modeling_custom_forward_pass_runs_without_crashing():
         from transformers import Gemma3TextConfig
     except ImportError:
         pytest.skip("Gemma3TextConfig not available in this transformers version")
-    from modeling_custom import CustomForCausalLM
+    CustomForCausalLM = modeling_custom_gemma.CustomForCausalLM
 
     hidden = 32
     config = Gemma3TextConfig(
@@ -2360,7 +2395,7 @@ def test_modeling_custom_forward_pass_runs_without_crashing():
     assert out.mtp_hidden_states.shape == (2, 5, hidden)
 
 
-def test_modeling_custom_mtp_loss_with_input_ids_and_labels():
+def test_modeling_custom_mtp_loss_with_input_ids_and_labels(modeling_custom_gemma):
     """Regression check: input_ids + labels (the normal training path) must
     keep working and return a real, finite scalar loss that includes the MTP
     term (not just the base CE loss)."""
@@ -2369,7 +2404,7 @@ def test_modeling_custom_mtp_loss_with_input_ids_and_labels():
         from transformers import Gemma3TextConfig
     except ImportError:
         pytest.skip("Gemma3TextConfig not available in this transformers version")
-    from modeling_custom import CustomForCausalLM
+    CustomForCausalLM = modeling_custom_gemma.CustomForCausalLM
 
     hidden = 32
     config = Gemma3TextConfig(
@@ -2390,7 +2425,7 @@ def test_modeling_custom_mtp_loss_with_input_ids_and_labels():
     assert out.loss.item() > 0.0
 
 
-def test_modeling_custom_mtp_loss_with_inputs_embeds_and_labels_does_not_crash():
+def test_modeling_custom_mtp_loss_with_inputs_embeds_and_labels_does_not_crash(modeling_custom_gemma):
     """Regression test for a real bug found while reviewing this file:
     _compute_mtp_total_loss -> _shift_labels did `input_ids.shape`, but
     input_ids can legitimately be None when inputs_embeds is used instead
@@ -2412,7 +2447,7 @@ def test_modeling_custom_mtp_loss_with_inputs_embeds_and_labels_does_not_crash()
         from transformers import Gemma3TextConfig
     except ImportError:
         pytest.skip("Gemma3TextConfig not available in this transformers version")
-    from modeling_custom import CustomForCausalLM
+    CustomForCausalLM = modeling_custom_gemma.CustomForCausalLM
 
     hidden = 32
     config = Gemma3TextConfig(
@@ -2438,7 +2473,7 @@ def test_modeling_custom_mtp_loss_with_inputs_embeds_and_labels_does_not_crash()
     )
 
 
-def test_modeling_custom_no_mtp_depths_is_a_clean_noop():
+def test_modeling_custom_no_mtp_depths_is_a_clean_noop(modeling_custom_gemma):
     """mtp_depths=0 (or absent from config) must behave exactly like the base
     *ForCausalLM -- no mtp_layers registered, no mtp_hidden_states on output,
     forward runs cleanly."""
@@ -2447,7 +2482,7 @@ def test_modeling_custom_no_mtp_depths_is_a_clean_noop():
         from transformers import Gemma3TextConfig
     except ImportError:
         pytest.skip("Gemma3TextConfig not available in this transformers version")
-    from modeling_custom import CustomForCausalLM
+    CustomForCausalLM = modeling_custom_gemma.CustomForCausalLM
 
     config = Gemma3TextConfig(
         vocab_size=100, hidden_size=32, intermediate_size=64,
