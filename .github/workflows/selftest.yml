@@ -67,7 +67,12 @@ jobs:
           echo "OK: all CLI entrypoints are executable."
       - name: Install deps
         run: |
-          pip install numpy safetensors torch pytest "transformers==5.7.0"
+          # pytest-xdist is required: the "Run pytest suite" step below uses
+          # `-n auto`. It is declared in pyproject's [dev] extra, which the ROCm
+          # job picks up via ".[train,infer,dev]" -- but this job hand-lists its
+          # deps, so it has to be named explicitly here or pytest exits with
+          # "error: unrecognized arguments: -n".
+          pip install numpy safetensors torch pytest pytest-xdist "transformers==5.7.0"
       - name: Run module self-tests
         run: |
           # Only modules with a --selftest flag (transformation tools like
