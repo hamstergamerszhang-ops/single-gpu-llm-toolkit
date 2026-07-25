@@ -325,6 +325,17 @@ class _MTPModule(nn.Module):
             block_kwargs["past_key_value"] = past_key_value
         if "use_cache" in params:
             block_kwargs["use_cache"] = use_cache
+        if "shared_kv_states" in params:
+            # Gemma-4 decoder layers share key/value states across layers of the
+            # same layer_type and write into this dict unconditionally:
+            #     shared_kv_states[self.layer_type] = key_states, value_states
+            # It defaults to None, so leaving it out raises
+            # "TypeError: 'NoneType' object does not support item assignment"
+            # the moment an MTP block wraps a Gemma-4 layer. The MTP head is an
+            # auxiliary block, not part of the trunk's sharing group, so it gets
+            # a fresh dict per call -- it manages its own KV locally instead of
+            # aliasing the trunk's.
+            block_kwargs["shared_kv_states"] = {}
 
         out = self.block(x, **block_kwargs)
         present_key_value = None
