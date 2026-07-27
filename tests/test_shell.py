@@ -202,7 +202,12 @@ def test_oom_guard_no_gpu_backend_falls_back(tmp_path):
         env=env, capture_output=True, text=True, timeout=15,
     )
     assert result.returncode == 0
-    assert "no rocm-smi or nvidia-smi found" in result.stdout
+    # Check the BEHAVIOUR -- fell back to system-RAM-only monitoring -- not one exact
+    # sentence. This used to hard-code "no rocm-smi or nvidia-smi found", which went stale
+    # when oom_guard.sh gained the faster KFD-sysfs probe and started saying "no KFD sysfs
+    # or rocm-smi found" instead. The guard was fine; the assertion had just drifted.
+    assert "GPU-VRAM checks skipped" in result.stdout
+    assert "system-RAM only" in result.stdout
 
 
 # ── catch_and_resume.sh ─────────────────────────────────────────────────────
