@@ -24,10 +24,17 @@ echo "[oom_guard] watching PID $TRAIN_PID, poll ${POLL_SEC}s"
 echo "[oom_guard] system-RAM: warn<${WARN_FREE_MB}MB, emergency<${EMERGENCY_FREE_MB}MB (via /proc/meminfo)"
 
 read_available_mb() {
+    # The meminfo path is overridable via $OOM_GUARD_MEMINFO solely so the
+    # system-RAM parsing logic can be tested against a fake meminfo file
+    # (there's no portable way to fake /proc/meminfo itself on Linux, and no
+    # /proc at all on macOS). Defaults to the real /proc/meminfo -- production
+    # behavior is unchanged. The GPU-VRAM paths below are tested by stubbing
+    # rocm-smi/nvidia-smi on PATH instead.
+    local meminfo="${OOM_GUARD_MEMINFO:-/proc/meminfo}"
     local kb
-    kb=$(awk '/^MemAvailable:/ {print $2; found=1} END {if (!found) print ""}' /proc/meminfo 2>/dev/null)
+    kb=$(awk '/^MemAvailable:/ {print $2; found=1} END {if (!found) print ""}' "$meminfo" 2>/dev/null)
     if [ -z "$kb" ]; then
-        kb=$(awk '/^MemFree:/ {print $2}' /proc/meminfo 2>/dev/null)
+        kb=$(awk '/^MemFree:/ {print $2}' "$meminfo" 2>/dev/null)
     fi
     if [ -z "$kb" ]; then
         echo ""

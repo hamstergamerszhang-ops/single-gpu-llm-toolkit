@@ -29,6 +29,26 @@ class ModelFamily:
         num_attention_heads_key: str = "num_attention_heads",
         num_key_value_heads_key: str | None = None,
         vocab_size_key: str = "vocab_size",
+        # --- expand_model.py architecture metadata (optional, Llama-default) ---
+        # The submodule attribute path segment BETWEEN the layer index and the
+        # leaf weight: the key is `<layers_path>.<idx>.<attn_path>.<suffix>`.
+        # Llama-derived architectures use self_attn/mlp; GPT-2 uses attn/mlp.
+        # Defaults to the Llama names so existing entries are unchanged.
+        attn_path: str = "self_attn",
+        mlp_path: str = "mlp",
+        # "linear" (default): weights are nn.Linear, stored (out, in) -- pad the
+        # OUTPUT dim when growing width. "conv1d": weights are HF Conv1D
+        # (GPT-2/GPT-NeoX), stored TRANSPOSED as (in, out) -- pad the INPUT dim,
+        # i.e. the axis opposite of what the linear case would touch. This flag
+        # is what lets width_expand_layer grow GPT-2's c_fc/c_proj/c_attn on the
+        # correct axis instead of silently corrupting them.
+        weight_orientation: str = "linear",
+        # "separate" (default): q/k/v/o are distinct weights (Llama/Gemma/Qwen).
+        # "fused_qkv": a single weight (e.g. c_attn) holds Q|K|V as N contiguous
+        # column-blocks; expand_model splits, grows each block, and re-cats
+        # rather than treating it as one opaque matrix. GQA/MQA never applies to
+        # a fused layout, so the GQA pass is skipped entirely for these.
+        attn_layout: str = "separate",
     ):
         self.name = name
         self.model_types = model_types
@@ -46,6 +66,10 @@ class ModelFamily:
         self.num_attention_heads_key = num_attention_heads_key
         self.num_key_value_heads_key = num_key_value_heads_key
         self.vocab_size_key = vocab_size_key
+        self.attn_path = attn_path
+        self.mlp_path = mlp_path
+        self.weight_orientation = weight_orientation
+        self.attn_layout = attn_layout
 
     def __repr__(self) -> str:
         return f"ModelFamily({self.name})"
@@ -160,6 +184,33 @@ REGISTRY: dict[str, ModelFamily] = {
             "o": "c_proj",
         },
         tie_weights=True,
+        # GPT-2's serialized config.json uses the original OpenAI n_* key names
+        # (n_embd/n_layer/n_head/n_inner), NOT the unified hidden_size/
+        # num_hidden_layers/... names that HF's PretrainedConfig exposes as
+        # Python properties. expand_model.py reads the raw config.json dict, so
+        # it sees these n_* names directly. Verified against a real
+        # GPT2Config().to_dict() on transformers 5.7.0: n_inner is None when
+        # unset (real GPT-2 defaults the intermediate to 4*n_embd).
+        hidden_size_key="n_embd",
+        intermediate_size_key="n_inner",
+        num_hidden_layers_key="n_layer",
+        num_attention_heads_key="n_head",
+        vocab_size_key="vocab_size",
+        # GPT-2 architecture metadata (verified against the installed
+        # transformers GPT2Block/GPT2Attention/GPT2MLP __init__ source):
+        #   - the attention submodule is named `attn` (not self_attn);
+        #   - c_attn/c_fc/c_proj are HF Conv1D, whose .weight is stored
+        #     TRANSPOSED as (in, out) -- "basically works like a linear layer
+        #     but the weights are transposed" (Conv1D docstring). Width padding
+        #     must therefore touch the axis opposite the nn.Linear case.
+        #   - c_attn = Conv1D(3*hidden, hidden) holds Q|K|V as three equal
+        #     column-blocks along dim=1 -- fused_qkv, not separate q/k/v.
+        #     GQA/MQA never applies to a fused layout, so expand_model skips the
+        #     GQA pass outright for this family.
+        attn_path="attn",
+        mlp_path="mlp",
+        weight_orientation="conv1d",
+        attn_layout="fused_qkv",
     ),
     "gpt_neox": ModelFamily(
         name="gpt_neox",
