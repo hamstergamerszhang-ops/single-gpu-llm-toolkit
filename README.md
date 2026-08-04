@@ -4,7 +4,7 @@ Twenty-two independently-runnable tools (twenty Python + two shell) for
 adapting an LLM checkpoint on a **single AMD GPU** under ROCm/PyTorch — no
 multi-node cluster, no external orchestration framework (no SLURM/Ray —
 though `--ddp`/`--fsdp` via `torch.distributed` is supported for multi-GPU
-nodes; see [Multi-GPU](#multi-gpu-ddp--fsdp) below). The pipeline covers
+nodes; see the `--ddp`/`--fsdp` flags under `train_cpt.py` below). The pipeline covers
 the full path from a base checkpoint to a trained one: shrink a tokenizer,
 grow a model's width and depth, continue-pretrain or fine-tune it, and
 survive the specific ways a single GPU fails you along the way — OOM,
@@ -15,8 +15,8 @@ to the model you just trained. `evaluate.py` measures perplexity, the three
 `export_*.py` tools convert a checkpoint to GGUF/ONNX/safetensors, and every
 tool ships its own `--selftest` or pytest coverage — transformation tools
 that need real checkpoints (`prune_vocab.py`, `prune_embeddings_torch.py`,
-`expand_model.py`, `export_safetensors.py`) are covered by pytest logic tests
-instead, and the two shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are
+`expand_model.py`) are covered by pytest logic tests instead, and the two
+shell scripts (`catch_and_resume.sh`, `oom_guard.sh`) are
 covered by `tests/test_shell.py` via pytest+subprocess with faked
 `/proc/meminfo`, stubbed `rocm-smi`, and a fake `train_cpt.py`; see
 [Testing](#testing). Everything is independently runnable — use the whole
