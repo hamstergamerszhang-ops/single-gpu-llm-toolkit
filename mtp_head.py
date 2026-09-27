@@ -214,12 +214,16 @@ def main():
     ap.add_argument("--model-family", type=str, default=None,
                     help="Override model-family auto-detection. One of: "
                          "llama, gemma, phi3, falcon, mpt, gpt2, gpt_neox, "
-                         "gptj, bloom. When omitted, the family is auto-"
-                         "detected from config.json via models.registry and "
-                         "the family's decoder_layers_path is used as the "
-                         "--layer-prefix default. When provided, overrides "
-                         "auto-detection. Without either, the historical "
-                         "DEFAULT_LAYER_PREFIX applies (backward compat).")
+                         "gptj, bloom, qwen, mistral, phi, cohere, starcoder2. "
+                         "When omitted, the family is auto-detected from "
+                         "config.json via models.registry and the family's "
+                         "decoder_layers_path is used as the --layer-prefix "
+                         "default. When provided, overrides auto-detection. "
+                         "Without either, the historical DEFAULT_LAYER_PREFIX "
+                         "applies (backward compat). Also written into the "
+                         "output config.json so modeling_custom.py can select "
+                         "the right base class at load time -- if config.json "
+                         "already has model_family set, omit this.")
     ap.add_argument("--layer-prefix", type=str, default=DEFAULT_LAYER_PREFIX,
                     help="Decoder-layer key prefix in the base checkpoint, same "
                          "semantics as expand_model.py --layer-prefix. When "
@@ -227,12 +231,6 @@ def main():
                          "detect) and this flag is left at its default, the "
                          "family's decoder_layers_path overrides it.")
     ap.add_argument("--max-shard-bytes", type=int, default=DEFAULT_MAX_SHARD_BYTES)
-    ap.add_argument("--model-family", type=str, default=None,
-                    help="Model architecture family (user-specified, NOT auto-guessed). "
-                         "Written into config.json so modeling_custom.py can select the "
-                         "right base class at load time. One of: gemma, llama, qwen, "
-                         "mistral, phi, falcon, gpt2, gpt_neox, gptj, bloom, mpt, cohere, "
-                         "starcoder2. If config.json already has model_family set, omit this.")
     args = ap.parse_args()
 
     import numpy as np

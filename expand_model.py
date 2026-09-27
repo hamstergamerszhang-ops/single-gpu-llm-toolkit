@@ -569,12 +569,16 @@ def main():
                          "llama, gemma, phi3, falcon, mpt, gpt2, gpt_neox, "
                          "gptj, bloom. When omitted, the family is auto-"
                          "detected from config.json (+ safetensors keys once "
-                         "they're loaded) via models.registry. When provided, "
+                         "they're loaded) via models.registry, BEFORE any "
+                         "tensor is touched -- it drives the tensor-key "
+                         "segments + pad axes, and a fused-QKV architecture "
+                         "like GPT-2 (c_attn Conv1D, attn/mlp paths) needs "
+                         "this rather than just --layer-prefix. When provided, "
                          "the family's decoder_layers_path / mlp_suffixes / "
                          "attn_suffixes / config field names are used in place "
-                         "of the historical Llama-derived defaults. Without "
-                         "this flag the existing defaults still apply "
-                         "(backward compat).")
+                         "of the historical Llama-derived defaults; if "
+                         "detection fails it falls back to those defaults with "
+                         "a logged warning (backward compat).")
     ap.add_argument("--width-step", type=int, default=DEFAULT_WIDTH_STEP)
     ap.add_argument("--depth-step", type=int, default=DEFAULT_DEPTH_STEP)
     ap.add_argument("--gqa-kv-heads", type=int, default=DEFAULT_GQA_KV_HEADS,
@@ -611,15 +615,6 @@ def main():
     ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,
                     help="Byte budget per output safetensors shard (default 5GB). Was a "
                          "hardcoded module constant; now a flag with the same default.")
-    ap.add_argument("--model-family", type=str, default=None,
-                    help="Force a specific model family (from models.registry: llama, gemma, "
-                         "gpt2, phi3, falcon, mpt, bloom, ...) instead of auto-detecting from "
-                         "config.json's model_type. Auto-detection is run BEFORE any tensor is "
-                         "touched and drives the tensor-key segments + pad axes -- a fused-QKV "
-                         "architecture like GPT-2 (c_attn Conv1D, attn/mlp paths) needs real "
-                         "code changes, not just --layer-prefix, and the family is how those "
-                         "changes are routed. If detection fails it falls back to the legacy "
-                         "Llama-derived layout with a logged warning.")
     args = ap.parse_args()
 
     # Guard against src == dst (in-place overwrite would corrupt the source).
