@@ -8,7 +8,8 @@
 # Build:  docker build -t single-gpu-llm-toolkit .
 # Run:    docker run --device /dev/kfd --device /dev/dri --group-add video \
 #                 --shm-size 64G -v $(pwd):/work -w /work -it single-gpu-llm-toolkit \
-#                 python3 train_cpt.py --model ... --save ...
+#                 python3 train_cpt.py --model ./checkpoints/base --data ./data/train.jsonl \
+#                 --save ./checkpoints/out --iters 1000 --batch 4 --lr 5e-7
 #
 # The --device /dev/kfd --device /dev/dri --group-add video flags give the
 # container access to the AMD GPU. --shm-size matters because PyTorch's
@@ -17,7 +18,8 @@
 
 # Base image: pinned to a specific ROCm/PyTorch tag for reproducibility. An
 # unpinned :latest would let a new ROCm major version silently break the
-# gfx-override or fp8 paths. This tag was verified to exist on Docker Hub
+# gfx-override or fp8 paths, and could also drift past the hard
+# transformers==5.7.0 pin. This tag was verified to exist on Docker Hub
 # (the real tag format is rocm<X.Y.Z>_ubuntu<YY.MM>_py<Z.W>_pytorch_release_A.B.C,
 # NOT hyphenated — a previous pass used a hyphenated tag that doesn't exist).
 # To upgrade: pick a real tag from https://hub.docker.com/r/rocm/pytorch/tags,
@@ -27,10 +29,10 @@ FROM rocm/pytorch:rocm6.4.4_ubuntu22.04_py3.10_pytorch_release_2.7.1
 # Copy the toolkit into the image and install it with its extras. This replaces
 # the old approach of re-listing deps in the Dockerfile (a third manifest that
 # drifted from pyproject.toml + requirements.txt). Now: one source of truth
-# (pyproject.toml), installed via pip install -e .[train,infer,dev].
+# (pyproject.toml), installed via pip install -e .[train,serve,dev].
 COPY . /work
 WORKDIR /work
-RUN pip install --no-cache-dir ".[train,dev]"
+RUN pip install --no-cache-dir ".[train,serve,dev]"
 
 # ROCm-specific optional performance deps. These are installed against the
 # ROCm stack in this base image (headers and hipcc are present). If a build

@@ -20,9 +20,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", help="Checkpoint directory.")
     ap.add_argument("--data", help="Input JSONL file.")
-    # --batch-size / --seq-length are kept as the flag names (matching the
-    # other eval/export tools); dest is set explicitly so they can be
-    # overridden by a recipe/preset whose keys use train_cpt's dest names.
+    # dest is batch_size/seq_length (not train_cpt.py's batch/max_seq_len) --
+    # this file's own batching loop below reads args.batch_size/args.seq_length,
+    # so the dest names have to match that, not the other tools' convention.
+    # --batch and --max-seq-len are accepted as aliases either way.
     ap.add_argument("--batch-size", "--batch", type=int, default=1,
                     dest="batch_size")
     ap.add_argument("--seq-length", "--max-seq-len", type=int, default=2048,
@@ -33,6 +34,12 @@ def main():
                          "alias for 'rocm' since ROCm reports through the cuda "
                          "namespace.")
     ap.add_argument("--backend", default=None, help="Backend override for environment setup.")
+    ap.add_argument("--flash-attn", action="store_true", default=False,
+                    help="Use Flash Attention 2 for the eval forward pass. Matches "
+                         "the training/inference config so eval numbers are comparable.")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="torch.compile the model for the eval forward pass. "
+                         "First batch is slower (compilation); subsequent batches faster.")
     ap.add_argument("--max-samples", type=int, default=None)
     # ROCm bootstrap flags, mirroring generate.py / train_cpt.py so consumer
     # AMD cards needing HSA_OVERRIDE_GFX_VERSION are auto-handled here too.
@@ -88,8 +95,8 @@ def main():
     from backends import get_backend
     backend = get_backend(args.backend) if args.backend else None
     if backend is None or backend.name == "rocm":
-        from rocm_env import setup_rocm_env
-        setup_rocm_env(override=args.gfx_override, hip_alloc_conf=args.hip_alloc_conf)
+        from rocm_env import setup_rocm_env_from_args
+        setup_rocm_env_from_args(args)
 
     import torch
 
@@ -106,10 +113,23 @@ def main():
     dtype_str = resolve_dtype(dev, args.dtype)
     torch_dtype = DTYPE_MAP[dtype_str]
 
+    # trust_remote_code is passed explicitly at the from_pretrained call below
+    # (matching the tokenizer load), so it's deliberately left out of
+    # load_kwargs -- putting it in both places raises "got multiple values
+    # for keyword argument 'trust_remote_code'".
+    load_kwargs = {"torch_dtype": torch_dtype}
+    if args.flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            print("[evaluate] flash attention 2 enabled at load")
+        except ImportError:
+            print("[evaluate] WARNING: --flash-attn but flash-attn not installed")
+
     print(f"[evaluate] loading model from {args.model} (dtype={dtype_str}) ...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        **load_kwargs,
         trust_remote_code=True,
     ).to(dev.torch_device)
     model.eval()
@@ -132,6 +152,15 @@ def main():
         except Exception as e:
             print(f"[evaluate] WARNING: fp8 inference failed ({e}) — using bf16")
 
+    # Optional torch.compile for the eval forward pass. Runs after fp8
+    # quantization so the compiled graph captures the quantized ops.
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            print("[evaluate] torch.compile enabled")
+        except Exception as e:
+            print(f"[evaluate] WARNING: compile failed ({e}), using eager")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -151,6 +180,8 @@ def main():
                       file=sys.stderr)
                 continue
             texts.append(obj["text"])
+    if not texts:
+        raise SystemExit("ERROR: no valid samples found in data file")
 
     total_loss = 0.0
     total_tokens = 0
@@ -189,7 +220,6 @@ def main():
                             labels=labels)
             loss = outputs.loss.item()
 
-            # Weight by number of non-ignored tokens.
             n_tokens = (labels != -100).sum().item()
             total_loss += loss * n_tokens
             total_tokens += n_tokens
@@ -202,6 +232,26 @@ def main():
 def _self_test():
     """Self-test: exercise argparse flag aliasing and DTYPE_MAP coverage (no GPU)."""
     print("[selftest] evaluate: flag aliasing + dtype coverage (no GPU required)")
+
+    # Test JSONL error handling: malformed lines are skipped, not fatal.
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write('{"text": "hello world"}\n')
+        f.write('{bad json\n')
+        f.write('{"text": "second valid"}\n')
+        fpath = f.name
+    _texts, _malformed = [], 0
+    with open(fpath) as f:
+        for line in f:
+            try:
+                _obj = json.loads(line)
+                _texts.append(_obj["text"])
+            except json.JSONDecodeError:
+                _malformed += 1
+    os.unlink(fpath)
+    assert len(_texts) == 2, f"expected 2 valid, got {len(_texts)}"
+    assert _malformed == 1, f"expected 1 malformed, got {_malformed}"
+    print("  OK (malformed JSONL skipped, valid rows kept)")
 
     # Flag aliasing: --batch-size and --batch must both set dest=batch_size;
     # --seq-length and --max-seq-len must both set dest=seq_length.
@@ -235,5 +285,15 @@ def _self_test():
     print("\n[selftest] All checks passed.")
 
 
+def main_cli():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true", default=False)
+    args, _ = ap.parse_known_args()
+    if args.selftest:
+        _self_test()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_cli()

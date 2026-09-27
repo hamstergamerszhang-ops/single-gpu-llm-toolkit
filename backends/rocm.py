@@ -64,6 +64,7 @@ class RocmBackend(ComputeBackend):
         cap = torch.cuda.get_device_capability(0)
         if cap is None:
             return False
+        # gfx940/gfx941/gfx942 (MI300 family) and gfx950 (MI350).
         return cap[0] == 9 and cap[1] >= 40
 
     def supports_flash_attn(self) -> bool:

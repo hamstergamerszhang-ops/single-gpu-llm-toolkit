@@ -54,13 +54,20 @@ serve = [
 dev = [
     "pytest>=8.0.0",
     "pytest-xdist>=3.5.0",
+    "ruff>=0.4.0",
 ]
 all = [
     "bitsandbytes>=0.43.0",
     "tensorboard>=2.14.0",
+    "liger-kernel>=0.3.0",
     "flash-attn>=2.5.0",
     "torchao>=0.5.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
     "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",
+    "ruff>=0.4.0",
 ]
 
 [project.urls]
@@ -69,8 +76,8 @@ Repository = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit"
 Issues = "https://github.com/hamstergamerszhang-ops/single-gpu-llm-toolkit/issues"
 
 [tool.setuptools]
-# The toolkit is a flat collection of CLI scripts + 5 subpackages. We package
-# the subpackages (backends, runtime, config, distributed, models) so they're
+# The toolkit is a flat collection of CLI scripts + 4 subpackages. We package
+# the subpackages (backends, runtime, config, models) so they're
 # importable after `pip install -e .`; the top-level *.py scripts stay as
 # directly-invoked entrypoints (not installed as console_scripts, because the
 # repo's convention is `python3 train_cpt.py ...`).
@@ -82,6 +89,7 @@ py-modules = [
     "local_cache_stream", "optimizer_compat_guard", "preprocess_data",
     "smart_hipify", "prune_vocab", "prune_embeddings_torch",
     "export_gguf", "export_onnx", "export_safetensors",
+    "pretokenize", "serve", "rocprof_trace", "vram_log", "tokenization",
 ]
 
 [tool.pytest.ini_options]
